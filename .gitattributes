@@ -1,0 +1,18 @@
+# 仓库里一律存 LF，检出也一律 LF。
+#
+# 客户端只做 Windows，但服务端要跑在 Linux 上，贡献者两边都会有。
+# 不钉死的话，谁的 core.autocrlf 设得不一样，diff 里就会出现整文件的换行符抖动，
+# 把真正的改动淹掉。
+* text=auto eol=lf
+
+# 例外：Windows 自己的脚本保持 CRLF。
+*.ps1  text eol=crlf
+*.cmd  text eol=crlf
+*.bat  text eol=crlf
+
+# 二进制，别做任何转换。
+# M2 起会有音频测试素材（参考信号、AEC 的近端/远端录音）。
+*.png  binary
+*.ico  binary
+*.wav  binary
+*.opus binary
