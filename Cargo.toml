@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/protocol", "crates/voice-core", "crates/latency-probe"]
+members = ["crates/protocol", "crates/voice-core", "crates/latency-probe", "crates/device-probe"]
 
 [workspace.package]
 version = "0.0.1"
@@ -14,6 +14,8 @@ voice-core = { path = "crates/voice-core" }
 opus = "0.3"
 chacha20poly1305 = "0.10"
 windows-sys = "0.59"
+# WASAPI 要走 COM 接口，windows-sys 只有裸 FFI，接不了 IMMDeviceEnumerator/IAudioClient。
+windows = "0.62"
 
 # M1 只关心延迟数字，所以 release 必须是真 release。
 # 注意：不开 panic = "abort"，否则 cargo test --release 跑不了。

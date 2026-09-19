@@ -1,7 +1,7 @@
 //! 度量。红线是拿分位数说话的 —— 平均值在实时音频里几乎没有意义，
 //! 用户记住的是最糟的那 5%。
 
-#[derive(Default, Clone)]
+#[derive(Debug, Default, Clone)]
 pub struct Histogram {
     samples: Vec<f64>,
     sorted: bool,

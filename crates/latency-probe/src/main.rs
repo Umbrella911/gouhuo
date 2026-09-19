@@ -11,7 +11,6 @@
 mod bandwidth;
 mod cpucost;
 mod netem;
-mod redline;
 mod relay;
 mod report;
 mod run;

@@ -5,8 +5,8 @@
 
 use crate::bandwidth::BandwidthRow;
 use crate::cpucost::CpuCostRow;
-use crate::redline;
 use crate::run::RunResult;
+use voice_core::redline;
 
 /// 判定档位。红线说的是「同城」，所以结论只在这一档上下。
 pub const VERDICT_PROFILE: &str = "city";

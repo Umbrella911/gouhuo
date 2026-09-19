@@ -1,0 +1,10 @@
+[package]
+name = "device-probe"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "M2：测 WASAPI 采集/渲染到底吃掉多少延迟，把 DEVICE_BUDGET_MS 从假设换成实测。"
+
+[dependencies]
+voice-core.workspace = true
