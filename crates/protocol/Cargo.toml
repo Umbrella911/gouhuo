@@ -1,0 +1,14 @@
+[package]
+name = "protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "客户端与服务端共享的唯一一份协议定义：包格式、序列化、加密。"
+
+[features]
+default = ["crypto"]
+crypto = ["dep:chacha20poly1305"]
+
+[dependencies]
+chacha20poly1305 = { workspace = true, optional = true }

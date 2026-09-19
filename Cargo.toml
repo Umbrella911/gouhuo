@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = ["crates/protocol", "crates/voice-core", "crates/latency-probe"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+protocol = { path = "crates/protocol" }
+voice-core = { path = "crates/voice-core" }
+opus = "0.3"
+chacha20poly1305 = "0.10"
+windows-sys = "0.59"
+
+# M1 只关心延迟数字，所以 release 必须是真 release。
+# 注意：不开 panic = "abort"，否则 cargo test --release 跑不了。
+# 体积相关的开关（panic=abort / strip）等到打客户端安装包时在 bin 的 profile 里加。
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = 1

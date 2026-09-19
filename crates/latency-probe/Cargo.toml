@@ -1,0 +1,12 @@
+[package]
+name = "latency-probe"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "M1 go/no-go：不接音频设备，测「编码 → UDP → 抖动缓冲 → 解码」的纯协议延迟下限。"
+
+[dependencies]
+protocol.workspace = true
+voice-core.workspace = true
+opus.workspace = true

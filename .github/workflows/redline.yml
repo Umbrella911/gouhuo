@@ -1,0 +1,67 @@
+name: redline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # VS 自带的 cmake 是 4.x，libopus 的 CMakeLists 声明的最低版本太老会被直接拒。
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+
+jobs:
+  # 确定性的红线：编译、单元测试、带宽和编解码成本。
+  # 这些不依赖调度精度，在共享 runner 上也是可信的，所以**门禁在这里**。
+  deterministic:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: fmt
+        run: cargo fmt --all --check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: test
+        run: cargo test --workspace
+
+  # 延迟数字。**共享 runner 上不做门禁。**
+  #
+  # 原因：这测的是实时调度精度。GitHub 托管 runner 是虚拟化的共享机器，
+  # 节拍器迟到是常态，测出来的 p95 反映的是 runner 的负载而不是我们的架构。
+  # 在那种数字上设门禁只会训练出「重跑一次就绿了」的习惯，比不测更糟。
+  #
+  # 所以这里只**记录**：跑一遍，把 JSON 存成 artifact，用来看趋势。
+  # 真正的门禁要跑在专用机器上 —— 见下面的 gate job。
+  latency-record:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: 测量（仅记录，不门禁）
+        run: cargo run --release -p latency-probe -- --seconds 4 --json > m1.json
+      - name: 人类可读的报告
+        run: cargo run --release -p latency-probe -- --seconds 4 > m1.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: m1-latency-${{ github.sha }}
+          path: |
+            m1.json
+            m1.txt
+
+  # 真门禁。只在专用 Windows 机器上跑 —— 独占、不虚拟化、跑的时候不干别的。
+  #
+  # 要启用：挂一个带 `dedicated-audio` 标签的 self-hosted runner，
+  # 并把仓库变量 DEDICATED_RUNNER 设成 true。
+  gate:
+    if: vars.DEDICATED_RUNNER == 'true'
+    runs-on: [self-hosted, windows, dedicated-audio]
+    steps:
+      - uses: actions/checkout@v4
+      - name: 延迟红线
+        # 判据：city 档里**存在**一个音质过关、协议延迟 <= 50 ms 的配置。
+        # 50 = 端到端红线 80 − 预留给 WASAPI 采集+渲染的 30。
+        # M2 测完设备那段之后，这个数字要跟着 redline::DEVICE_BUDGET_MS 一起改。
+        run: cargo run --release -p latency-probe -- --seconds 30 --assert-p95-ms 50

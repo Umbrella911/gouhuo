@@ -1,0 +1,19 @@
+[package]
+name = "voice-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "客户端语音内核：音频 IO / APM / Opus / 抖动缓冲 / 传输 / 热键。M1 只含抖动缓冲、实时时钟与度量。"
+
+[dependencies]
+protocol.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Media",
+    "Win32_Networking_WinSock",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+] }
