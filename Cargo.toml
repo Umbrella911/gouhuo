@@ -8,7 +8,8 @@ exclude = ["third_party"]
 version = "0.0.1"
 edition = "2021"
 rust-version = "1.80"
-license = "MIT OR Apache-2.0"
+# 核心实现是 copyleft，protocol 单独放宽 —— 见 LICENSING.md。
+license = "GPL-3.0-or-later"
 
 [workspace.dependencies]
 protocol = { path = "crates/protocol" }

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! M1 go/no-go 探针。
 //!
 //! 一句话：**先别碰 UI，先把一个数字测出来。**

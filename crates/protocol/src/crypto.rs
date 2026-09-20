@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! 语音包加密。**不自研密码学** —— 这里只是把 RustCrypto 的 ChaCha20-Poly1305
 //! 按我们的包格式接上去。
 //!

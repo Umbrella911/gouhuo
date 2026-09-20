@@ -3,7 +3,9 @@ name = "protocol"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+# 这一个 crate 不跟工作区：协议定义要能被任何人自由实现，
+# 包括闭源的第三方客户端和别的语言的实现。理由见 LICENSING.md。
+license = "MIT OR Apache-2.0"
 description = "客户端与服务端共享的唯一一份协议定义：包格式、序列化、加密。"
 
 [features]

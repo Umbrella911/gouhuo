@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! M2 探针：WASAPI 到底吃掉多少延迟。
 //!
 //! M1 已经把协议链路测干净了（同城 p95 46.5 ms）。80 ms 红线里剩下的那部分

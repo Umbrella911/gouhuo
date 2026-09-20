@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! 客户端与服务端共享的**唯一一份**协议定义。
 //!
 //! 这个 crate 里不放任何业务逻辑，只放「线上长什么样」。两端都依赖它，
