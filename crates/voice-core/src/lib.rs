@@ -9,6 +9,7 @@
 
 pub mod apm;
 pub mod clock;
+pub mod identity;
 pub mod jitter;
 pub mod metrics;
 pub mod net;

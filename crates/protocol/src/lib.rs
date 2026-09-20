@@ -6,17 +6,27 @@
 //! 改一个字段两边同时编译报错 —— 这就是把它独立出来的全部理由。
 //!
 //! 分层（抄 Mumble，二十年验证过）：
-//! - 控制面：TCP + TLS，登录 / 频道树 / 成员状态 / 文字消息（M3）
-//! - 语音面：UDP，Opus 帧 + 序号 + 时间戳，ChaCha20-Poly1305（本文件）
+//! - 控制面：TCP + TLS，登录 / 频道树 / 成员状态 / 文字消息（M3，进行中）
+//! - 语音面：UDP，Opus 帧 + 序号 + 时间戳，ChaCha20-Poly1305（`voice`）
 //! - UDP 不通时语音包塞进 TCP 回退（M3）
+//!
+//! 除了线上格式，这里还放两样「客户端和服务端必须理解得一模一样」的东西：
+//! - `identity`：身份（Ed25519 公钥）和指纹
+//! - `invite`：邀请链接 —— 它是协议的一部分，第三方客户端也得能解析
 #![forbid(unsafe_code)]
 
+pub mod base32;
 #[cfg(feature = "crypto")]
 mod crypto;
+mod identity;
+mod invite;
+pub mod text;
 mod voice;
 
 #[cfg(feature = "crypto")]
 pub use crypto::*;
+pub use identity::*;
+pub use invite::*;
 pub use voice::*;
 
 /// 全链路固定 48 kHz —— Opus 的原生采样率，任何重采样都是白送的延迟和 CPU。
