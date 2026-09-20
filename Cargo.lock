@@ -1119,6 +1119,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "server"
+version = "0.0.1"
+dependencies = [
+ "getrandom 0.3.4",
+ "protocol",
+ "rustls",
+ "transport",
+ "voice-core",
+]
+
+[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"

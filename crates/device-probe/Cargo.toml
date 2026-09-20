@@ -7,4 +7,5 @@ license.workspace = true
 description = "M2：测 WASAPI 采集/渲染到底吃掉多少延迟，把 DEVICE_BUDGET_MS 从假设换成实测。"
 
 [dependencies]
-voice-core.workspace = true
+# 这个 probe 就是用来量 APM 的，显式要上 —— 工作区默认把它关了。
+voice-core = { workspace = true, features = ["apm"] }

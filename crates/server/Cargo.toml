@@ -1,0 +1,32 @@
+[package]
+name = "server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "开麦服务端：单二进制，自部署零依赖。"
+
+# 拆成 lib + bin：集成测试进不了 bin crate，而认证流程恰恰是最需要
+# 端到端测的一块。
+[lib]
+name = "server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kaimai-server"
+path = "src/main.rs"
+
+[dependencies]
+protocol.workspace = true
+transport.workspace = true
+# 只用它的身份（Ed25519）。**不要 APM** —— 服务端不碰音频采样，
+# 带上它等于要求自部署的人装 meson 和 ninja。
+voice-core = { workspace = true, default-features = false }
+rustls.workspace = true
+getrandom.workspace = true
+
+[dev-dependencies]
+protocol.workspace = true
+transport.workspace = true
+voice-core = { workspace = true, default-features = false }
+rustls.workspace = true

@@ -6,6 +6,7 @@ members = [
     "crates/voice-core",
     "crates/latency-probe",
     "crates/device-probe",
+    "crates/server",
 ]
 # vendor 进来的第三方源码不是工作区成员，只是 [patch] 的目标。
 exclude = ["third_party"]
@@ -19,7 +20,7 @@ license = "GPL-3.0-or-later"
 
 [workspace.dependencies]
 protocol = { path = "crates/protocol" }
-voice-core = { path = "crates/voice-core" }
+voice-core = { path = "crates/voice-core", default-features = false }
 opus = "0.3"
 chacha20poly1305 = "0.10"
 windows-sys = "0.59"

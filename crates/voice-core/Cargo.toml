@@ -6,12 +6,22 @@ rust-version.workspace = true
 license.workspace = true
 description = "客户端语音内核：音频 IO / APM / Opus / 抖动缓冲 / 传输 / 热键。M1 只含抖动缓冲、实时时钟与度量。"
 
+[features]
+# 默认带上 APM。客户端要它，服务端不要 —— 见下。
+default = ["apm"]
+# 回声消除 / 降噪 / AGC。**这是唯一需要 C++ 工具链（meson + ninja）的东西。**
+#
+# 服务端只转发 Opus 包，从头到尾不碰音频采样，所以它关掉这个 feature
+# 编译。否则自部署的人为了编一个转发器要先装一整套 C++ 构建环境，
+# 跟「单二进制、自部署零依赖」直接冲突。
+apm = ["dep:webrtc-audio-processing"]
+
 [dependencies]
 protocol.workspace = true
 ed25519-dalek.workspace = true
 getrandom.workspace = true
 sha2.workspace = true
-webrtc-audio-processing.workspace = true
+webrtc-audio-processing = { workspace = true, optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = [

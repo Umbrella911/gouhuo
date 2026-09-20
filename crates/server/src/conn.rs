@@ -1,0 +1,563 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+//! 连接处理：TLS、认证握手、消息循环。
+//!
+//! 这里只负责把字节搬进搬出；所有「准不准、该怎么改状态」的规则在 `state` 里。
+//!
+//! # 为什么是线程不是 async
+//!
+//! 场景是 3–20 人的频道，一台自部署的机器撑一个社群，几十条连接封顶。
+//! 这个量级上 async 换不来任何东西，却要带进四十来个依赖 ——
+//! 跟「单二进制、自部署零依赖」直接冲突。
+//!
+//! 边界划在连接处理这一层：真到了需要换的那天，改的是这个文件，
+//! `state` 里那套规则一行都不用动。
+//!
+//! # 读写怎么分开
+//!
+//! rustls 的连接状态是单份的，读和写都要 `&mut`。所以：
+//! - **读**：自己一个 socket 句柄（`try_clone`），阻塞读原始字节，不持锁
+//! - **写**：`Mutex<Wire>` 里装着 TLS 状态和写用的 socket 句柄
+//! - 读到字节之后才短暂上锁，喂给 TLS 解出明文
+//!
+//! # 超时为什么用看门狗而不是读超时
+//!
+//! `SO_RCVTIMEO` 在 Windows 上超时跟到达的数据撞车时会**丢数据** ——
+//! M1 在 UDP 上已经被这个坑过一次（见 `voice_core::net`），TCP 上同样成立，
+//! 只是表现为流错位而不是丢包，更难查。
+//!
+//! 所以读永远是阻塞的、没有超时；另起一个看门狗线程看「谁多久没动静了」，
+//! 该踢的直接 `shutdown` 那条 socket —— 阻塞的读会立刻返回 0。
+
+use std::collections::HashMap;
+use std::io::{self, Read, Write};
+use std::net::{Shutdown, TcpStream};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use protocol::control::{
+    client_message, decode_frame, encode_frame, peek_frame_len, Challenge, ClientMessage, Rejected,
+    ServerMessage, MAX_FRAME_BODY, PROTOCOL_VERSION,
+};
+use protocol::PublicKey;
+use voice_core::identity::Identity;
+
+use crate::state::{Broadcast, Server, SessionId};
+
+/// 多久没收到任何东西就算掉线。客户端每隔几秒会发一次 Ping。
+pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 认证必须在这个时间内走完。
+///
+/// 没有这个的话，一条连上来什么都不发的连接会永远占着一个线程 ——
+/// 开一千条就能把服务端拖垮，而且不需要任何凭证。
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 挑战随机数的长度。
+const CHALLENGE_LEN: usize = 32;
+
+/// 一条连接的 TLS 状态和写用的 socket。
+struct Wire {
+    conn: rustls::ServerConnection,
+    sock: TcpStream,
+}
+
+impl Wire {
+    /// 把 rustls 攒着的字节真正写出去。
+    fn flush_tls(&mut self) -> io::Result<()> {
+        while self.conn.wants_write() {
+            self.conn.write_tls(&mut self.sock)?;
+        }
+        self.sock.flush()
+    }
+
+    fn send(&mut self, message: &ServerMessage) -> io::Result<()> {
+        let mut frame = Vec::new();
+        encode_frame(message, &mut frame).map_err(io::Error::other)?;
+        self.conn.writer().write_all(&frame)?;
+        self.flush_tls()
+    }
+}
+
+/// 一个已登录的人。广播时通过它把消息推出去。
+pub struct Peer {
+    pub session: SessionId,
+    wire: Arc<Mutex<Wire>>,
+    /// 最后一次收到东西的时刻，看门狗要用。存成 Unix 毫秒的原子值，
+    /// 免得为了读一个时间戳还要上锁。
+    last_seen_ms: AtomicU64,
+    /// 是被看门狗踢掉的，还是自己走的。
+    ///
+    /// 两种情况读线程看到的都是 `read` 返回 0，分不出来 —— 但广播给别人的
+    /// `UserLeft` 理由不一样，「掉线了」和「自己退了」在界面上是两回事。
+    timed_out: AtomicBool,
+}
+
+impl Peer {
+    pub fn send(&self, message: &ServerMessage) {
+        // 发不出去不是这里该处理的：读线程会在下一次 read 返回 0 时清理。
+        // 在广播路径上做清理会让锁的顺序变复杂，而复杂的锁顺序就是死锁。
+        if let Ok(mut wire) = self.wire.lock() {
+            let _ = wire.send(message);
+        }
+    }
+
+    fn touch(&self) {
+        self.last_seen_ms.store(now_ms() as u64, Ordering::Relaxed);
+    }
+
+    fn idle_for(&self) -> Duration {
+        let last = self.last_seen_ms.load(Ordering::Relaxed);
+        Duration::from_millis((now_ms() as u64).saturating_sub(last))
+    }
+
+    /// 把这条连接踢掉。阻塞在 read 上的线程会立刻返回 0 然后自己收拾。
+    fn kick(&self) {
+        self.close();
+    }
+
+    /// 同上，但标记成「超时」而不是「自己走的」。
+    fn kick_idle(&self) {
+        self.timed_out.store(true, Ordering::Relaxed);
+        self.close();
+    }
+
+    fn close(&self) {
+        if let Ok(wire) = self.wire.lock() {
+            let _ = wire.sock.shutdown(Shutdown::Both);
+        }
+    }
+}
+
+/// 所有连接和状态的汇合点。
+pub struct Hub {
+    state: Mutex<Server>,
+    peers: Mutex<HashMap<SessionId, Arc<Peer>>>,
+    /// 语音的 UDP 端口，填进 Welcome 里告诉客户端。
+    udp_port: u16,
+}
+
+impl Hub {
+    pub fn new(server: Server, udp_port: u16) -> Self {
+        Self {
+            state: Mutex::new(server),
+            peers: Mutex::new(HashMap::new()),
+            udp_port,
+        }
+    }
+
+    pub fn user_count(&self) -> usize {
+        self.state.lock().expect("state poisoned").user_count()
+    }
+
+    /// 把一批广播真正发出去。
+    ///
+    /// **先取快照再发**：持着 state 锁去写 socket 的话，一个卡住的客户端
+    /// 就能把整个服务端的状态锁住。
+    fn dispatch(&self, events: Vec<Broadcast>) {
+        if events.is_empty() {
+            return;
+        }
+        let peers: Vec<Arc<Peer>> = {
+            let peers = self.peers.lock().expect("peers poisoned");
+            peers.values().cloned().collect()
+        };
+
+        for event in events {
+            match event {
+                Broadcast::Everyone(msg) => {
+                    for peer in &peers {
+                        peer.send(&msg);
+                    }
+                }
+                Broadcast::Channel(channel, msg) => {
+                    let targets = {
+                        let state = self.state.lock().expect("state poisoned");
+                        state.sessions_in_channel(channel)
+                    };
+                    for peer in &peers {
+                        if targets.contains(&peer.session) {
+                            peer.send(&msg);
+                        }
+                    }
+                }
+                Broadcast::One(session, msg) => {
+                    if let Some(peer) = peers.iter().find(|p| p.session == session) {
+                        peer.send(&msg);
+                    }
+                }
+            }
+        }
+    }
+
+    /// 看门狗：踢掉太久没动静的连接。
+    pub fn sweep_idle(&self) {
+        let stale: Vec<Arc<Peer>> = {
+            let peers = self.peers.lock().expect("peers poisoned");
+            peers
+                .values()
+                .filter(|p| p.idle_for() > IDLE_TIMEOUT)
+                .cloned()
+                .collect()
+        };
+        for peer in stale {
+            peer.kick_idle();
+        }
+    }
+}
+
+/// 处理一条连上来的 TCP 连接，直到它断开。**这个函数会阻塞。**
+pub fn serve_connection(
+    sock: TcpStream,
+    tls_config: Arc<rustls::ServerConfig>,
+    hub: Arc<Hub>,
+) -> io::Result<()> {
+    sock.set_nodelay(true)?;
+    let read_sock = sock.try_clone()?;
+
+    let mut conn = rustls::ServerConnection::new(tls_config).map_err(io::Error::other)?;
+    // 握手在这里一次做完，之后才拆成读写两半。
+    let mut handshake_sock = sock.try_clone()?;
+    conn.complete_io(&mut handshake_sock)?;
+
+    let wire = Arc::new(Mutex::new(Wire { conn, sock }));
+    let mut reader = Reader::new(read_sock, Arc::clone(&wire));
+
+    // ---- 认证 ----
+    let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+    let session = match authenticate(&mut reader, &wire, &hub, deadline) {
+        Ok(Some(session)) => session,
+        // 被拒或者对面走了：Rejected 已经发过了，这里干净收场。
+        Ok(None) => return Ok(()),
+        Err(e) => return Err(e),
+    };
+
+    let peer = Arc::new(Peer {
+        session,
+        wire: Arc::clone(&wire),
+        last_seen_ms: AtomicU64::new(now_ms() as u64),
+        timed_out: AtomicBool::new(false),
+    });
+    hub.peers
+        .lock()
+        .expect("peers poisoned")
+        .insert(session, Arc::clone(&peer));
+
+    // ---- 消息循环 ----
+    let result = message_loop(&mut reader, &wire, &hub, &peer);
+
+    // ---- 收尾。不管怎么出来的，都要把人从状态里摘掉并广播 ----
+    hub.peers.lock().expect("peers poisoned").remove(&session);
+    let events = {
+        let mut state = hub.state.lock().expect("state poisoned");
+        if peer.timed_out.load(Ordering::Relaxed) {
+            state.timeout(session)
+        } else {
+            state.disconnect(session)
+        }
+    };
+    hub.dispatch(events);
+    result
+}
+
+/// Hello -> Challenge -> Authenticate -> Welcome / Rejected。
+///
+/// 返回 `Ok(None)` 表示「正常地没让他进来」（版本不对、签名不对、策略不让）——
+/// 该发的 `Rejected` 已经发出去了，调用方安静收场就行。
+fn authenticate(
+    reader: &mut Reader,
+    wire: &Arc<Mutex<Wire>>,
+    hub: &Arc<Hub>,
+    deadline: Instant,
+) -> io::Result<Option<SessionId>> {
+    use protocol::control::rejected::Reason;
+
+    let Some(hello) = reader.next_message(deadline)? else {
+        return Ok(None);
+    };
+    let Some(client_message::Payload::Hello(hello)) = hello.payload else {
+        // 第一条不是 Hello：要么是实现有问题，要么是在乱探。不解释，直接走。
+        return Ok(None);
+    };
+
+    if hello.protocol_version != PROTOCOL_VERSION {
+        reject(
+            wire,
+            Reason::VersionMismatch,
+            format!(
+                "协议版本对不上：服务端是 {PROTOCOL_VERSION}，你的客户端是 {}。升级一下",
+                hello.protocol_version
+            ),
+        );
+        return Ok(None);
+    }
+
+    let Ok(key_bytes): Result<[u8; 32], _> = hello.public_key.try_into() else {
+        reject(wire, Reason::BadSignature, "公钥长度不对".into());
+        return Ok(None);
+    };
+    let public_key = PublicKey(key_bytes);
+
+    // 随机数必须由服务端出。让客户端自己选要签的内容等于允许重放：
+    // 抓一次签名就能无限次冒充。
+    let mut nonce = [0u8; CHALLENGE_LEN];
+    getrandom::fill(&mut nonce).map_err(|e| io::Error::other(format!("拿不到随机数: {e}")))?;
+    {
+        let mut w = wire.lock().expect("wire poisoned");
+        w.send(
+            &Challenge {
+                nonce: nonce.to_vec(),
+            }
+            .into(),
+        )?;
+    }
+
+    let Some(auth) = reader.next_message(deadline)? else {
+        return Ok(None);
+    };
+    let Some(client_message::Payload::Authenticate(auth)) = auth.payload else {
+        return Ok(None);
+    };
+
+    let Ok(signature): Result<[u8; 64], _> = auth.signature.try_into() else {
+        reject(wire, Reason::BadSignature, "签名长度不对".into());
+        return Ok(None);
+    };
+    if !Identity::verify(&public_key, &nonce, &signature) {
+        reject(
+            wire,
+            Reason::BadSignature,
+            "签名验不过 —— 公钥和私钥对不上".into(),
+        );
+        return Ok(None);
+    }
+
+    // 到这里才轮到策略。密码学归密码学，策略归 state。
+    let admitted = {
+        let mut state = hub.state.lock().expect("state poisoned");
+        state.admit(public_key, &auth.invite_code, &auth.desired_name)
+    };
+    let admitted = match admitted {
+        Ok(a) => a,
+        Err(denied) => {
+            let mut w = wire.lock().expect("wire poisoned");
+            let _ = w.send(&denied.to_wire().into());
+            return Ok(None);
+        }
+    };
+
+    // 顶号：把旧连接踢掉。状态里已经摘干净了，这里只管关 socket。
+    if let Some(old) = admitted.displaced {
+        let old_peer = hub.peers.lock().expect("peers poisoned").remove(&old);
+        if let Some(old_peer) = old_peer {
+            old_peer.kick();
+        }
+    }
+
+    let mut welcome = admitted.welcome;
+    welcome.udp_port = hub.udp_port as u32;
+    {
+        let mut w = wire.lock().expect("wire poisoned");
+        w.send(&welcome.into())?;
+    }
+    hub.dispatch(admitted.broadcasts);
+    Ok(Some(admitted.session_id))
+}
+
+fn reject(wire: &Arc<Mutex<Wire>>, reason: protocol::control::rejected::Reason, detail: String) {
+    if let Ok(mut w) = wire.lock() {
+        let _ = w.send(
+            &Rejected {
+                reason: reason as i32,
+                detail,
+            }
+            .into(),
+        );
+    }
+}
+
+fn message_loop(
+    reader: &mut Reader,
+    wire: &Arc<Mutex<Wire>>,
+    hub: &Arc<Hub>,
+    peer: &Arc<Peer>,
+) -> io::Result<()> {
+    use protocol::control::Pong;
+
+    loop {
+        // 登录之后不再有截止时间 —— 该不该踢由看门狗按空闲时长决定。
+        let Some(message) = reader.next_message(Instant::now() + Duration::from_secs(86_400))?
+        else {
+            return Ok(());
+        };
+        peer.touch();
+
+        let events = match message.payload {
+            Some(client_message::Payload::Ping(ping)) => {
+                let mut w = wire.lock().expect("wire poisoned");
+                w.send(
+                    &Pong {
+                        timestamp: ping.timestamp,
+                        // 语音包计数等 UDP 那半边接上再填
+                        udp_packets_received: 0,
+                    }
+                    .into(),
+                )?;
+                Vec::new()
+            }
+            Some(client_message::Payload::JoinChannel(join)) => {
+                let mut state = hub.state.lock().expect("state poisoned");
+                state.join_channel(peer.session, join.channel_id)
+            }
+            Some(client_message::Payload::SelfState(s)) => {
+                let mut state = hub.state.lock().expect("state poisoned");
+                state.set_self_state(peer.session, s.self_muted, s.self_deafened)
+            }
+            Some(client_message::Payload::TextMessage(text)) => {
+                let mut state = hub.state.lock().expect("state poisoned");
+                state.text_message(peer.session, text, now_ms())
+            }
+            // 登录之后再发 Hello / Authenticate 是协议错误，忽略。
+            Some(_) => Vec::new(),
+            // 认不出来的分支：新客户端发了我们不懂的东西。**忽略，不要断开** ——
+            // 这正是 protobuf 演进语义要的行为。
+            None => Vec::new(),
+        };
+        hub.dispatch(events);
+    }
+}
+
+/// 从 TLS 流里一条一条读控制消息。
+///
+/// 自己管一个缓冲区：TCP 会在任意位置切断，一次 read 可能拿到半条、也可能拿到两条半。
+struct Reader {
+    /// 只用来读的 socket 句柄。阻塞读的时候**不持锁** ——
+    /// 否则一条安静的连接会把广播路径堵死。
+    sock: TcpStream,
+    /// TLS 状态。读到密文之后才短暂上锁，解出明文就放开。
+    wire: Arc<Mutex<Wire>>,
+    /// 已经解密但还没解析成消息的明文。
+    buffered: Vec<u8>,
+}
+
+impl Reader {
+    fn new(sock: TcpStream, wire: Arc<Mutex<Wire>>) -> Self {
+        Self {
+            sock,
+            wire,
+            buffered: Vec::with_capacity(4096),
+        }
+    }
+
+    /// 取下一条消息。返回 `Ok(None)` 表示对面关了。
+    fn next_message(&mut self, deadline: Instant) -> io::Result<Option<ClientMessage>> {
+        loop {
+            match decode_frame::<ClientMessage>(&self.buffered) {
+                Ok(Some((message, used))) => {
+                    self.buffered.drain(..used);
+                    return Ok(Some(message));
+                }
+                Ok(None) => {}
+                Err(e) => return Err(io::Error::other(e)),
+            }
+            // 先看一眼对面声称有多长，超限的当场断 —— 不要等它慢慢发完。
+            if let Err(e) = peek_frame_len(&self.buffered) {
+                return Err(io::Error::other(e));
+            }
+            if Instant::now() > deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "握手超时：连上来之后一直不说话",
+                ));
+            }
+            if !self.fill()? {
+                return Ok(None);
+            }
+        }
+    }
+
+    /// 读一批密文，解密，追加到明文缓冲区。返回 false 表示对面关了。
+    fn fill(&mut self) -> io::Result<bool> {
+        // 先看 TLS 层有没有攒着还没取走的明文。握手那一步（`complete_io`）
+        // 有可能顺手把对端紧跟着发来的应用数据一起读进去了 —— 不先取干净的话
+        // 就会卡在「等 socket 再来点东西」，而对端正在等我们回话。
+        if self.drain_plaintext()? > 0 {
+            return Ok(true);
+        }
+
+        let mut chunk = [0u8; 8192];
+        let n = self.sock.read(&mut chunk)?;
+        if n == 0 {
+            return Ok(false);
+        }
+
+        let mut rest = &chunk[..n];
+        while !rest.is_empty() {
+            let consumed = {
+                let mut wire = self.wire.lock().expect("wire poisoned");
+                let consumed = wire.conn.read_tls(&mut rest)?;
+                wire.conn.process_new_packets().map_err(io::Error::other)?;
+                // 握手期间对端可能还要我们回点东西（比如 TLS 1.3 的 key update）。
+                if wire.conn.wants_write() {
+                    wire.flush_tls()?;
+                }
+                consumed
+            };
+            if consumed == 0 {
+                // read_tls 一个字节都吃不下，而我们刚刚才把明文取空 ——
+                // 再转下去就是死循环。
+                return Err(io::Error::other("TLS 层卡住了：既不收字节也不出明文"));
+            }
+            self.drain_plaintext()?;
+        }
+        Ok(true)
+    }
+
+    /// 把 TLS 已经解好的明文搬进 `buffered`，返回搬了多少字节。
+    fn drain_plaintext(&mut self) -> io::Result<usize> {
+        let mut wire = self.wire.lock().expect("wire poisoned");
+        let available = wire.conn.process_new_packets().map_err(io::Error::other)?;
+        let pending = available.plaintext_bytes_to_read();
+        if pending == 0 {
+            return Ok(0);
+        }
+        // 缓冲区不能无限涨。分帧本身有上限，但攒着好几条也可能很大。
+        if self.buffered.len() + pending > MAX_FRAME_BODY * 2 {
+            return Err(io::Error::other("对端积压了太多没解析的控制消息"));
+        }
+        let start = self.buffered.len();
+        self.buffered.resize(start + pending, 0);
+        wire.conn.reader().read_exact(&mut self.buffered[start..])?;
+        Ok(pending)
+    }
+}
+
+pub fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timeouts_are_sane() {
+        assert!(
+            HANDSHAKE_TIMEOUT < IDLE_TIMEOUT,
+            "握手超时该比空闲超时短：一条连上来不说话的连接不该白占 30 秒"
+        );
+        assert!(IDLE_TIMEOUT.as_secs() >= 15, "太短会把网络抖动误判成掉线");
+    }
+
+    #[test]
+    fn now_ms_looks_like_a_unix_timestamp() {
+        let now = now_ms();
+        // 2020-01-01 之后、2100 之前
+        assert!(now > 1_577_836_800_000);
+        assert!(now < 4_102_444_800_000);
+    }
+}
