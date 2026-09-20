@@ -30,7 +30,7 @@ pub mod keys;
 pub mod pinning;
 
 pub use cert::ServerCert;
-pub use keys::{derive_voice_key, VoiceKey, VOICE_KEY_LABEL};
+pub use keys::{derive_voice_key, VoiceKey, DOWNSTREAM, UPSTREAM, VOICE_KEY_LABEL};
 pub use pinning::PinnedServerCert;
 
 use std::sync::Arc;

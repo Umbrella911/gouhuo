@@ -10,8 +10,14 @@
 //!   u32 LE          u32 LE          u32 LE          u8
 //! ```
 //!
-//! 头部 13 字节，明文，同时作为 AEAD 的 AAD（服务端要按 session 查频道转发，
-//! 不能也不该解密负载）。
+//! 头部 13 字节，明文，同时作为 AEAD 的 AAD。明文是因为服务端要先按 session
+//! 找到是谁在说话，才知道该查哪把密钥、往哪个频道转。
+//!
+//! **服务端会解密再重新加密。** 语音密钥是每条连接从 TLS 派生的，收发双方
+//! 的密钥不同，所以转发不可能是原样复制。代价是服务端能看到 Opus 字节
+//! （它不解码，只是搬运）；换来的是**发送者不可伪造** —— 换成全频道共享一把
+//! 密钥的话，任何成员都能拿着这把钥匙伪造别人的 session id，做出「某人正在
+//! 说话」的假象，而服务端分辨不出来。
 //!
 //! 13 字节不是随便定的，它直接吃带宽红线：50 包/秒时头部本身就是
 //! `(13 + 28) * 8 * 50 = 16.4 kbps`。10 ms 帧会翻倍到 32.8 kbps，
@@ -28,6 +34,19 @@ pub const FLAG_TERMINATOR: u8 = 1 << 0;
 
 /// 该帧由 DTX 生成（舒适噪声），不计入「正在说话」指示。
 pub const FLAG_DTX: u8 = 1 << 1;
+
+/// 保活/探测包。负载为空，**不转发给任何人**。
+///
+/// 它解决两件事：
+///
+/// 1. **只听不说的人也要能听见。** 服务端的 UDP 地址是从收到的包里学来的
+///    （NAT 会改源地址，事先不可能知道）。一个从不说话的人如果不发点什么，
+///    服务端就永远不知道往哪儿发给他 —— 他会完全听不到声音。
+/// 2. **UDP 到底通不通。** 服务端收到保活会原样回一个，两个方向都验过了。
+///    一直收不到回包就说明 UDP 被挡了，该退回 TCP 传语音。
+///
+/// `timestamp` 字段在保活包里装的是客户端的发送时刻，回来就是一次 RTT。
+pub const FLAG_KEEPALIVE: u8 = 1 << 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VoiceHeader {
@@ -67,6 +86,10 @@ impl VoiceHeader {
 
     pub fn is_terminator(self) -> bool {
         self.flags & FLAG_TERMINATOR != 0
+    }
+
+    pub fn is_keepalive(self) -> bool {
+        self.flags & FLAG_KEEPALIVE != 0
     }
 }
 
@@ -128,6 +151,28 @@ mod tests {
         assert_eq!(got, h);
         assert_eq!(payload, &[1, 2, 3]);
         assert!(got.is_terminator());
+    }
+
+    /// 保活包和语音包必须能分开 —— 混了的话保活会被当成音频转发出去，
+    /// 所有人都会听到一声空响。
+    #[test]
+    fn keepalive_is_distinguishable() {
+        let voice = VoiceHeader {
+            session: 1,
+            seq: 1,
+            timestamp: 0,
+            flags: 0,
+        };
+        let keepalive = VoiceHeader {
+            flags: FLAG_KEEPALIVE,
+            ..voice
+        };
+        assert!(!voice.is_keepalive());
+        assert!(keepalive.is_keepalive());
+        // 各个标志位互不干扰
+        assert!(!keepalive.is_terminator());
+        assert_ne!(FLAG_KEEPALIVE, FLAG_TERMINATOR);
+        assert_ne!(FLAG_KEEPALIVE, FLAG_DTX);
     }
 
     #[test]

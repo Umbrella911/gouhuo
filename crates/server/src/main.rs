@@ -82,10 +82,11 @@ fn run() -> io::Result<()> {
         TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)).map_err(|e| bind_error("TCP", port, e))?;
     let voice =
         UdpSocket::bind((Ipv4Addr::UNSPECIFIED, port)).map_err(|e| bind_error("UDP", port, e))?;
-    let udp_port = voice.local_addr()?.port();
+    // 默认 8 KB 的接收缓冲在 20 人同时说话时会溢出（M1 量过）。
+    voice_core::net::set_recv_buffer(&voice, voice_core::net::DEFAULT_RECV_BUFFER)?;
 
     let tls_config = Arc::new(server_config(&cert).map_err(io::Error::other)?);
-    let hub = Arc::new(Hub::new(server, udp_port));
+    let hub = Arc::new(Hub::new(server, voice));
 
     let host = std::env::var("KAIMAI_HOST").unwrap_or_else(|_| local_address());
     let invite = Invite {
@@ -98,9 +99,12 @@ fn run() -> io::Result<()> {
 
     server::spawn_watchdog(Arc::clone(&hub), SWEEP_INTERVAL)?;
 
-    // 语音转发还没接上（M3 的下一步）。端口先占住，免得将来接上时
-    // 发现被别的东西抢了。
-    drop(voice);
+    {
+        let hub = Arc::clone(&hub);
+        std::thread::Builder::new()
+            .name("kaimai-voice".into())
+            .spawn(move || hub.run_voice())?;
+    }
 
     server::accept_loop(listener, tls_config, hub);
     Ok(())

@@ -28,6 +28,12 @@ pub const VOICE_KEY_LEN: usize = 32;
 /// 派生标签。**改用途就换标签**，见模块文档。
 pub const VOICE_KEY_LABEL: &[u8] = b"kaimai voice udp v1";
 
+/// 上行：客户端发给服务端的语音。
+pub const UPSTREAM: &[u8] = b"client-to-server";
+
+/// 下行：服务端转发给客户端的语音。
+pub const DOWNSTREAM: &[u8] = b"server-to-client";
+
 /// 派生出来的语音密钥。
 ///
 /// 不实现 `Debug`/`Display`：它是密钥，不该出现在任何日志里。
@@ -53,8 +59,18 @@ impl Drop for VoiceKey {
 /// 客户端和服务端在同一条连接上调用，会得到**完全相同**的结果 ——
 /// 这就是不需要额外握手的原因。
 ///
-/// `context` 让同一条 TLS 连接能派生出多把互不相干的密钥。当前传空；
-/// 将来如果要做「一个会话一把」或者「一人一把」，就把会话 id 放进去。
+/// `context` 让同一条 TLS 连接能派生出多把互不相干的密钥。上下行各一把，
+/// 见 [`UPSTREAM`] / [`DOWNSTREAM`]。
+///
+/// # 上下行为什么要分开
+///
+/// nonce 是 `session || seq` 推出来的。一条连接上如果两个方向共用一把密钥，
+/// 就得论证「服务端转发给 A 的包，其 session 永远不等于 A 自己的 session」——
+/// 这条确实成立（不会把包发回给发送者，会话 id 也不重复），但它是一条
+/// **散落在别处的、很容易在重构中被破坏的不变量**。
+///
+/// 分成两把密钥之后，这条论证直接不需要了：两个方向的密钥不同，nonce
+/// 撞不撞都无所谓。多一次密钥派生，换掉一整类将来会咬人的推理。
 pub fn derive_voice_key<T>(
     conn: &ConnectionCommon<T>,
     context: &[u8],

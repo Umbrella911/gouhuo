@@ -27,6 +27,7 @@ use voice_core::identity::Identity;
 /// 防止测试挂死，撞上它基本就等于「服务端没发」。
 const RECV_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// 这个文件只测控制面。语音那半边在 `tests/voice.rs`。
 struct TestServer {
     addr: SocketAddr,
     fingerprint: Fingerprint,
@@ -39,7 +40,11 @@ fn start(config: Config) -> TestServer {
     let tls = Arc::new(server_config(&cert).unwrap());
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
-    let hub = Arc::new(Hub::new(Server::new(config), addr.port()));
+    let voice_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let hub = Arc::new(Hub::new(Server::new(config), voice_socket));
+
+    let voice_hub = Arc::clone(&hub);
+    std::thread::spawn(move || voice_hub.run_voice());
 
     let accept_hub = Arc::clone(&hub);
     std::thread::spawn(move || server::accept_loop(listener, tls, accept_hub));

@@ -31,7 +31,7 @@
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::net::{Shutdown, TcpStream};
+use std::net::{Shutdown, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -44,6 +44,7 @@ use protocol::PublicKey;
 use voice_core::identity::Identity;
 
 use crate::state::{Broadcast, Server, SessionId};
+use crate::voice::{Incoming, VoiceRouter};
 
 /// 多久没收到任何东西就算掉线。客户端每隔几秒会发一次 Ping。
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -134,16 +135,16 @@ impl Peer {
 pub struct Hub {
     state: Mutex<Server>,
     peers: Mutex<HashMap<SessionId, Arc<Peer>>>,
-    /// 语音的 UDP 端口，填进 Welcome 里告诉客户端。
-    udp_port: u16,
+    /// UDP 那一半。
+    pub voice: VoiceRouter,
 }
 
 impl Hub {
-    pub fn new(server: Server, udp_port: u16) -> Self {
+    pub fn new(server: Server, voice_socket: UdpSocket) -> Self {
         Self {
             state: Mutex::new(server),
             peers: Mutex::new(HashMap::new()),
-            udp_port,
+            voice: VoiceRouter::new(voice_socket),
         }
     }
 
@@ -191,6 +192,58 @@ impl Hub {
         }
     }
 
+    /// 语音转发循环。**这个函数会阻塞**，在自己的线程上跑。
+    ///
+    /// # 这个循环绝不能退出
+    ///
+    /// 它一退，全服务器的语音就哑了，而控制面还好好的 —— 用户看到的是
+    /// 「大家都在线，但谁也听不见谁」，是最难报的那种故障。所以除了
+    /// socket 本身被关掉，任何错误都只是丢掉这一个包继续。
+    ///
+    /// Windows 上尤其重要：给一个已经关掉的客户端端口发包，对方的 ICMP
+    /// port unreachable 会让**下一次 `recv_from`** 报 WSAECONNRESET(10054)，
+    /// 哪怕出问题的是发送、哪怕接收队列里的包好好的。照着报错退出循环，
+    /// 结果就是「有人退出游戏，全频道哑了」。
+    pub fn run_voice(&self) {
+        // 比 MAX_DATAGRAM 大一点，这样超长的包收得到、也认得出来。
+        let mut buf = [0u8; 2048];
+        loop {
+            let (n, from) = match self.voice.socket().recv_from(&mut buf) {
+                Ok(got) => got,
+                Err(e) if fatal_socket_error(&e) => {
+                    eprintln!("语音 socket 关了：{e}");
+                    return;
+                }
+                Err(_) => continue,
+            };
+            if n > protocol::MAX_DATAGRAM {
+                continue;
+            }
+            let forward = match self.voice.accept(from, &buf[..n]) {
+                Some(Incoming::Voice(forward)) => forward,
+                Some(Incoming::Keepalive(session, header)) => {
+                    self.voice.reply_keepalive(session, header);
+                    continue;
+                }
+                None => continue,
+            };
+
+            // 只查一次状态就放开锁 —— 后面封包和发包都不持锁。
+            let targets = {
+                let state = self.state.lock().expect("state poisoned");
+                match state.channel_of(forward.from) {
+                    Some(channel) => state.sessions_in_channel(channel),
+                    None => Vec::new(),
+                }
+            };
+            if targets.len() < 2 {
+                // 频道里只有他自己。不用发给任何人。
+                continue;
+            }
+            self.voice.deliver(&forward, &targets);
+        }
+    }
+
     /// 看门狗：踢掉太久没动静的连接。
     pub fn sweep_idle(&self) {
         let stale: Vec<Arc<Peer>> = {
@@ -221,12 +274,24 @@ pub fn serve_connection(
     let mut handshake_sock = sock.try_clone()?;
     conn.complete_io(&mut handshake_sock)?;
 
+    // 语音密钥在这里就派生好。不另起一次握手 —— 这条 TLS 连接已经认证过了，
+    // RFC 5705 的 exporter 保证两端算出来一模一样。上下行分开，见
+    // transport::derive_voice_key 的文档。
+    let upstream = transport::derive_voice_key(&conn, transport::UPSTREAM)
+        .map_err(|e| io::Error::other(format!("派生上行语音密钥失败: {e}")))?;
+    let downstream = transport::derive_voice_key(&conn, transport::DOWNSTREAM)
+        .map_err(|e| io::Error::other(format!("派生下行语音密钥失败: {e}")))?;
+
     let wire = Arc::new(Mutex::new(Wire { conn, sock }));
     let mut reader = Reader::new(read_sock, Arc::clone(&wire));
 
     // ---- 认证 ----
     let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
-    let session = match authenticate(&mut reader, &wire, &hub, deadline) {
+    let keys = VoiceKeys {
+        upstream,
+        downstream,
+    };
+    let session = match authenticate(&mut reader, &wire, &hub, &keys, deadline) {
         Ok(Some(session)) => session,
         // 被拒或者对面走了：Rejected 已经发过了，这里干净收场。
         Ok(None) => return Ok(()),
@@ -249,6 +314,8 @@ pub fn serve_connection(
 
     // ---- 收尾。不管怎么出来的，都要把人从状态里摘掉并广播 ----
     hub.peers.lock().expect("peers poisoned").remove(&session);
+    // **先摘语音再改状态**：留着的话，一个刚被踢掉的人还能继续往频道里灌声音。
+    hub.voice.unregister(session);
     let events = {
         let mut state = hub.state.lock().expect("state poisoned");
         if peer.timed_out.load(Ordering::Relaxed) {
@@ -265,10 +332,17 @@ pub fn serve_connection(
 ///
 /// 返回 `Ok(None)` 表示「正常地没让他进来」（版本不对、签名不对、策略不让）——
 /// 该发的 `Rejected` 已经发出去了，调用方安静收场就行。
+/// 这条连接派生出来的两把语音密钥。
+struct VoiceKeys {
+    upstream: transport::VoiceKey,
+    downstream: transport::VoiceKey,
+}
+
 fn authenticate(
     reader: &mut Reader,
     wire: &Arc<Mutex<Wire>>,
     hub: &Arc<Hub>,
+    keys: &VoiceKeys,
     deadline: Instant,
 ) -> io::Result<Option<SessionId>> {
     use protocol::control::rejected::Reason;
@@ -355,8 +429,16 @@ fn authenticate(
         }
     }
 
+    // **在 Welcome 发出去之前挂上密钥**：客户端一收到 Welcome 就会开始发语音，
+    // 晚一步注册，开头那几个包就全被当成「不认识的会话」丢了。
+    hub.voice.register(
+        admitted.session_id,
+        keys.upstream.as_bytes(),
+        keys.downstream.as_bytes(),
+    );
+
     let mut welcome = admitted.welcome;
-    welcome.udp_port = hub.udp_port as u32;
+    welcome.udp_port = hub.voice.local_port() as u32;
     {
         let mut w = wire.lock().expect("wire poisoned");
         w.send(&welcome.into())?;
@@ -399,8 +481,9 @@ fn message_loop(
                 w.send(
                     &Pong {
                         timestamp: ping.timestamp,
-                        // 语音包计数等 UDP 那半边接上再填
-                        udp_packets_received: 0,
+                        // 客户端靠这个判断 UDP 到底通没通 —— 一直是 0
+                        // 就说明该退回 TCP 传语音了。
+                        udp_packets_received: hub.voice.packets_received(peer.session),
                     }
                     .into(),
                 )?;
@@ -532,6 +615,19 @@ impl Reader {
         Ok(pending)
     }
 }
+
+/// 这个 socket 错误是不是「没救了」。
+///
+/// 只有 socket 本身没了才算。**其他一概不算** —— 见 [`Hub::run_voice`]。
+fn fatal_socket_error(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::NotConnected | io::ErrorKind::BrokenPipe
+    ) || e.raw_os_error() == Some(WSAENOTSOCK)
+}
+
+/// Winsock 的「这个句柄不是 socket」。socket 被关掉之后 `recv_from` 报这个。
+const WSAENOTSOCK: i32 = 10038;
 
 pub fn now_ms() -> i64 {
     SystemTime::now()
