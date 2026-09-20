@@ -27,7 +27,7 @@ use voice_core::metrics::{Histogram, Summary};
 
 use crate::netem::{self, NetemConfig, NetemStats};
 use crate::relay;
-use crate::signal;
+use voice_core::signal;
 
 /// 加密用的固定密钥。M1 只关心 AEAD 的**开销**，密钥协商是 M3 的事
 /// （Noise 框架，或者从控制面 TLS 派生 —— 不自研密码学）。

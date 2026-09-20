@@ -14,7 +14,6 @@ mod netem;
 mod relay;
 mod report;
 mod run;
-mod signal;
 
 use std::process::ExitCode;
 

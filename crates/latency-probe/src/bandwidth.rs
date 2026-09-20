@@ -14,7 +14,7 @@
 use opus::{Application, Bitrate, Channels, Encoder, Signal};
 use protocol::{IPV4_UDP_OVERHEAD, SAMPLE_RATE, VOICE_HEADER_LEN};
 
-use crate::signal;
+use voice_core::signal;
 
 /// AEAD tag 长度。没开 crypto feature 时也要按开了算 —— 生产路径一定加密。
 const TAG_LEN: usize = 16;

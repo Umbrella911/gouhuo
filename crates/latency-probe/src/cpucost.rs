@@ -13,7 +13,7 @@ use opus::{Application, Bitrate, Channels, Decoder, Encoder, Signal};
 use protocol::SAMPLE_RATE;
 use voice_core::metrics::Histogram;
 
-use crate::signal;
+use voice_core::signal;
 
 #[derive(Debug, Clone, Copy)]
 pub struct CpuCostRow {

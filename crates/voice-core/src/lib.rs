@@ -5,11 +5,13 @@
 //! M2 起加 WASAPI 采集/渲染。
 //! 后续补：WASAPI 采集/渲染、APM(AEC3/NS/AGC)、Opus 编解码封装、传输、全局热键。
 
+pub mod apm;
 pub mod clock;
 pub mod jitter;
 pub mod metrics;
 pub mod net;
 pub mod redline;
+pub mod signal;
 
 #[cfg(windows)]
 pub mod sysstat;

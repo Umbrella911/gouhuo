@@ -8,6 +8,7 @@ description = "客户端语音内核：音频 IO / APM / Opus / 抖动缓冲 / �
 
 [dependencies]
 protocol.workspace = true
+webrtc-audio-processing.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = [

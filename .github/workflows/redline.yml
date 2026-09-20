@@ -9,6 +9,10 @@ env:
   CARGO_TERM_COLOR: always
   # VS 自带的 cmake 是 4.x，libopus 的 CMakeLists 声明的最低版本太老会被直接拒。
   CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+  # MAX_PATH。APM 的 bundled 构建里，abseil 的相对路径 + out 目录能顶到 265 字符
+  # （Windows 拿"当前目录 + 相对路径"在规范化**之前**比 260 上限）。
+  # 构建根必须短，否则 cl 会报"源文件不存在"——而文件其实在。见 docs/m2-apm-windows.md。
+  CARGO_TARGET_DIR: C:\t
 
 jobs:
   # 确定性的红线：编译、单元测试、带宽和编解码成本。
@@ -18,10 +22,51 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt, llvm-tools
       - uses: Swatinem/rust-cache@v2
+
+      # ---- APM 的构建前置 ----
+      # 上游 webrtc-audio-processing-sys 要从源码编 libwebrtc（meson + ninja），
+      # 而它的构建脚本没有 Windows 分支。third_party/ 下是打过补丁的副本，
+      # 但下面这几样外部工具还是得自己准备。详见 docs/m2-apm-windows.md。
+      - name: 装 meson 和 ninja
+        run: pip install meson ninja
+
+      - name: 注入 MSVC 环境
+        shell: pwsh
+        run: |
+          # meson 要在 PATH 上看得见 cl.exe 才会选 MSVC 后端。
+          # 不用第三方 action，自己从 vcvars 里捞 —— 少一个供应链依赖。
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $vcvars = Join-Path $vs "VC\Auxiliary\Build\vcvars64.bat"
+          if (-not (Test-Path $vcvars)) { throw "找不到 vcvars64.bat" }
+          cmd /c "`"$vcvars`" >nul 2>&1 && set" | ForEach-Object {
+            if ($_ -match '^([^=]+)=(.*)$') {
+              $name, $value = $matches[1], $matches[2]
+              if ($name -in @('INCLUDE','LIB','LIBPATH','PATH')) {
+                if ($name -eq 'PATH') { Add-Content $env:GITHUB_PATH $value.Split(';') }
+                else { Add-Content $env:GITHUB_ENV "$name=$value" }
+              }
+            }
+          }
+
+      - name: 定位 libclang（bindgen 要用）
+        shell: pwsh
+        run: |
+          $candidates = @(
+            "C:\Program Files\LLVM\bin",
+            "${env:ProgramFiles}\Microsoft Visual Studio\2022\Enterprise\VC\Tools\Llvm\x64\bin"
+          )
+          $found = $candidates | Where-Object { Test-Path (Join-Path $_ "libclang.dll") } | Select-Object -First 1
+          if (-not $found) { throw "找不到 libclang.dll" }
+          Add-Content $env:GITHUB_ENV "LIBCLANG_PATH=$found"
+
       - name: fmt
         run: cargo fmt --all --check
       - name: clippy
+        # third_party/ 是 vendor 进来的第三方代码，不在工作区成员里，本来就不会被扫。
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: test
         run: cargo test --workspace
@@ -61,7 +106,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: 延迟红线
-        # 判据：city 档里**存在**一个音质过关、协议延迟 <= 50 ms 的配置。
-        # 50 = 端到端红线 80 − 预留给 WASAPI 采集+渲染的 30。
-        # M2 测完设备那段之后，这个数字要跟着 redline::DEVICE_BUDGET_MS 一起改。
-        run: cargo run --release -p latency-probe -- --seconds 30 --assert-p95-ms 50
+        # 判据：city 档里**存在**一个音质过关、协议延迟 <= 49.5 ms 的配置。
+        # 49.5 = 端到端红线 80 − M2 实测的设备 30.5。
+        #
+        # 注意：M2 测完 APM 之后，端到端实测是 91.9 ms，已经破了 80 ms 红线
+        # （见 README 的「红线破了」一节）。这里只门禁**协议**那一段 ——
+        # 它是唯一还在预算内、且我们改代码会影响到的部分。
+        # 整条红线怎么办是个还没定的产品决定，定了之后这里要跟着改。
+        run: cargo run --release -p latency-probe -- --seconds 30 --assert-p95-ms 49.5

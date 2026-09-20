@@ -8,6 +8,7 @@
 //!    驱动决定 —— 不先看清楚这个，后面测出来的数字不知道该归因给谁。
 //! 2. 真开流实测。不出声：渲染灌静音，采集只读 WASAPI 自带的 QPC 时间戳。
 
+mod apm;
 mod measure;
 mod width;
 
@@ -25,6 +26,7 @@ const M1_PROTOCOL_P95_MS: f64 = 46.5;
 
 struct Args {
     seconds: f64,
+    skip_apm: bool,
     exclusive: bool,
     all: bool,
     list_only: bool,
@@ -33,6 +35,7 @@ struct Args {
 fn parse_args() -> Result<Option<Args>, String> {
     let mut a = Args {
         seconds: 3.0,
+        skip_apm: false,
         exclusive: false,
         all: false,
         list_only: false,
@@ -45,6 +48,7 @@ fn parse_args() -> Result<Option<Args>, String> {
                 a.seconds = v.parse().map_err(|_| "--seconds 要是数字")?;
             }
             "--exclusive" => a.exclusive = true,
+            "--no-apm" => a.skip_apm = true,
             "--all" => a.all = true,
             "--list" => a.list_only = true,
             "--help" | "-h" => {
@@ -66,6 +70,7 @@ fn print_help() {
     println!("  --list        只列设备能力，不打开任何流");
     println!("  --seconds F   每一路测多久，默认 3");
     println!("  --all         测所有真硬件端点，不只是默认端点");
+    println!("  --no-apm      跳过 APM 那一段（它不碰设备，纯信号处理）");
     println!("  --exclusive   顺便测独占模式");
     println!("                注意：独占期间别的程序发不出声，测几秒就恢复");
     println!();
@@ -126,7 +131,125 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
     measure_all(&targets, &args);
+    if !args.skip_apm {
+        apm_section(&args);
+    }
     ExitCode::SUCCESS
+}
+
+/// APM 那一段。不碰设备、不出声 —— 纯信号处理，喂合成信号就行。
+fn apm_section(args: &Args) {
+    println!();
+    println!("==== APM（AEC3 / 降噪 / AGC2 / 高通）====");
+    println!("不碰设备、不出声。每块单独计价，最后是实际要发布的全开配置。");
+    println!();
+    println!(
+        "{:<22} {:>10} {:>10} {:>9} {:>10} {:>8} {:>9}",
+        "config", "p50-us", "p95-us", "cpu%", "delay-ms", "peak", "level"
+    );
+    println!("{}", "-".repeat(84));
+
+    let seconds = (args.seconds * 2.0).max(4.0);
+    let rows = apm::measure_all(seconds);
+    let mut shipping_delay = None;
+    let mut shipping_cpu = None;
+
+    for row in &rows {
+        match row {
+            Ok(r) => {
+                let delay = match r.delay_ms {
+                    Some(d) => format!("{d:.2}"),
+                    None => "对不上".to_string(),
+                };
+                let peak = match r.delay_peak {
+                    Some(p) => format!("{p:.2}"),
+                    None => "-".to_string(),
+                };
+                println!(
+                    "{:<22} {:>10.1} {:>10.1} {:>8.2}% {:>10} {:>8} {:>9.3}",
+                    r.label, r.cpu_us_p50, r.cpu_us_p95, r.cpu_pct, delay, peak, r.level_ratio
+                );
+                if r.label.starts_with("全开") {
+                    shipping_delay = r.delay_ms;
+                    shipping_cpu = Some(r.cpu_pct);
+                }
+            }
+            Err(e) => println!("{:<22} {e}", "(失败)"),
+        }
+    }
+
+    println!("{}", "-".repeat(84));
+    println!("  p50/p95-us  每 10 ms 帧的处理耗时（近端 + 远端两次调用）");
+    println!(
+        "  cpu%        折算成单核占比。红线 {:.0}%，但那是**整个通话**的预算，",
+        redline::CPU_PCT
+    );
+    println!("              APM 要跟 Opus 编解码共享（M1 实测编解码 2.18%）");
+    println!("  delay-ms    互相关量到的波形延迟。APM 不会自报这个数，只能测");
+    println!("  peak        相关峰。低于 0.5 就判定认不出来了，宁可不报数");
+    println!("  level       输出/输入幅度比。AGC 会明显改它，接近 0 说明信号被吃掉了");
+
+    apm_verdict(shipping_delay, shipping_cpu);
+}
+
+fn apm_verdict(delay_ms: Option<f64>, cpu_pct: Option<f64>) {
+    const DEVICE_MS: f64 = 30.4; // M2 实测，见 m2-baseline.txt
+    const CODEC_CPU_PCT: f64 = 2.18; // M1 实测，complexity 5 / 10 ms 帧
+
+    println!();
+    println!("{}", "=".repeat(84));
+    println!("M2 完整结论：协议 + 设备 + APM");
+    println!("{}", "=".repeat(84));
+
+    match delay_ms {
+        Some(d) => {
+            let total = M1_PROTOCOL_P95_MS + DEVICE_MS + d;
+            println!(
+                "  延迟：协议 {:.1}（M1）+ 设备 {:.1}（M2）+ APM {:.2} = {:.1} ms，红线 {:.0}",
+                M1_PROTOCOL_P95_MS,
+                DEVICE_MS,
+                d,
+                total,
+                redline::E2E_MS
+            );
+            if total <= redline::E2E_MS {
+                println!("    >>> 进线，余量 {:.1} ms", redline::E2E_MS - total);
+            } else {
+                println!("    >>> 破线 {:.1} ms", total - redline::E2E_MS);
+            }
+        }
+        None => println!("  延迟：APM 那一段没测出可信数字（相关峰太低），端到端算不全"),
+    }
+
+    match cpu_pct {
+        Some(c) => {
+            let total = c + CODEC_CPU_PCT;
+            println!(
+                "  CPU：APM {:.2}% + 编解码 {:.2}%（M1）= {:.2}%，红线 {:.0}%",
+                c,
+                CODEC_CPU_PCT,
+                total,
+                redline::CPU_PCT
+            );
+            if total <= redline::CPU_PCT {
+                println!(
+                    "    >>> 进线，余量 {:.2} 个百分点",
+                    redline::CPU_PCT - total
+                );
+            } else {
+                println!("    >>> 破线 {:.2} 个百分点", total - redline::CPU_PCT);
+            }
+            println!("    注意这是单路。频道里 K 个人同时说话，解码要乘 K，APM 不用。");
+        }
+        None => println!("  CPU：没测出来"),
+    }
+
+    println!();
+    println!("  仍然没测的：");
+    println!("    - 真回声下 AEC3 的效果（这里远端喂的是静音，没有回声可消）");
+    println!("    - 声学往返（音箱 → 空气 → 麦克风）");
+    println!("    - 虚拟声卡那一层、蓝牙耳机");
+    println!("    - 内存和安装包红线（要等 voice-core 独立进程和 Tauri 打包）");
 }
 
 fn table(list: &[&DeviceInfo]) {

@@ -49,25 +49,23 @@ SteelSeries Sonar - Microphone (S~ *   ROOT     48000 Hz 2ch 32f       10.00    
 
 device                             dir      mode@queue     format             buf-ms  rep-ms     p50     p95     max  wake95 glitch
 ------------------------------------------------------------------------------------------------------------------------------------
-SteelSeries Sonar - Microphone (S~ capture  shared         48000 Hz 2ch 32f    22.00    0.00    0.83    1.49    2.00   10.91      0
-                                     ^ 这一行的采集延迟不可信：0.83 ms 小于四分之一个周期（10.0 ms），
-                                       音频物理上至少要攒够一个周期才可能交付 —— 这个时间戳不是设备记录时刻
+SteelSeries Sonar - Microphone (S~ capture  shared         48000 Hz 2ch 32f    22.00    0.00 184467441.29 184467441.72 184467441.85   10.26      0
 SteelSeries Sonar - Microphone (S~ capture  exclusive      设备不接受这个格式（0x88890008）
-麦克风 (Arctis Nova Pro Wireless)  capture  shared         48000 Hz 2ch 32f    22.00    0.00   10.29   10.38   10.46   10.74      0
-麦克风 (Arctis Nova Pro Wireless)  capture  exclusive      48000 Hz 1ch 16i     3.00    3.00    0.00    0.01    0.05    3.03      0
+麦克风 (Arctis Nova Pro Wireless)  capture  shared         48000 Hz 2ch 32f    22.00    0.00   10.24   10.33   10.44   10.76      0
+麦克风 (Arctis Nova Pro Wireless)  capture  exclusive      48000 Hz 1ch 16i     3.00    3.00    0.00    0.00    0.03    3.03      0
                                      ^ 这一行的采集延迟不可信：0.00 ms 小于四分之一个周期（3.0 ms），
                                        音频物理上至少要攒够一个周期才可能交付 —— 这个时间戳不是设备记录时刻
-SteelSeries Sonar - Gaming (Steel~ render   shared@10.0    96000 Hz 8ch 32f    22.00    0.00    0.01    0.01    0.01   10.93      0
-SteelSeries Sonar - Gaming (Steel~ render   shared@12.5    96000 Hz 8ch 32f    22.00    0.00    2.50    2.50    2.50   10.92      0
-SteelSeries Sonar - Gaming (Steel~ render   shared@15.0    96000 Hz 8ch 32f    22.00    0.00    5.00    5.00    5.00   10.94      0
-SteelSeries Sonar - Gaming (Steel~ render   shared@20.0    96000 Hz 8ch 32f    22.00    0.00   10.00   10.00   10.00   10.88      0
-SteelSeries Sonar - Gaming (Steel~ render   shared@22.0    96000 Hz 8ch 32f    22.00    0.00   12.00   12.00   12.00   10.92      0
+SteelSeries Sonar - Gaming (Steel~ render   shared@10.0    96000 Hz 8ch 32f    22.00    0.00    0.01    0.01    0.01   10.84      0
+SteelSeries Sonar - Gaming (Steel~ render   shared@12.5    96000 Hz 8ch 32f    22.00    0.00    2.50    2.50    2.50   10.78      0
+SteelSeries Sonar - Gaming (Steel~ render   shared@15.0    96000 Hz 8ch 32f    22.00    0.00    5.00    5.00    5.00   11.04      0
+SteelSeries Sonar - Gaming (Steel~ render   shared@20.0    96000 Hz 8ch 32f    22.00    0.00   10.00   10.00   10.00   10.85      0
+SteelSeries Sonar - Gaming (Steel~ render   shared@22.0    96000 Hz 8ch 32f    22.00    0.00   12.00   12.00   12.00   10.93      0
 SteelSeries Sonar - Gaming (Steel~ render   exclusive      设备不接受 48 kHz 16 位独占
-Realtek Digital Output (Realtek(R~ render   shared@10.0    48000 Hz 2ch 32f    22.00    0.00    0.02    0.02    0.02   10.01      0
+Realtek Digital Output (Realtek(R~ render   shared@10.0    48000 Hz 2ch 32f    22.00    0.00    0.02    0.02    0.02   10.02      0
 Realtek Digital Output (Realtek(R~ render   shared@12.5    48000 Hz 2ch 32f    22.00    0.00    2.50    2.50    2.50   10.03      0
-Realtek Digital Output (Realtek(R~ render   shared@15.0    48000 Hz 2ch 32f    22.00    0.00    5.00    5.00    5.00   10.03      0
-Realtek Digital Output (Realtek(R~ render   shared@20.0    48000 Hz 2ch 32f    22.00    0.00   10.00   10.00   10.00   10.01      0
-Realtek Digital Output (Realtek(R~ render   shared@22.0    48000 Hz 2ch 32f    22.00    0.00   12.00   12.00   12.00   10.02      0
+Realtek Digital Output (Realtek(R~ render   shared@15.0    48000 Hz 2ch 32f    22.00    0.00    5.00    5.00    5.00   10.02      0
+Realtek Digital Output (Realtek(R~ render   shared@20.0    48000 Hz 2ch 32f    22.00    0.00   10.00   10.00   10.00   10.02      0
+Realtek Digital Output (Realtek(R~ render   shared@22.0    48000 Hz 2ch 32f    22.00    0.00   12.00   12.00   12.00   10.01      0
 Realtek Digital Output (Realtek(R~ render   exclusive@3.0  缓冲大小错误（独占模式下缓冲必须正好是一个周期）（0x88890016）
 ------------------------------------------------------------------------------------------------------------------------------------
                从一个周期起往上扫，撑住一个就停 —— 再深只是更安全、延迟更差
@@ -85,16 +83,16 @@ M2 结论：设备到底吃掉多少
 ====================================================================================
 
   shared 模式（只算真硬件端点）
-    采集实测 p95        10.38 ms
+    采集实测 p95        10.33 ms
     渲染理论下限        10.02 ms（shared@10.0）
                         零欠载，但余量可能只有一帧 —— 漏醒一次就咔哒
     渲染可用工作点      20.00 ms（shared@20.0，余量 >= 一个周期）
-    合计（按可用工作点）30.38 ms
+    合计（按可用工作点）30.33 ms
 
   对账 M1 的假设：
-    协议 46.5（M1 实测）+ 设备 30.4（本次实测）= 端到端 76.9 ms，红线 80
-    >>> 进线，余量 3.1 ms
-    redline::DEVICE_BUDGET_MS = 30.5 ms，本次实测 30.4 ms，差 -0.1 ms
+    协议 46.5（M1 实测）+ 设备 30.3（本次实测）= 端到端 76.8 ms，红线 80
+    >>> 进线，余量 3.2 ms
+    redline::DEVICE_BUDGET_MS = 30.5 ms，本次实测 30.3 ms，差 -0.2 ms
 
   这个数字**不**代表所有用户：
     - 虚拟声卡（SteelSeries Sonar / 雷蛇 / Voicemeeter / 直播虚拟线）没算进来。
@@ -106,3 +104,37 @@ M2 结论：设备到底吃掉多少
     - 声学往返（音箱 → 空气 → 麦克风）。要出声，得单独做
     - APM（AEC3/降噪/AGC）的延迟与 CPU
     - 采集和渲染两个时钟不同步时的重采样代价
+
+==== APM（AEC3 / 降噪 / AGC2 / 高通）====
+不碰设备、不出声。每块单独计价，最后是实际要发布的全开配置。
+
+config                     p50-us     p95-us      cpu%   delay-ms     peak     level
+------------------------------------------------------------------------------------
+全关（基线）                        4.4        5.3     0.04%       0.00     1.00     1.000
+只开 AEC3                      57.6      100.5     0.58%       9.00     1.00     0.988
+只开 降噪                        21.5       35.8     0.21%       7.00     1.00     0.948
+只开 AGC2                       4.4        7.3     0.04%       0.00     1.00     1.000
+只开 高通                        13.7       21.7     0.14%       1.00     1.00     0.988
+全开（实际配置）                     66.0      100.8     0.66%      15.00     1.00     0.948
+------------------------------------------------------------------------------------
+  p50/p95-us  每 10 ms 帧的处理耗时（近端 + 远端两次调用）
+  cpu%        折算成单核占比。红线 3%，但那是**整个通话**的预算，
+              APM 要跟 Opus 编解码共享（M1 实测编解码 2.18%）
+  delay-ms    互相关量到的波形延迟。APM 不会自报这个数，只能测
+  peak        相关峰。低于 0.5 就判定认不出来了，宁可不报数
+  level       输出/输入幅度比。AGC 会明显改它，接近 0 说明信号被吃掉了
+
+====================================================================================
+M2 完整结论：协议 + 设备 + APM
+====================================================================================
+  延迟：协议 46.5（M1）+ 设备 30.4（M2）+ APM 15.00 = 91.9 ms，红线 80
+    >>> 破线 11.9 ms
+  CPU：APM 0.66% + 编解码 2.18%（M1）= 2.84%，红线 3%
+    >>> 进线，余量 0.16 个百分点
+    注意这是单路。频道里 K 个人同时说话，解码要乘 K，APM 不用。
+
+  仍然没测的：
+    - 真回声下 AEC3 的效果（这里远端喂的是静音，没有回声可消）
+    - 声学往返（音箱 → 空气 → 麦克风）
+    - 虚拟声卡那一层、蓝牙耳机
+    - 内存和安装包红线（要等 voice-core 独立进程和 Tauri 打包）

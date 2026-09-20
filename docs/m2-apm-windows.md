@@ -1,10 +1,17 @@
-# M2 的 APM 半边：`webrtc-audio-processing` 在 Windows/MSVC 上编不过
+# `webrtc-audio-processing` 在 Windows/MSVC 上编不过：诊断与补丁
+
+> **状态：已解决。** `third_party/webrtc-audio-processing-sys/` 是打过补丁的副本，
+> 六处补丁全部用 `kaimai patch:` 标出来了。环境准备用
+> [`scripts/win-buildenv.ps1`](../scripts/win-buildenv.ps1)。
+> 下面是完整诊断 —— 留着是为了把补丁提给上游时有据可依，
+> 以及以后有人问"为什么仓库里躺着 5 MB 第三方 C++ 源码"时能有个答案。
 
 调查时间：2026-09-20。机器：Windows 11 Pro / rustc 1.96 MSVC / VS BuildTools 18（MSVC 14.51）。
 
 ## 一句话结论
 
 **`webrtc-audio-processing` 2.1.0 开箱在 Windows/MSVC 上编不过，但不是死路。**
+打六个小补丁就能跑起来，补丁都在 `third_party/` 那份副本里。
 
 libwebrtc 的 APM 本体（含 abseil）在 MSVC 下**能完整编出来** —— 我编出来了，
 59814 个符号也前缀成功了。缺的是那个 Rust `-sys` crate 的构建脚本里
@@ -24,19 +31,15 @@ libwebrtc 的 APM 本体（含 abseil）在 MSVC 下**能完整编出来** —�
 | ninja 编 APM 本体（85 个目标） | ✅ 过（需要 C++20） |
 | ninja install | ✅ 过 |
 | `nm` 枚举符号 + `objcopy` 加 `v2_` 前缀 | ✅ 过（需要变通） |
-| **cc-rs 编 crate 自己的 `src/wrapper.cpp`** | ❌ **卡在这里** |
-| bindgen 生成绑定 | 没走到 |
-| 链接 | 没走到 |
+| cc-rs 编 crate 自己的 `src/wrapper.cpp` | ✅ 过（补丁 3） |
+| bindgen 生成绑定 | ✅ 过（补丁 4） |
+| 链接 | ✅ 过（补丁 5、6） |
 
-最后那一步的报错：
+（下面列的是原始诊断时每一步撞到的墙，以及对应的补丁。）
 
-```
-cl: 命令行 error D8021: 无效的数值参数"/Wno-unused-parameter"
-```
+## 六个缺口
 
-## 五个缺口
-
-### 1. `build.rs` 给 `cl` 喂 GCC 风格的编译参数（**当前的拦路虎**）
+### 1. `build.rs` 给 `cl` 喂 GCC 风格的编译参数
 
 `webrtc-audio-processing-sys-2.1.0/build.rs:403-404`：
 
@@ -106,6 +109,23 @@ crate 的 out 目录本身就吃掉 ~100 字符
 `build.rs` 用它们拷源码树和打补丁。Git for Windows 自带，但要在 PATH 上，
 而从 PowerShell 跑 cargo 时通常不在。
 
+### 6. 符号前缀和库名
+
+两个都是 Windows 独有的：
+
+**符号前缀在 COFF 上不生效。** 上游会给 webrtc 库里的每个符号加 `v2_` 前缀
+（为了让多个版本能共存），然后把 wrapper 里的引用也一起改。但在 MSVC 上：
+`llvm-objcopy --redefine-sym` 对 COFF 归档不报错也不干活；而且那段代码只找
+`libwebrtc_audio_processing_wrapper.a`，cc-rs 在 MSVC 下产出的却是 `.lib`。
+结果是库被"前缀"了、wrapper 没有，链接时一堆 unresolved external symbol。
+
+我们不需要多版本共存，所以补丁直接在 MSVC 上跳过整个前缀步骤。
+
+**库名对不上。** meson 在 MSVC 下产出的静态库叫 `lib<name>.a`
+（GNU 风格的文件名，内容其实是正经的 COFF 归档），而
+`cargo:rustc-link-lib=static=<name>` 在 MSVC 目标下找的是 `<name>.lib`。
+补丁复制一份改名，内容一样。
+
 ## 复现配方
 
 全套都要，缺一不可：
@@ -155,17 +175,24 @@ APM 这条把**处理**粒度钉死在 10 ms，但**打包**粒度不受影响 �
 APM 真正进二进制的部分通常是几 MB 量级。但 30 MB 的安装包红线摆在那儿，
 这一项必须在 M5 打包时实测，不能想当然。
 
-## 选项
+## 当初的选项，和最后选的
 
-| 方案 | 代价 | 说明 |
+| 方案 | 代价 | |
 |---|---|---|
-| **A. vendor 一份打过补丁的 `-sys`** | 仓库里多 5.4 MB 第三方源码，自己维护 | 补丁本身很小：build.rs 三行 + meson 一个选项 + nm 查找。同时把补丁提给上游 |
-| B. 等上游支持 Windows | 不可控 | 上游 meson.build **有** windows 分支，说明不是没人管，但 Rust 侧没人测过 |
-| C. 换 Windows 自带的 Voice Capture DSP | 零依赖、零体积 | 回声消除质量明显不如 AEC3，跟「外放开黑不啸叫」的目标有落差 |
-| D. 先不做 AEC，只做降噪/AGC | 拖延 | 外放用户会啸叫，等于这个场景不能用 |
+| **A. vendor 一份打过补丁的 `-sys`** | 仓库里多 5.3 MB 第三方源码，自己维护 | **选了这个** |
+| B. 等上游支持 Windows | 不可控 | |
+| C. 换 Windows 自带的 Voice Capture DSP | 零依赖、零体积，但质量不如 AEC3 | |
+| D. 先不做 AEC，只做降噪/AGC | 外放用户会啸叫，等于这个场景不能用 | |
 
-推荐 **A**：补丁小、可控，而且顺手能回馈上游。B 不可控，C 牺牲的正是设计里点名
-「绝对不要自己写」的那块核心价值，D 不解决问题。
+选 A 的理由：补丁小、可控，而且顺手能回馈上游。C 牺牲的正是设计里点名
+「绝对不要自己写」的那块核心价值。
 
-在做出选择之前，M2 的 APM 半边保持未完成状态 —— 设备那半边（30.4 ms）已经完成，
-见 `m2-baseline.txt`。
+**补丁提给上游、合并之后，删掉 `third_party/` 和根 `Cargo.toml` 里那段
+`[patch.crates-io]` 即可。** 补丁本身对 Linux/macOS 完全是 no-op ——
+全部用 `target_is_msvc()` 门控。
+
+## 结果
+
+APM 跑起来了。逐块计价见 `m2-baseline.txt`：全开配置 0.66% CPU、15 ms 延迟。
+那 15 ms 正是把端到端顶到 91.9 ms、破掉 80 ms 红线的最后一根稻草 ——
+详见 README 的「红线破了」一节。

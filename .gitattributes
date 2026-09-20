@@ -16,3 +16,8 @@
 *.ico  binary
 *.wav  binary
 *.opus binary
+
+# vendor 进来的第三方源码原样保存，不做换行符规范化 ——
+# 改动了字节就没法跟上游干净地 diff，而这份副本的全部价值就在于
+# "除了带 kaimai patch: 的地方，其余跟上游一字不差"。
+third_party/** -text
