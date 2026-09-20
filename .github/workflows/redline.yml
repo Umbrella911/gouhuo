@@ -105,12 +105,11 @@ jobs:
     runs-on: [self-hosted, windows, dedicated-audio]
     steps:
       - uses: actions/checkout@v4
-      - name: 延迟红线
-        # 判据：city 档里**存在**一个音质过关、协议延迟 <= 49.5 ms 的配置。
-        # 49.5 = 端到端红线 80 − M2 实测的设备 30.5。
+      - name: 协议链路的防回归闸
+        # 判据：city 档里**存在**一个音质过关、协议延迟在闸以内的配置。
+        # 闸的数字来自 redline::GATE_PROTOCOL_MS，不在这里重复写 ——
+        # 两处各写一份迟早会漂移，而漂移的那天 CI 是绿的。
         #
-        # 注意：M2 测完 APM 之后，端到端实测是 91.9 ms，已经破了 80 ms 红线
-        # （见 README 的「红线破了」一节）。这里只门禁**协议**那一段 ——
-        # 它是唯一还在预算内、且我们改代码会影响到的部分。
-        # 整条红线怎么办是个还没定的产品决定，定了之后这里要跟着改。
-        run: cargo run --release -p latency-probe -- --seconds 30 --assert-p95-ms 49.5
+        # 只卡协议这一段：设备那段由声卡和驱动决定，APM 那段由 libwebrtc 决定，
+        # 这两段变了不是我们改坏了。协议段一旦变慢，一定是我们干的。
+        run: cargo run --release -p latency-probe -- --seconds 30 --assert-gate

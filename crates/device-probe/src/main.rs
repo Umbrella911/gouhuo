@@ -20,10 +20,6 @@ use width::pad;
 
 const NAME_W: usize = 34;
 
-/// M1 实测的协议链路嘴到耳 p95（city 档 / 10 ms 帧 / 缓冲 2 帧）。
-/// 拿它跟设备实测值相加才是端到端。见 docs/m1-baseline.txt。
-const M1_PROTOCOL_P95_MS: f64 = 46.5;
-
 struct Args {
     seconds: f64,
     skip_apm: bool,
@@ -181,7 +177,7 @@ fn apm_section(args: &Args) {
     println!("{}", "-".repeat(84));
     println!("  p50/p95-us  每 10 ms 帧的处理耗时（近端 + 远端两次调用）");
     println!(
-        "  cpu%        折算成单核占比。红线 {:.0}%，但那是**整个通话**的预算，",
+        "  cpu%        折算成单核占比。产品线 {:.0}%，但那是**整个通话**的预算，",
         redline::CPU_PCT
     );
     println!("              APM 要跟 Opus 编解码共享（M1 实测编解码 2.18%）");
@@ -193,9 +189,6 @@ fn apm_section(args: &Args) {
 }
 
 fn apm_verdict(delay_ms: Option<f64>, cpu_pct: Option<f64>) {
-    const DEVICE_MS: f64 = 30.4; // M2 实测，见 m2-baseline.txt
-    const CODEC_CPU_PCT: f64 = 2.18; // M1 实测，complexity 5 / 10 ms 帧
-
     println!();
     println!("{}", "=".repeat(84));
     println!("M2 完整结论：协议 + 设备 + APM");
@@ -203,11 +196,11 @@ fn apm_verdict(delay_ms: Option<f64>, cpu_pct: Option<f64>) {
 
     match delay_ms {
         Some(d) => {
-            let total = M1_PROTOCOL_P95_MS + DEVICE_MS + d;
+            let total = redline::MEASURED_PROTOCOL_MS + redline::DEVICE_BUDGET_MS + d;
             println!(
-                "  延迟：协议 {:.1}（M1）+ 设备 {:.1}（M2）+ APM {:.2} = {:.1} ms，红线 {:.0}",
-                M1_PROTOCOL_P95_MS,
-                DEVICE_MS,
+                "  延迟：协议 {:.1}（M1）+ 设备 {:.1}（M2）+ APM {:.2} = {:.1} ms，产品线 {:.0}",
+                redline::MEASURED_PROTOCOL_MS,
+                redline::DEVICE_BUDGET_MS,
                 d,
                 total,
                 redline::E2E_MS
@@ -215,19 +208,28 @@ fn apm_verdict(delay_ms: Option<f64>, cpu_pct: Option<f64>) {
             if total <= redline::E2E_MS {
                 println!("    >>> 进线，余量 {:.1} ms", redline::E2E_MS - total);
             } else {
-                println!("    >>> 破线 {:.1} ms", total - redline::E2E_MS);
+                println!("    >>> 超出产品线 {:.1} ms", total - redline::E2E_MS);
             }
+            println!(
+                "    防回归闸 {:.0} ms：{}",
+                redline::GATE_E2E_MS,
+                if total <= redline::GATE_E2E_MS {
+                    "在闸内"
+                } else {
+                    "已经比今天更差了"
+                }
+            );
         }
         None => println!("  延迟：APM 那一段没测出可信数字（相关峰太低），端到端算不全"),
     }
 
     match cpu_pct {
         Some(c) => {
-            let total = c + CODEC_CPU_PCT;
+            let total = c + redline::MEASURED_CODEC_CPU_PCT;
             println!(
-                "  CPU：APM {:.2}% + 编解码 {:.2}%（M1）= {:.2}%，红线 {:.0}%",
+                "  CPU：APM {:.2}% + 编解码 {:.2}%（M1）= {:.2}%，产品线 {:.0}%",
                 c,
-                CODEC_CPU_PCT,
+                redline::MEASURED_CODEC_CPU_PCT,
                 total,
                 redline::CPU_PCT
             );
@@ -237,8 +239,20 @@ fn apm_verdict(delay_ms: Option<f64>, cpu_pct: Option<f64>) {
                     redline::CPU_PCT - total
                 );
             } else {
-                println!("    >>> 破线 {:.2} 个百分点", total - redline::CPU_PCT);
+                println!(
+                    "    >>> 超出产品线 {:.2} 个百分点",
+                    total - redline::CPU_PCT
+                );
             }
+            println!(
+                "    防回归闸 {:.0}%：{}",
+                redline::GATE_CPU_PCT,
+                if total <= redline::GATE_CPU_PCT {
+                    "在闸内"
+                } else {
+                    "已经比今天更重了"
+                }
+            );
             println!("    注意这是单路。频道里 K 个人同时说话，解码要乘 K，APM 不用。");
         }
         None => println!("  CPU：没测出来"),
@@ -600,12 +614,12 @@ fn budget(results: &[(bool, measure::Measurement)]) {
         return;
     };
 
-    let e2e = M1_PROTOCOL_P95_MS + total;
+    let e2e = redline::MEASURED_PROTOCOL_MS + total;
     println!();
     println!("  对账 M1 的假设：");
     println!(
         "    协议 {:.1}（M1 实测）+ 设备 {:.1}（本次实测）= 端到端 {:.1} ms，红线 {:.0}",
-        M1_PROTOCOL_P95_MS,
+        redline::MEASURED_PROTOCOL_MS,
         total,
         e2e,
         redline::E2E_MS

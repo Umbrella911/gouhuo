@@ -317,7 +317,7 @@ pub fn quality_ok(r: &RunResult) -> bool {
 pub fn pick_best(runs: &[RunResult]) -> Option<&RunResult> {
     runs.iter()
         .filter(|r| r.cfg.profile == VERDICT_PROFILE)
-        .filter(|r| quality_ok(r) && r.mouth_to_ear_p95_ms <= redline::PROTOCOL_BUDGET_MS)
+        .filter(|r| quality_ok(r) && r.mouth_to_ear_p95_ms <= redline::GATE_PROTOCOL_MS)
         .min_by(|a, b| {
             a.mouth_to_ear_p95_ms
                 .partial_cmp(&b.mouth_to_ear_p95_ms)
@@ -327,21 +327,24 @@ pub fn pick_best(runs: &[RunResult]) -> Option<&RunResult> {
 }
 
 pub fn verdict(runs: &[RunResult], bw: &[BandwidthRow], cpu: &[CpuCostRow]) {
-    let budget = redline::PROTOCOL_BUDGET_MS;
+    let budget = redline::GATE_PROTOCOL_MS;
     println!();
     println!("{}", "=".repeat(84));
     println!("M1 结论");
     println!("{}", "=".repeat(84));
     println!(
-        "  预算：端到端红线 {:.0} ms − 预留给 WASAPI 采集+渲染的 {:.0} ms = 协议链路 {:.0} ms",
-        redline::E2E_MS,
-        redline::DEVICE_BUDGET_MS,
-        budget
+        "  协议链路的防回归闸：{budget:.0} ms（实测 {:.1}，留了余量）",
+        redline::MEASURED_PROTOCOL_MS
     );
     println!(
-        "  （那 {:.0} ms 是假设不是实测，M2 的任务就是把它换掉）",
-        redline::DEVICE_BUDGET_MS
+        "  端到端的账：协议 {:.1} + 设备 {:.1} + APM {:.1} = {:.1} ms，产品线 {:.0} ms",
+        redline::MEASURED_PROTOCOL_MS,
+        redline::DEVICE_BUDGET_MS,
+        redline::APM_BUDGET_MS,
+        redline::MEASURED_E2E_MS,
+        redline::E2E_MS
     );
+    println!("  这里只卡协议这一段 —— 它是唯一只跟我们的代码有关的部分。");
     println!();
 
     println!("  {VERDICT_PROFILE} 档各配置：");
@@ -385,8 +388,11 @@ pub fn verdict(runs: &[RunResult], bw: &[BandwidthRow], cpu: &[CpuCostRow]) {
                 println!("      互相关实测波形延迟 {v:.1} ms（两套独立测量对得上）");
             }
             println!(
-                "      80 ms 里还剩 {:.1} ms 给设备。共享模式够不够要 M2 实测。",
-                redline::E2E_MS - best.mouth_to_ear_p95_ms
+                "      加上设备 {:.1} + APM {:.1}，端到端 {:.1} ms（产品线 {:.0}）",
+                redline::DEVICE_BUDGET_MS,
+                redline::APM_BUDGET_MS,
+                best.mouth_to_ear_p95_ms + redline::DEVICE_BUDGET_MS + redline::APM_BUDGET_MS,
+                redline::E2E_MS
             );
             if let Some(worst) = runs.iter().find(|r| {
                 r.cfg.profile == "bad"
@@ -405,10 +411,7 @@ pub fn verdict(runs: &[RunResult], bw: &[BandwidthRow], cpu: &[CpuCostRow]) {
                 );
             }
             println!();
-            println!("      下一步 M2：接 WASAPI，分别测共享模式和独占模式的采集 + 渲染延迟。");
-            println!(
-                "      两段加起来才是端到端。测完把 DEVICE_BUDGET_MS 换成实测值再回来看这张表。"
-            );
+            println!("      设备和 APM 那两段 M2 已经测完了，见 docs/m2-baseline.txt。");
         }
         None => {
             let closest = runs
@@ -438,7 +441,7 @@ pub fn verdict(runs: &[RunResult], bw: &[BandwidthRow], cpu: &[CpuCostRow]) {
             );
             println!("      2) 帧长 20 → 10 ms —— 省打包和缓冲，但固定带宽开销翻倍，先看带宽表");
             println!(
-                "      3) 设备预算 {:.0} ms 是不是定保守了？独占模式实测完再算一次",
+                "      3) 设备那 {:.1} ms 里渲染队列占 20 —— 压到 10 能省 10 ms，代价是偶尔咔哒",
                 redline::DEVICE_BUDGET_MS
             );
             println!("      4) 检查矩阵的 late 列 —— 节拍器不准的话，这不是架构的锅");

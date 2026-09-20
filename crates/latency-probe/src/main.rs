@@ -352,6 +352,9 @@ fn parse_args() -> Result<Option<Args>, String> {
                     .map_err(|_| "--complexity 要是整数")?
             }
             "--seed" => a.seed = next("--seed")?.parse().map_err(|_| "--seed 要是整数")?,
+            // 用 redline.rs 里的闸，不在命令行上重复一遍数字 ——
+            // 两处各写一份迟早会漂移，而漂移的那天 CI 是绿的。
+            "--assert-gate" => a.assert_p95_ms = Some(voice_core::redline::GATE_PROTOCOL_MS),
             "--assert-p95-ms" => {
                 a.assert_p95_ms = Some(
                     next("--assert-p95-ms")?
@@ -397,7 +400,11 @@ fn print_help() {
     println!("  --no-crypto           不加密（看 AEAD 的开销有多大）");
     println!("  --no-relay            客户端直连，不走服务端转发那一跳");
     println!("  --json                输出 JSON，给 CI 用");
-    println!("  --assert-p95-ms F     {DEFAULT_PROFILE} 档里没有音质过关且 m2e-p95 <= F 的配置就退出码 1");
+    println!(
+        "  --assert-gate         按 redline::GATE_PROTOCOL_MS（当前 {:.0} ms）卡防回归闸，CI 用这个",
+        voice_core::redline::GATE_PROTOCOL_MS
+    );
+    println!("  --assert-p95-ms F     同上但自己指定毫秒数");
     println!();
     println!("网络档位：");
     for p in PROFILES {
