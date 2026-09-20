@@ -6,7 +6,7 @@
 //! 改一个字段两边同时编译报错 —— 这就是把它独立出来的全部理由。
 //!
 //! 分层（抄 Mumble，二十年验证过）：
-//! - 控制面：TCP + TLS，登录 / 频道树 / 成员状态 / 文字消息（M3，进行中）
+//! - 控制面：TCP + TLS，登录 / 频道树 / 成员状态 / 文字消息（`control`）
 //! - 语音面：UDP，Opus 帧 + 序号 + 时间戳，ChaCha20-Poly1305（`voice`）
 //! - UDP 不通时语音包塞进 TCP 回退（M3）
 //!
@@ -16,6 +16,7 @@
 #![forbid(unsafe_code)]
 
 pub mod base32;
+pub mod control;
 #[cfg(feature = "crypto")]
 mod crypto;
 mod identity;
