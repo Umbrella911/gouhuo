@@ -1,0 +1,12 @@
+[package]
+name = "transport"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "TLS 连接怎么建、UDP 密钥从哪来。客户端和服务端共用。"
+
+[dependencies]
+protocol.workspace = true
+rustls.workspace = true
+rcgen.workspace = true

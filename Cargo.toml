@@ -1,6 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["crates/protocol", "crates/voice-core", "crates/latency-probe", "crates/device-probe"]
+members = [
+    "crates/protocol",
+    "crates/transport",
+    "crates/voice-core",
+    "crates/latency-probe",
+    "crates/device-probe",
+]
 # vendor 进来的第三方源码不是工作区成员，只是 [patch] 的目标。
 exclude = ["third_party"]
 
@@ -25,6 +31,11 @@ getrandom = "0.3"
 prost = "0.14"
 prost-build = "0.14"
 protox = "0.9"
+# TLS。选 ring 而不是 aws-lc-rs：ring 在 Windows/MSVC 上纯 cargo build 就能编，
+# aws-lc-rs 要 cmake 和 nasm。见 crates/transport/src/lib.rs 的注释。
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
+rcgen = "0.14"
+transport = { path = "crates/transport" }
 # WASAPI 要走 COM 接口，windows-sys 只有裸 FFI，接不了 IMMDeviceEnumerator/IAudioClient。
 windows = "0.62"
 # APM（AEC3 / 降噪 / AGC）。bundled 会从源码编 libwebrtc 的 APM 模块。
