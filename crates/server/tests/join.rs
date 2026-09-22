@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! 端到端：起一个真服务端，拿真 TLS + 真 Ed25519 身份连进去。
 //!

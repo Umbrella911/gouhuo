@@ -758,15 +758,17 @@ README 里的每个数字都出自这两份存档。
 | 部分 | 许可 |
 |---|---|
 | `crates/protocol` | MIT OR Apache-2.0 |
-| `crates/voice-core`、`crates/transport` | MPL-2.0 |
-| 其余（客户端、服务端、探针） | GPL-3.0-or-later |
+| `crates/voice-core`、`crates/transport`、`crates/server` | MPL-2.0 |
+| 其余（客户端、探针） | GPL-3.0-or-later |
 | `third_party/` | BSD-3-Clause（上游原样保留） |
 
 `protocol` 放开是为了让别人能自由写第三方客户端、机器人、别的语言的实现 ——
 照着协议写的人越多，这个协议的生态越好。
 
-`voice-core` / `transport` 是 MPL，所以可以链进任何产品，包括闭源商业产品；
-只有改了这两个 crate 里的文件才要公开那些改动。其余是 GPL，不想被套壳加广告再分发。
+引擎（`voice-core` / `transport`）和服务端是 MPL，可以链进任何产品、可以随便
+自部署，包括闭源商业场景；只有改了这些 crate 里的文件才要公开那些改动 ——
+自部署本来就是核心卖点，不该在公司 IT 的许可白名单那里被卡住。
+客户端是 GPL，不想被套壳加广告再分发。
 
 **对用户没有任何影响**：copyleft 的义务只在分发时产生。下载、安装、自己架服务器
 给朋友用，都没有义务；把改过的版本发给别人才要带源码。

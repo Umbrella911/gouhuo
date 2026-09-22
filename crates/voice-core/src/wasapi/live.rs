@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! 真声卡的采集和播放，实现 [`crate::audio`] 的两个 trait。
 //!
