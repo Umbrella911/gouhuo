@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! UDP socket 调优。
 //!
 //! 两件事，都是 M1 在**纯回环、零网络损伤**的链路上真被咬到之后才加的。

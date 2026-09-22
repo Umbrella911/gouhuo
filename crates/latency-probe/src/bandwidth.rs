@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! 带宽红线的测量：说话 < 40 kbps，静音（DTX 生效）< 5 kbps。
 //!
 //! 这里**不跑实时**，只把编码器喂满然后数字节 —— 带宽跟调度无关，

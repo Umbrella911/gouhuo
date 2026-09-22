@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! 真开流、真测量。
 //!
 //! # 会有什么副作用

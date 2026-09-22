@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! 端到端：起一个真的 TLS 服务端和客户端，走完整握手。
 //!

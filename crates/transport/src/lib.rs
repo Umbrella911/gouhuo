@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! 传输层：TLS 连接怎么建、UDP 密钥从哪来。
 //!

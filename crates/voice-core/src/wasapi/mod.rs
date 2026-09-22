@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! WASAPI：Windows 的音频设备接口。
 //!
 //! M2 的全部问题就一个：**80 ms 里设备到底吃掉多少？**

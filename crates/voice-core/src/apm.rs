@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! APM：回声消除、降噪、自动增益。
 //!
 //! 用 libwebrtc 的 AudioProcessing 模块（`webrtc-audio-processing` crate）。

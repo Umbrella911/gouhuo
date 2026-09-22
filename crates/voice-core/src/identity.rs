@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! 本地身份：一对 Ed25519 密钥。**痛点 #3 的答案：身份是本地文件，换机就没了。**
 //!

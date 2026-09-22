@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! 语音用的对称密钥：从 TLS 连接里派生，不另起一套握手。
 //!

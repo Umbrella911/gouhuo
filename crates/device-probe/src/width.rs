@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! 按**显示宽度**而不是字符数对齐。
 //!
 //! 设备名里全是中文（扬声器、耳机式麦克风、内部 AUX 插座），Rust 的

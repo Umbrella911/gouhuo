@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! 最小 UDP 转发器 —— 也就是服务端语音面的全部核心。
 //!
 //! 这就是「音频-only 的所谓 SFU」：收包、查频道、转发。不解码，不转码，

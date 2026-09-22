@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! 报表输出。
 //!
 //! 表格一律用 ASCII 表头，中文只出现在表格外面 —— 中日韩字符在不同终端里

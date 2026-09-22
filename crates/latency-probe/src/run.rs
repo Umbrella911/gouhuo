@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! 一次完整的「编码 → UDP → 转发 → 抖动缓冲 → 解码 → 播放」测量。
 //!
 //! 不接任何音频设备。这么做是刻意的：设备那一段（WASAPI 共享 vs 独占）

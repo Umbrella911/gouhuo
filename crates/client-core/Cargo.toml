@@ -9,8 +9,9 @@ description = "客户端逻辑，不含界面：连接、认证、状态镜像�
 [dependencies]
 protocol.workspace = true
 transport.workspace = true
-# 只要身份（Ed25519）。APM 是界面那边的事，这里不碰音频。
-voice-core = { workspace = true, default-features = false }
+# 身份（Ed25519）加整条语音链路。**不带 apm** —— 那套 C++ 工具链是可选的，
+# 见 voice-core 的 features。客户端要不要开由 client 那边决定。
+voice-core = { workspace = true, default-features = false, features = ["pipeline"] }
 rustls.workspace = true
 prost.workspace = true
 

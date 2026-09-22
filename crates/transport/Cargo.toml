@@ -3,7 +3,8 @@ name = "transport"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+# 引擎层：要能链进闭源产品，见 LICENSING.md
+license = "MPL-2.0"
 description = "TLS 连接怎么建、UDP 密钥从哪来。客户端和服务端共用。"
 
 [dependencies]

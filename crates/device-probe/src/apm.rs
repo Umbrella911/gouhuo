@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! 给 APM 逐块计价：每一块吃掉多少 CPU、多少延迟。
 //!
 //! 不接设备、不出声 —— APM 是纯信号处理，喂合成信号就行。

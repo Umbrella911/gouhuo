@@ -41,9 +41,11 @@ git rebase --signoff main    # 一串提交
 取决于改的是哪一部分，见 [`LICENSING.md`](LICENSING.md)：
 
 - `crates/protocol` → **MIT OR Apache-2.0**
+- `crates/voice-core`、`crates/transport` → **MPL-2.0**
 - 其余 → **GPL-3.0-or-later**
 
-签了 DCO 就表示你同意按对应的许可提交。
+签了 DCO 就表示你同意按对应的许可提交。**新文件请照抄同目录下已有文件的
+`SPDX-License-Identifier` 头** —— MPL 是文件级 copyleft，漏了那行会让边界变模糊。
 
 ## 本地要过的检查
 

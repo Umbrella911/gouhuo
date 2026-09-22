@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! 客户端语音内核。完全独立于 UI —— 如果实测内存不达标，把它拆成独立进程
 //! 加托盘常驻是纯工程重构，不需要重写任何逻辑。
@@ -9,11 +9,18 @@
 
 #[cfg(feature = "apm")]
 pub mod apm;
+
+#[cfg(feature = "codec")]
+pub mod audio;
 pub mod clock;
+#[cfg(feature = "codec")]
+pub mod codec;
 pub mod identity;
 pub mod jitter;
 pub mod metrics;
 pub mod net;
+#[cfg(feature = "pipeline")]
+pub mod pipeline;
 pub mod redline;
 pub mod signal;
 

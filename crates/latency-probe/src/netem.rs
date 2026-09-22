@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! 网络仿真器。
 //!
 //! 包**真的**走 UDP socket（127.0.0.1），仿真器只在发送侧排队延时、

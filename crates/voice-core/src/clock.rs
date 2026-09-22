@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! 实时节拍。
 //!
 //! Windows 默认的定时器粒度是 15.6 ms —— 对 10/20 ms 的语音帧是致命的，

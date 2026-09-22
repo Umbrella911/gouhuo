@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! 合成信号，以及信号域的延迟测量。
 //!
 //! 放在 voice-core 里是因为两个探针都要用：M1 量协议链路的波形延迟，
