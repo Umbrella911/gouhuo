@@ -1,0 +1,117 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+// 配色和基础控件。
+//
+// 痛点之一是「界面停留在 2010 年」。这里的做法不是堆装饰，而是三件事：
+// 对比度压住（长时间挂着不刺眼）、间距一致、状态变化有过渡。
+// 常驻几小时不打扰人是唯一的评判标准。
+
+export global Theme {
+    // 不用纯黑。纯黑配白字对比度过高，盯几小时眼睛受不了。
+    out property <color> bg: #16171b;
+    out property <color> panel: #1b1d22;
+    out property <color> raised: #23262d;
+    out property <color> hover: #2a2e36;
+    out property <color> line: #2e323a;
+
+    out property <color> text: #e6e8ec;
+    out property <color> dim: #868c96;
+    out property <color> faint: #5b616b;
+
+    out property <color> accent: #5b8def;
+    out property <color> accent-hover: #6f9bf2;
+    out property <color> speaking: #3fbf6d;
+    out property <color> danger: #e05a52;
+    out property <color> warn: #d9a441;
+
+    out property <length> radius: 8px;
+    out property <length> gap: 8px;
+    out property <length> pad: 14px;
+
+    // 中文字形要专门指定，不然会落到一个字重不对的回退字体上。
+    out property <string> font: "Microsoft YaHei UI";
+}
+
+export component Btn inherits Rectangle {
+    in property <string> label;
+    in property <bool> primary: false;
+    in property <bool> enabled: true;
+    callback clicked();
+
+    height: 36px;
+    border-radius: Theme.radius;
+    background: !root.enabled
+        ? Theme.raised
+        : root.primary
+            ? (touch.has-hover ? Theme.accent-hover : Theme.accent)
+            : (touch.has-hover ? Theme.hover : Theme.raised);
+    animate background { duration: 120ms; }
+
+    Text {
+        text: root.label;
+        color: root.enabled ? (root.primary ? #ffffff : Theme.text) : Theme.faint;
+        font-family: Theme.font;
+        font-size: 14px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        width: 100%;
+        height: 100%;
+    }
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+export component Field inherits Rectangle {
+    in property <string> placeholder;
+    in-out property <string> text;
+    in property <bool> password: false;
+    callback accepted();
+
+    height: 38px;
+    border-radius: Theme.radius;
+    background: Theme.bg;
+    border-width: 1px;
+    border-color: input.has-focus ? Theme.accent : Theme.line;
+    animate border-color { duration: 120ms; }
+
+    // 占位符自己画。Slint 的 TextInput 没有这个属性，而没有占位符的输入框
+    // 用户根本不知道该往里填什么 —— 邀请链接那个框尤其如此。
+    Text {
+        x: 12px;
+        visible: root.text == "";
+        text: root.placeholder;
+        color: Theme.faint;
+        font-family: Theme.font;
+        font-size: 14px;
+        vertical-alignment: center;
+        height: 100%;
+    }
+
+    input := TextInput {
+        x: 12px;
+        width: parent.width - 24px;
+        height: 100%;
+        text <=> root.text;
+        color: Theme.text;
+        font-family: Theme.font;
+        font-size: 14px;
+        vertical-alignment: center;
+        single-line: true;
+        accepted => { root.accepted(); }
+    }
+
+    forward-focus: input;
+}
+
+// 一个圆点，用来表示状态。比文字省地方，扫一眼就知道。
+export component Dot inherits Rectangle {
+    in property <color> tint;
+    width: 8px;
+    height: 8px;
+    border-radius: 4px;
+    background: root.tint;
+}

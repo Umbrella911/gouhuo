@@ -1,0 +1,384 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+import { Theme, Btn, Field, Dot } from "theme.slint";
+import { ScrollView } from "std-widgets.slint";
+
+// 频道树和成员名单压成的一行。
+//
+// 用一个扁平列表而不是嵌套模型：频道和人本来就是交替出现的，
+// 嵌套两层模型换不来任何东西，却要在 Rust 那边维护两套同步逻辑。
+export struct Row {
+    is-channel: bool,
+    id: int,
+    name: string,
+    depth: int,
+    // 下面几个只对人有意义
+    muted: bool,
+    deafened: bool,
+    speaking: bool,
+    is-me: bool,
+    // 只对频道有意义：我在不在这个频道里
+    is-current: bool,
+    // 频道里有几个人，显示在右边
+    count: int,
+}
+
+export struct ChatRow {
+    sender: string,
+    body: string,
+    time: string,
+    is-me: bool,
+}
+
+export component App inherits Window {
+    title: "开麦";
+    background: Theme.bg;
+    default-font-family: Theme.font;
+    min-width: 720px;
+    min-height: 480px;
+    preferred-width: 900px;
+    preferred-height: 620px;
+
+    // ---- 状态 ----
+    in-out property <bool> connected: false;
+    in-out property <bool> connecting: false;
+    in-out property <string> invite-link;
+    in-out property <string> nick;
+    in property <string> error-headline;
+    in property <string> error-advice;
+
+    in property <string> server-name: "开麦";
+    in property <string> my-fingerprint;
+    in property <[Row]> rows;
+    in property <[ChatRow]> chat;
+    in-out property <string> draft;
+    in-out property <bool> self-muted: false;
+    in-out property <bool> self-deafened: false;
+    // UDP 通不通。不通的时候要让用户看见，而不是让他纳闷为什么没声音。
+    in property <bool> udp-ok: false;
+
+    // ---- 回调 ----
+    callback join();
+    callback leave();
+    callback join-channel(int);
+    callback send-text();
+    callback toggle-mute();
+    callback toggle-deafen();
+
+    // =======================================================================
+    // 没连上：一个框，一个按钮
+    // =======================================================================
+    if !root.connected: VerticalLayout {
+        alignment: center;
+        padding: 48px;
+
+        VerticalLayout {
+            spacing: 18px;
+            max-width: 460px;
+            alignment: center;
+
+            Text {
+                text: "开麦";
+                color: Theme.text;
+                font-size: 30px;
+                font-weight: 600;
+                horizontal-alignment: center;
+            }
+            Text {
+                text: "把朋友发给你的那条链接粘进来";
+                color: Theme.dim;
+                font-size: 14px;
+                horizontal-alignment: center;
+            }
+
+            VerticalLayout {
+                spacing: 10px;
+                link := Field {
+                    placeholder: "kaimai://j/…";
+                    text <=> root.invite-link;
+                    accepted => { root.join(); }
+                }
+                Field {
+                    placeholder: "你的昵称";
+                    text <=> root.nick;
+                    accepted => { root.join(); }
+                }
+                Btn {
+                    label: root.connecting ? "正在连接…" : "加入";
+                    primary: true;
+                    enabled: !root.connecting && root.invite-link != "";
+                    clicked => { root.join(); }
+                }
+            }
+
+            // 报错要占住位置一起显示，别用弹窗 —— 弹窗一关，用户就想不起来
+            // 刚才说了什么，而这几行恰恰是要照着做的。
+            if root.error-headline != "": Rectangle {
+                background: #2a1d1d;
+                border-radius: Theme.radius;
+                border-width: 1px;
+                border-color: #4a2b28;
+
+                VerticalLayout {
+                    padding: 14px;
+                    spacing: 6px;
+                    Text {
+                        text: root.error-headline;
+                        color: Theme.danger;
+                        font-size: 14px;
+                        font-weight: 600;
+                        wrap: word-wrap;
+                    }
+                    Text {
+                        text: root.error-advice;
+                        color: Theme.dim;
+                        font-size: 13px;
+                        wrap: word-wrap;
+                    }
+                }
+            }
+
+            if root.my-fingerprint != "": Text {
+                text: "你的身份指纹 " + root.my-fingerprint;
+                color: Theme.faint;
+                font-size: 11px;
+                horizontal-alignment: center;
+            }
+        }
+    }
+
+    // =======================================================================
+    // 连上了：左边频道树，右边文字
+    // =======================================================================
+    if root.connected: HorizontalLayout {
+        spacing: 0;
+
+        // ---- 左：频道树 + 成员 ----
+        Rectangle {
+            width: 260px;
+            background: Theme.panel;
+
+            VerticalLayout {
+                padding: 0;
+
+                Rectangle {
+                    height: 48px;
+                    HorizontalLayout {
+                        padding-left: Theme.pad;
+                        padding-right: Theme.pad;
+                        spacing: 8px;
+                        Text {
+                            text: root.server-name;
+                            color: Theme.text;
+                            font-size: 15px;
+                            font-weight: 600;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+                    }
+                }
+                Rectangle { height: 1px; background: Theme.line; }
+
+                ScrollView {
+                    VerticalLayout {
+                        padding: 6px;
+                        spacing: 1px;
+
+                        for row[i] in root.rows: Rectangle {
+                            height: row.is-channel ? 30px : 28px;
+                            border-radius: 6px;
+                            background: row.is-channel && row.is-current
+                                ? Theme.raised
+                                : (rowtouch.has-hover && row.is-channel ? Theme.hover : transparent);
+                            animate background { duration: 100ms; }
+
+                            HorizontalLayout {
+                                padding-left: 8px + (row.depth * 12px);
+                                padding-right: 10px;
+                                spacing: 8px;
+
+                                if !row.is-channel: Dot {
+                                    y: (parent.height - self.height) / 2;
+                                    tint: row.deafened
+                                        ? Theme.danger
+                                        : (row.muted
+                                            ? Theme.warn
+                                            : (row.speaking ? Theme.speaking : Theme.faint));
+                                }
+
+                                Text {
+                                    text: row.is-channel ? row.name : "  " + row.name;
+                                    color: row.is-channel
+                                        ? (row.is-current ? Theme.text : Theme.dim)
+                                        : (row.is-me ? Theme.accent : Theme.text);
+                                    font-size: row.is-channel ? 13px : 14px;
+                                    font-weight: row.is-channel ? 600 : 400;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                    horizontal-stretch: 1;
+                                }
+
+                                if row.is-channel: Text {
+                                    text: row.count > 0 ? row.count : "";
+                                    color: Theme.faint;
+                                    font-size: 12px;
+                                    vertical-alignment: center;
+                                }
+                            }
+
+                            rowtouch := TouchArea {
+                                enabled: row.is-channel;
+                                mouse-cursor: row.is-channel ? pointer : default;
+                                clicked => { root.join-channel(row.id); }
+                            }
+                        }
+                    }
+                }
+
+                // ---- 自己的那一条，钉在底部 ----
+                Rectangle { height: 1px; background: Theme.line; }
+                Rectangle {
+                    height: 56px;
+                    background: Theme.bg;
+
+                    HorizontalLayout {
+                        padding-left: 12px;
+                        padding-right: 12px;
+                        spacing: 6px;
+
+                        VerticalLayout {
+                            alignment: center;
+                            horizontal-stretch: 1;
+                            Text {
+                                text: root.nick;
+                                color: Theme.text;
+                                font-size: 13px;
+                                overflow: elide;
+                            }
+                            HorizontalLayout {
+                                spacing: 5px;
+                                Dot {
+                                    y: 4px;
+                                    tint: root.udp-ok ? Theme.speaking : Theme.warn;
+                                }
+                                Text {
+                                    text: root.udp-ok ? "语音已连通" : "语音未连通";
+                                    color: Theme.faint;
+                                    font-size: 11px;
+                                }
+                            }
+                        }
+
+                        Btn {
+                            width: 44px;
+                            y: (parent.height - self.height) / 2;
+                            label: root.self-muted ? "🔇" : "🎤";
+                            clicked => { root.toggle-mute(); }
+                        }
+                        Btn {
+                            width: 44px;
+                            y: (parent.height - self.height) / 2;
+                            label: root.self-deafened ? "🔕" : "🔊";
+                            clicked => { root.toggle-deafen(); }
+                        }
+                    }
+                }
+            }
+        }
+
+        Rectangle { width: 1px; background: Theme.line; }
+
+        // ---- 右：文字 ----
+        Rectangle {
+            background: Theme.bg;
+            horizontal-stretch: 1;
+
+            VerticalLayout {
+                Rectangle {
+                    height: 48px;
+                    HorizontalLayout {
+                        padding-left: Theme.pad;
+                        padding-right: Theme.pad;
+                        spacing: 8px;
+                        Text {
+                            text: "频道文字";
+                            color: Theme.dim;
+                            font-size: 13px;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                        }
+                        Btn {
+                            width: 72px;
+                            y: (parent.height - self.height) / 2;
+                            label: "离开";
+                            clicked => { root.leave(); }
+                        }
+                    }
+                }
+                Rectangle { height: 1px; background: Theme.line; }
+
+                ScrollView {
+                    vertical-stretch: 1;
+                    VerticalLayout {
+                        padding: Theme.pad;
+                        spacing: 10px;
+                        alignment: start;
+
+                        if root.chat.length == 0: Text {
+                            text: "这里的消息关掉就没了 —— 发个链接、报个坐标用的，不留记录。";
+                            color: Theme.faint;
+                            font-size: 12px;
+                            wrap: word-wrap;
+                        }
+
+                        for line[i] in root.chat: VerticalLayout {
+                            spacing: 3px;
+                            HorizontalLayout {
+                                spacing: 8px;
+                                Text {
+                                    text: line.sender;
+                                    color: line.is-me ? Theme.accent : Theme.text;
+                                    font-size: 13px;
+                                    font-weight: 600;
+                                }
+                                Text {
+                                    text: line.time;
+                                    color: Theme.faint;
+                                    font-size: 11px;
+                                    vertical-alignment: bottom;
+                                }
+                            }
+                            Text {
+                                text: line.body;
+                                color: Theme.text;
+                                font-size: 14px;
+                                wrap: word-wrap;
+                            }
+                        }
+                    }
+                }
+
+                Rectangle {
+                    height: 60px;
+                    HorizontalLayout {
+                        padding: 12px;
+                        spacing: 8px;
+                        Field {
+                            placeholder: "说点什么";
+                            text <=> root.draft;
+                            horizontal-stretch: 1;
+                            accepted => { root.send-text(); }
+                        }
+                        Btn {
+                            width: 64px;
+                            label: "发送";
+                            primary: true;
+                            enabled: root.draft != "";
+                            clicked => { root.send-text(); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

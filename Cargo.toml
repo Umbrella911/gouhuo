@@ -8,6 +8,7 @@ members = [
     "crates/device-probe",
     "crates/server",
     "crates/client-core",
+    "crates/client",
 ]
 # vendor 进来的第三方源码不是工作区成员，只是 [patch] 的目标。
 exclude = ["third_party"]
@@ -39,6 +40,10 @@ rustls = { version = "0.23", default-features = false, features = ["std", "ring"
 rcgen = "0.14"
 transport = { path = "crates/transport" }
 client-core = { path = "crates/client-core" }
+# 界面。选 Slint 不选 Tauri：不带 WebView2，安装包和内存都由我们自己说了算 ——
+# 安装包 60 MB、voice-core RSS 100 MB 这两条红线完全由界面框架决定。
+slint = "1"
+slint-build = "1" 
 # WASAPI 要走 COM 接口，windows-sys 只有裸 FFI，接不了 IMMDeviceEnumerator/IAudioClient。
 windows = "0.62"
 # APM（AEC3 / 降噪 / AGC）。bundled 会从源码编 libwebrtc 的 APM 模块。
@@ -59,3 +64,14 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 debug = 1
+
+# 打包用的 profile。release 带着 debug = 1（量延迟时要看栈），发布不需要。
+#
+# panic = "abort" 只放在这里：release 上开了的话 `cargo test --release` 就跑不了，
+# 而那正是量延迟数字用的构建。
+#
+# 安装包 60 MB 是红线，所以这个 profile 的产物大小是要盯着的数字。
+[profile.dist]
+inherits = "release"
+strip = "symbols"
+panic = "abort"

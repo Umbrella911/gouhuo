@@ -79,14 +79,30 @@ pub const SPEAKING_KBPS: f64 = 80.0;
 /// M5 把 voice-core 拆成独立进程之后实测，再按实测收紧。
 pub const VOICE_CORE_RSS_MB: f64 = 100.0;
 
-/// 安装包，MB。**还没实测过。**
+/// 安装包，MB。
 ///
 /// 从 30 放到 60。libwebrtc 的 APM 静态库 strip 之后 38 MB —— 链接器会丢掉
 /// 用不到的部分，真正进二进制的通常是几 MB，但 30 MB 这条线在加进 APM 之后
 /// 风险不小。60 MB 对比 Discord 的安装包仍然很轻。
 ///
-/// M5 打包时实测，再按实测收紧。
+/// 界面接上之后实测见 [`MEASURED_CLIENT_EXE_MB`]，音频那半边还没进去。
 pub const INSTALLER_MB: f64 = 60.0;
+
+/// 客户端界面进程的常驻内存，MB。
+///
+/// 跟 [`VOICE_CORE_RSS_MB`] 是**两个预算**：设计上留着「把 voice-core 拆成
+/// 独立进程」这条路，那样两边各占各的。现在还在一个进程里，两条线加起来看。
+///
+/// 80 的依据是实测 59.4（见 [`MEASURED_UI_RSS_MB`]）加一档余量给字体缓存和
+/// 几十条消息。作为对比，Electron 系的语音软件光界面就要两三百 MB。
+pub const UI_RSS_MB: f64 = 80.0;
+
+/// 客户端冷启动到窗口出现，毫秒。
+///
+/// 这条线是给**框架选型**用的，不是给用户感知用的 —— 用户一天启动一次，
+/// 300 ms 和 800 ms 他分不出来。但它是个很灵敏的指标：一旦有人往启动路径上
+/// 加了同步 IO、或者换了个重的界面框架，这个数第一个跳。
+pub const UI_COLD_START_MS: f64 = 300.0;
 
 // ===========================================================================
 // 防回归闸：CI 卡的线，定在实测值 + 余量
@@ -154,6 +170,29 @@ pub const MEASURED_CPU_PCT: f64 = MEASURED_CODEC_CPU_PCT + MEASURED_APM_CPU_PCT;
 /// 当前实测的端到端总延迟，毫秒。改动任何一段都要把这里更新掉。
 pub const MEASURED_E2E_MS: f64 = MEASURED_PROTOCOL_MS + DEVICE_BUDGET_MS + APM_BUDGET_MS;
 
+/// 实测的客户端界面进程常驻内存，MB。
+///
+/// 连上服务器、名单和频道树都画出来之后的稳定值，dist profile。
+/// **不含音频那半边** —— WASAPI 和 APM 接进来之后要重新量。
+pub const MEASURED_UI_RSS_MB: f64 = 59.4;
+
+/// 实测的冷启动到窗口出现，毫秒（dist profile，三次取最差的稳态值）。
+///
+/// 第一次 220 ms 是磁盘缓存冷的，之后 79/92 ms。这里记稳态值：
+/// 磁盘冷不冷不由我们决定。
+pub const MEASURED_UI_COLD_START_MS: f64 = 92.0;
+
+/// 实测的客户端可执行文件大小，MB（dist profile，strip 过）。
+///
+/// **还不是安装包**：音频那半边（Opus + libwebrtc 的 APM）还没链进去，
+/// 打包器和运行库也还没算。放在这里是为了让它在涨的时候看得见。
+pub const MEASURED_CLIENT_EXE_MB: f64 = 12.5;
+
+/// 实测的服务端可执行文件大小，MB（dist profile，strip 过）。
+///
+/// 「单二进制、自部署零依赖」就是这个数。
+pub const MEASURED_SERVER_EXE_MB: f64 = 1.4;
+
 // ===========================================================================
 // 不变量：编译期就检查
 // ===========================================================================
@@ -182,6 +221,19 @@ const _: () = assert!(
 
 // 今天的实测值必须在产品线之内 —— 不然就是在承诺做不到的事。
 const _: () = assert!(MEASURED_E2E_MS <= E2E_MS, "实测的端到端延迟超出了产品线");
+
+const _: () = assert!(
+    MEASURED_UI_RSS_MB < UI_RSS_MB,
+    "界面内存实测已经顶到线了：要么是真的变重了，要么该重新定一次"
+);
+const _: () = assert!(
+    MEASURED_UI_COLD_START_MS < UI_COLD_START_MS,
+    "冷启动实测已经顶到线了：多半是有人往启动路径上加了同步 IO"
+);
+const _: () = assert!(
+    MEASURED_CLIENT_EXE_MB < INSTALLER_MB,
+    "光可执行文件就超过安装包的线了"
+);
 
 // 分段加起来要等于总数，别让某一段悄悄对不上。
 const _: () = assert!(

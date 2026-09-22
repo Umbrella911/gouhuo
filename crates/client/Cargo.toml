@@ -1,0 +1,25 @@
+[package]
+name = "client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "开麦客户端。"
+
+[[bin]]
+name = "kaimai"
+path = "src/main.rs"
+
+[dependencies]
+client-core.workspace = true
+protocol.workspace = true
+# 只要身份（Ed25519）。音频那半边接上时再开 apm feature。
+voice-core = { workspace = true, default-features = false }
+slint = { workspace = true, features = ["raw-window-handle-06"] }
+raw-window-handle = "0.6"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Time", "Win32_Graphics_Dwm"] }
+
+[build-dependencies]
+slint-build.workspace = true
