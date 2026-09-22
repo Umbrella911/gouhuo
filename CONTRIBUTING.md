@@ -49,13 +49,18 @@ git rebase --signoff main    # 一串提交
 
 ## 本地要过的检查
 
-CI 卡这三条，本地先跑一遍省事：
+CI 卡这四条，本地先跑一遍省事：
 
 ```bash
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+python scripts/check-spdx.py
 ```
+
+最后那条查的是每个 `.rs` 文件头的 SPDX 跟所属 crate 的许可对不对得上。
+期望值是从 `cargo metadata` 读出来的，所以改了某个 crate 的许可，
+这个检查会自动跟着变，不用改脚本。
 
 Windows 上首次构建要额外准备（APM 要从源码编 libwebrtc），
 用 [`scripts/win-buildenv.ps1`](scripts/win-buildenv.ps1) 检查环境缺什么。

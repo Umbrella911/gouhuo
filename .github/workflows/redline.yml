@@ -45,6 +45,24 @@ jobs:
           fi
           echo "所有提交都签了。"
 
+  # 许可边界：每个 .rs 文件头的 SPDX 要跟所属 crate 的 license 字段一致。
+  #
+  # 仓库是混合许可的（protocol 宽松 / 引擎和服务端 MPL / 客户端 GPL），而 MPL 是
+  # **文件级** copyleft —— 边界就是靠每个文件头那行划的。一个标着 GPL 的文件躺在
+  # MPL 的 crate 里，不是不整洁，是边界真的模糊了。
+  #
+  # 这事会自己复发：新文件基本都是照抄同目录的旧文件。服务端改 MPL 那次就抓到
+  # 一个（wasapi/live.rs 是前一个 commit 新增的，头还写着 GPL）。靠人眼盯不住。
+  #
+  # 不跟 deterministic 合并，因为它完全不需要编译 —— 独立跑在 ubuntu 上几秒出结果，
+  # 不用排在 MSVC + meson 那一长串前置后面。
+  license:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 检查 SPDX 头
+        run: python3 scripts/check-spdx.py
+
   # 确定性的红线：编译、单元测试、带宽和编解码成本。
   # 这些不依赖调度精度，在共享 runner 上也是可信的，所以**门禁在这里**。
   deterministic:
