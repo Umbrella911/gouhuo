@@ -59,6 +59,14 @@ export component App inherits Window {
     // 语音那边出的错（设备打不开、采样率不对）。要能直接显示给用户。
     in property <string> voice-error;
 
+    // ---- 设置 ----
+    in-out property <bool> show-settings: false;
+    in-out property <bool> ptt-mode: false;
+    /// 按住说话绑的键，给人看的名字。空表示还没绑。
+    in property <string> ptt-label;
+    /// 正在等用户按一个键。
+    in property <bool> rebinding: false;
+
     // ---- 回调 ----
     callback join();
     callback leave();
@@ -66,6 +74,10 @@ export component App inherits Window {
     callback send-text();
     callback toggle-mute();
     callback toggle-deafen();
+    callback toggle-settings();
+    callback set-ptt-mode(bool);
+    callback rebind-ptt();
+    callback cancel-rebind();
 
     // =======================================================================
     // 没连上：一个框，一个按钮
@@ -170,18 +182,91 @@ export component App inherits Window {
                         padding-right: Theme.pad;
                         spacing: 8px;
                         Text {
-                            text: root.server-name;
+                            text: root.show-settings ? "设置" : root.server-name;
                             color: Theme.text;
                             font-size: 15px;
                             font-weight: 600;
                             vertical-alignment: center;
                             overflow: elide;
+                            horizontal-stretch: 1;
+                        }
+                        Btn {
+                            width: 34px;
+                            height: 28px;
+                            y: (parent.height - self.height) / 2;
+                            label: root.show-settings ? "←" : "⚙";
+                            clicked => { root.toggle-settings(); }
                         }
                     }
                 }
                 Rectangle { height: 1px; background: Theme.line; }
 
-                ScrollView {
+                if root.show-settings: ScrollView {
+                    VerticalLayout {
+                        padding: Theme.pad;
+                        spacing: 14px;
+                        alignment: start;
+
+                        Text {
+                            text: "说话方式";
+                            color: Theme.dim;
+                            font-size: 12px;
+                        }
+                        HorizontalLayout {
+                            spacing: 6px;
+                            Btn {
+                                label: "语音激活";
+                                primary: !root.ptt-mode;
+                                clicked => { root.set-ptt-mode(false); }
+                            }
+                            Btn {
+                                label: "按住说话";
+                                primary: root.ptt-mode;
+                                clicked => { root.set-ptt-mode(true); }
+                            }
+                        }
+
+                        Text {
+                            text: "按住说话的键";
+                            color: Theme.dim;
+                            font-size: 12px;
+                        }
+                        Btn {
+                            label: root.rebinding
+                                ? "按一个键…（点这里取消）"
+                                : (root.ptt-label == "" ? "还没设置，点这里设" : root.ptt-label);
+                            primary: root.rebinding;
+                            clicked => {
+                                if (root.rebinding) { root.cancel-rebind(); }
+                                else { root.rebind-ptt(); }
+                            }
+                        }
+                        Text {
+                            text: "键盘任意键，或者鼠标侧键。游戏全屏时也有效，"
+                                + "而且不会把这个键从游戏那边抢走。";
+                            color: Theme.faint;
+                            font-size: 11px;
+                            wrap: word-wrap;
+                        }
+
+                        // 选了按住说话却没绑键 = 一个字都发不出去。必须说出来。
+                        if root.ptt-mode && root.ptt-label == "": Rectangle {
+                            background: #2a2417;
+                            border-radius: 6px;
+                            VerticalLayout {
+                                padding: 10px;
+                                Text {
+                                    text: "还没绑键，现在谁都听不见你说话。";
+                                    color: Theme.warn;
+                                    font-size: 12px;
+                                    wrap: word-wrap;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if !root.show-settings: ScrollView {
                     VerticalLayout {
                         padding: 6px;
                         spacing: 1px;
@@ -273,7 +358,13 @@ export component App inherits Window {
                                 Text {
                                     text: root.voice-error != ""
                                         ? "语音出错"
-                                        : (root.udp-ok ? "语音已连通" : "语音连接中…");
+                                        : (!root.udp-ok
+                                            ? "语音连接中…"
+                                            : (root.ptt-mode
+                                                ? (root.ptt-label == ""
+                                                    ? "没绑说话键"
+                                                    : "按住 " + root.ptt-label + " 说话")
+                                                : "语音激活"));
                                     color: root.voice-error != "" ? Theme.danger : Theme.faint;
                                     font-size: 11px;
                                     overflow: elide;

@@ -99,6 +99,8 @@ impl AudioProcessor for crate::apm::Apm {
 }
 
 /// 什么时候往外发。
+///
+/// 能在链路跑着的时候改（[`Pipeline::set_mode`]）—— 改设置不该让声音断一下。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TransmitMode {
     /// 按住才发。全局热键控制 —— 游戏里最常用的方式。
@@ -110,6 +112,33 @@ pub enum TransmitMode {
     VoiceActivity { threshold_db: f32 },
     /// 一直发。测试用。
     Always,
+}
+
+impl TransmitMode {
+    /// 塞进一个 u32 里，好放进原子变量。
+    ///
+    /// 阈值用定点存（0.01 dB 一档）：分贝值在 -120..0 之间，精度远远够用，
+    /// 而原子浮点数在稳定版 Rust 里没有。
+    fn encode(self) -> u32 {
+        match self {
+            TransmitMode::PushToTalk => 0,
+            TransmitMode::Always => 1,
+            TransmitMode::VoiceActivity { threshold_db } => {
+                let centi = (threshold_db.clamp(-120.0, 0.0) * -100.0) as u32;
+                2 | (centi << 8)
+            }
+        }
+    }
+
+    fn decode(raw: u32) -> Self {
+        match raw & 0xFF {
+            0 => TransmitMode::PushToTalk,
+            1 => TransmitMode::Always,
+            _ => TransmitMode::VoiceActivity {
+                threshold_db: -((raw >> 8) as f32) / 100.0,
+            },
+        }
+    }
 }
 
 pub struct PipelineConfig {
@@ -167,6 +196,7 @@ pub struct Pipeline {
     transmitting: Arc<AtomicBool>,
     muted: Arc<AtomicBool>,
     deafened: Arc<AtomicBool>,
+    mode: Arc<AtomicU32>,
     socket: Arc<UdpSocket>,
     shared: Arc<Shared>,
     threads: Vec<JoinHandle<()>>,
@@ -222,6 +252,7 @@ impl Pipeline {
         let transmitting = Arc::new(AtomicBool::new(false));
         let muted = Arc::new(AtomicBool::new(false));
         let deafened = Arc::new(AtomicBool::new(false));
+        let mode = Arc::new(AtomicU32::new(cfg.mode.encode()));
         let shared = Arc::new(Shared {
             speakers: Mutex::new(BTreeMap::new()),
             packets_sent: AtomicU64::new(0),
@@ -247,7 +278,7 @@ impl Pipeline {
             let session_id = cfg.session_id;
             let key = cfg.upstream_key;
             let server = cfg.server;
-            let mode = cfg.mode;
+            let mode = Arc::clone(&mode);
             threads.push(spawn("kaimai-voice-send", move || {
                 send_loop(
                     &mut *capture,
@@ -306,6 +337,7 @@ impl Pipeline {
             transmitting,
             muted,
             deafened,
+            mode,
             socket,
             shared,
             threads,
@@ -325,6 +357,17 @@ impl Pipeline {
     /// 关耳朵。链路照常转，只是播出去的是静音 —— 见 [`play_loop`]。
     pub fn set_deafened(&self, deafened: bool) {
         self.deafened.store(deafened, Ordering::Relaxed);
+    }
+
+    /// 换发送方式。链路不断，下一帧就生效。
+    pub fn set_mode(&self, mode: TransmitMode) {
+        self.mode.store(mode.encode(), Ordering::Relaxed);
+        // 从语音激活切到按住说话时，如果不清一下，可能会卡在「一直在发」
+        self.transmitting.store(false, Ordering::Relaxed);
+    }
+
+    pub fn mode(&self) -> TransmitMode {
+        TransmitMode::decode(self.mode.load(Ordering::Relaxed))
     }
 
     /// 单独调某个人的音量。0.0 是静音，1.0 是原样。
@@ -409,7 +452,7 @@ fn send_loop(
     session_id: u32,
     key: [u8; 32],
     server: SocketAddr,
-    mode: TransmitMode,
+    mode: Arc<AtomicU32>,
 ) {
     // 音频线程要优先于游戏线程被调度，否则一次掉帧就是一次爆音。
     crate::clock::boost_current_thread();
@@ -441,7 +484,7 @@ fn send_loop(
         // 闭麦压过一切。按着说话键也不行 —— 用户点了闭麦就是不想出声，
         // 这时候还漏出去一声是很糟糕的那种 bug。
         let sending = !muted.load(Ordering::Relaxed)
-            && match mode {
+            && match TransmitMode::decode(mode.load(Ordering::Relaxed)) {
                 TransmitMode::PushToTalk => transmitting.load(Ordering::Relaxed),
                 TransmitMode::VoiceActivity { threshold_db } => {
                     frame_db(&frame) > threshold_db || transmitting.load(Ordering::Relaxed)
@@ -743,6 +786,38 @@ mod tests {
         let real = intrinsic_latency_ms(DEFAULT_JITTER_FRAMES);
         assert!(real > naive, "没算前瞻：{real} vs {naive}");
         assert!(real < naive + 10.0, "前瞻不该有这么大：{real}");
+    }
+
+    /// 发送方式塞进原子变量再取出来，必须还是原来那个。
+    #[test]
+    fn transmit_modes_round_trip_through_the_atomic_encoding() {
+        for mode in [
+            TransmitMode::PushToTalk,
+            TransmitMode::Always,
+            TransmitMode::VoiceActivity {
+                threshold_db: -45.0,
+            },
+            TransmitMode::VoiceActivity {
+                threshold_db: -60.5,
+            },
+            TransmitMode::VoiceActivity { threshold_db: 0.0 },
+        ] {
+            assert_eq!(TransmitMode::decode(mode.encode()), mode, "{mode:?}");
+        }
+    }
+
+    /// 阈值越界不能变成别的模式 —— 那会让用户一个字都发不出去，
+    /// 而界面上显示的还是「语音激活」。
+    #[test]
+    fn an_out_of_range_threshold_is_clamped_not_wrapped() {
+        for threshold_db in [-500.0, 100.0, f32::NAN] {
+            let decoded =
+                TransmitMode::decode(TransmitMode::VoiceActivity { threshold_db }.encode());
+            assert!(
+                matches!(decoded, TransmitMode::VoiceActivity { .. }),
+                "{threshold_db} 变成了 {decoded:?}"
+            );
+        }
     }
 
     #[test]

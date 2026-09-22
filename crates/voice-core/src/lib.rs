@@ -15,6 +15,7 @@ pub mod audio;
 pub mod clock;
 #[cfg(feature = "codec")]
 pub mod codec;
+pub mod hotkey;
 pub mod identity;
 pub mod jitter;
 pub mod metrics;

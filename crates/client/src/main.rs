@@ -33,6 +33,17 @@ const VOICE_POLL: std::time::Duration = std::time::Duration::from_millis(200);
 /// VAD 的阈值。安静房间里够用；机械键盘会把它顶起来，那是 APM 降噪的事。
 const VAD_THRESHOLD_DB: f32 = -45.0;
 
+/// 多久看一次按住说话的键有没有被按下。
+///
+/// 这个数直接决定「按下去到开始发声」的延迟，所以要比语音状态那个快得多。
+/// 20 ms 是两帧音频，用户感觉不出来；再快就只是在空转了。
+const PTT_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
+mod settings;
+
+use settings::{Settings, TalkMode};
+use voice_core::hotkey::{Hotkeys, Key};
+
 slint::include_modules!();
 
 fn main() -> Result<(), slint::PlatformError> {
@@ -51,10 +62,37 @@ fn main() -> Result<(), slint::PlatformError> {
         }
     };
     app.set_my_fingerprint(identity.public_key().fingerprint().to_grouped_hex().into());
-    app.set_nick(default_nick().into());
 
-    // 命令行上给了链接就填进去。Windows 把 `kaimai://` 的协议处理器
-    // 就是这么调起来的 —— 所以这一个参数同时也是「一键加入」的落点。
+    // 全局热键。起不来不该让客户端打不开 —— 语音激活那条路不需要它。
+    let hotkeys = match Hotkeys::start() {
+        Ok(hotkeys) => Some(Rc::new(hotkeys)),
+        Err(e) => {
+            eprintln!("全局热键起不来，按住说话用不了：{e}");
+            None
+        }
+    };
+
+    let stored = Settings::load();
+    app.set_nick(if stored.nick.is_empty() {
+        default_nick().into()
+    } else {
+        stored.nick.clone().into()
+    });
+    app.set_invite_link(stored.last_invite.clone().into());
+    app.set_ptt_mode(stored.talk_mode == TalkMode::PushToTalk);
+    app.set_ptt_label(
+        stored
+            .ptt_key
+            .map(|key| key.label())
+            .unwrap_or_default()
+            .into(),
+    );
+    if let Some(hotkeys) = &hotkeys {
+        hotkeys.set_ptt(stored.ptt_key);
+    }
+
+    // 命令行上给了链接就填进去，盖过上次存的那条。Windows 把 `kaimai://`
+    // 的协议处理器就是这么调起来的 —— 这一个参数同时也是「一键加入」的落点。
     if let Some(link) = link_from_args() {
         app.set_invite_link(link.into());
     }
@@ -62,9 +100,14 @@ fn main() -> Result<(), slint::PlatformError> {
     // 用 Arc<Mutex<..>> 而不是 Rc<RefCell<..>>：连接结果要从后台线程
     // 搬回界面线程，那个闭包必须是 Send 的。
     let state = Arc::new(Mutex::new(State::default()));
+    state.lock().expect("state poisoned").settings = stored;
 
     wire_join(&app, &identity, &state);
     wire_actions(&app, &state);
+    wire_settings(&app, &state, hotkeys.clone());
+    if let Some(hotkeys) = hotkeys {
+        spawn_ptt_poll(app.as_weak(), Arc::clone(&state), hotkeys);
+    }
 
     // 点链接进来的老用户直接连，这才叫一键加入。
     //
@@ -122,11 +165,16 @@ struct State {
     client: Option<Client>,
     /// 语音链路。丢掉它就会把音频线程收干净。
     voice: Option<Arc<Pipeline>>,
+    settings: Settings,
 }
 
 thread_local! {
     /// 定时器丢掉就停了，所以要让它活到窗口关掉为止。
     static VOICE_TIMER: RefCell<Option<slint::Timer>> = const { RefCell::new(None) };
+    static PTT_TIMER: RefCell<Option<slint::Timer>> = const { RefCell::new(None) };
+    /// 等用户按键设置热键时，接收那个键的通道。
+    static REBIND: RefCell<Option<std::sync::mpsc::Receiver<Key>>> =
+        const { RefCell::new(None) };
 }
 
 /// 点「加入」之后发生的事。
@@ -207,7 +255,14 @@ fn on_connected(
         actual.into()
     });
 
-    state.lock().expect("state poisoned").client = Some(client.clone());
+    {
+        // 连上了才存 —— 存一条连不上的链接只会让下次打开就看到一个错误。
+        let mut locked = state.lock().expect("state poisoned");
+        locked.client = Some(client.clone());
+        locked.settings.nick = app.get_nick().to_string();
+        locked.settings.last_invite = app.get_invite_link().to_string();
+        let _ = locked.settings.save();
+    }
     app.set_connecting(false);
     app.set_connected(true);
     app.set_self_muted(false);
@@ -230,17 +285,14 @@ fn start_voice(app: &App, state: &Arc<Mutex<State>>, client: &Client) {
         return;
     };
 
+    let mode = transmit_mode(&state.lock().expect("state poisoned").settings);
     let cfg = PipelineConfig {
         session_id: client.session_id(),
         server: addr,
         upstream_key: *client.voice_keys().upstream.as_bytes(),
         downstream_key: *client.voice_keys().downstream.as_bytes(),
         jitter_frames: DEFAULT_JITTER_FRAMES,
-        // 默认语音激活。按键说话要等全局热键做出来 —— 在那之前默认按键说话的话，
-        // 用户进来会发现怎么说都没人听见。
-        mode: TransmitMode::VoiceActivity {
-            threshold_db: VAD_THRESHOLD_DB,
-        },
+        mode,
     };
 
     match Pipeline::start(
@@ -254,6 +306,108 @@ fn start_voice(app: &App, state: &Arc<Mutex<State>>, client: &Client) {
             spawn_voice_poll(app.as_weak(), Arc::clone(state));
         }
         Err(e) => app.set_voice_error(format!("{e}").into()),
+    }
+}
+
+/// 设置面板：切换说话方式、绑按住说话的键。
+fn wire_settings(app: &App, state: &Arc<Mutex<State>>, hotkeys: Option<Rc<Hotkeys>>) {
+    {
+        let weak = app.as_weak();
+        app.on_toggle_settings(move || {
+            let Some(app) = weak.upgrade() else { return };
+            app.set_show_settings(!app.get_show_settings());
+        });
+    }
+
+    {
+        let state = Arc::clone(state);
+        let weak = app.as_weak();
+        app.on_set_ptt_mode(move |ptt| {
+            let Some(app) = weak.upgrade() else { return };
+            app.set_ptt_mode(ptt);
+            let mode = {
+                let mut locked = state.lock().expect("state poisoned");
+                locked.settings.talk_mode = if ptt {
+                    TalkMode::PushToTalk
+                } else {
+                    TalkMode::VoiceActivity
+                };
+                let _ = locked.settings.save();
+                transmit_mode(&locked.settings)
+            };
+            // 链路不用重起，下一帧就按新方式走。
+            if let Some(voice) = current_voice(&state) {
+                voice.set_mode(mode);
+            }
+        });
+    }
+
+    {
+        let hotkeys = hotkeys.clone();
+        let weak = app.as_weak();
+        app.on_rebind_ptt(move || {
+            let (Some(app), Some(hotkeys)) = (weak.upgrade(), hotkeys.as_ref()) else {
+                return;
+            };
+            REBIND.with(|slot| *slot.borrow_mut() = Some(hotkeys.capture_next()));
+            app.set_rebinding(true);
+        });
+    }
+
+    {
+        let weak = app.as_weak();
+        app.on_cancel_rebind(move || {
+            let Some(app) = weak.upgrade() else { return };
+            if let Some(hotkeys) = &hotkeys {
+                hotkeys.cancel_capture();
+            }
+            REBIND.with(|slot| *slot.borrow_mut() = None);
+            app.set_rebinding(false);
+        });
+    }
+}
+
+/// 盯着按住说话的键，也顺便接住「正在设置热键」按下的那个键。
+///
+/// 轮询而不是回调：热键是在另一个线程上收到的，而改界面必须在界面线程上。
+/// 每 20 ms 读一个原子变量，比每次按键都投递一次跨线程消息便宜得多 ——
+/// 而按键在游戏里是每秒几十次的事。
+fn spawn_ptt_poll(weak: slint::Weak<App>, state: Arc<Mutex<State>>, hotkeys: Rc<Hotkeys>) {
+    let timer = slint::Timer::default();
+    timer.start(slint::TimerMode::Repeated, PTT_POLL, move || {
+        let Some(app) = weak.upgrade() else { return };
+
+        // 用户正在设置热键？看看按下来没有。
+        let captured = REBIND.with(|slot| slot.borrow().as_ref().and_then(|rx| rx.try_recv().ok()));
+        if let Some(key) = captured {
+            REBIND.with(|slot| *slot.borrow_mut() = None);
+            hotkeys.set_ptt(Some(key));
+            app.set_rebinding(false);
+            app.set_ptt_label(key.label().into());
+            let mut locked = state.lock().expect("state poisoned");
+            locked.settings.ptt_key = Some(key);
+            let _ = locked.settings.save();
+            return;
+        }
+
+        // 按住说话：把键的状态推给链路。
+        let Some(voice) = current_voice(&state) else {
+            return;
+        };
+        if app.get_ptt_mode() {
+            voice.set_transmitting(hotkeys.is_down());
+        }
+    });
+    PTT_TIMER.with(|slot| *slot.borrow_mut() = Some(timer));
+}
+
+/// 设置里的说话方式翻译成链路那边的发送方式。
+fn transmit_mode(settings: &Settings) -> TransmitMode {
+    match settings.talk_mode {
+        TalkMode::PushToTalk => TransmitMode::PushToTalk,
+        TalkMode::VoiceActivity => TransmitMode::VoiceActivity {
+            threshold_db: VAD_THRESHOLD_DB,
+        },
     }
 }
 

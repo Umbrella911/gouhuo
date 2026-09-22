@@ -49,6 +49,13 @@ windows = { workspace = true, features = [
     "Win32_System_Threading",
     "Win32_System_Variant",
     "Win32_UI_Shell_PropertiesSystem",
+    # 全局热键走 Raw Input，见 src/hotkey.rs
+    "Win32_UI_Input",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_LibraryLoader",
+    # WNDCLASSW 里有 HBRUSH/HICON 这些 GDI 类型
+    "Win32_Graphics_Gdi",
 ] }
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
