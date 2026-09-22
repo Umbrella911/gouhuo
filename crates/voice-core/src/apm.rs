@@ -324,3 +324,224 @@ mod tests {
         apm.process_capture(&mut capture).unwrap();
     }
 }
+
+#[cfg(test)]
+mod echo {
+    use super::*;
+
+    const FRAME: usize = 480;
+    /// 模拟的声学回路延迟：扬声器出声到麦克风收回来。
+    /// M2 实测这台机器上是 30 ms 上下（渲染队列 20 + 采集 10.4）。
+    const ECHO_DELAY_FRAMES: usize = 3;
+    /// 回声比原声小多少。
+    ///
+    /// -6 dB：音箱开到能听清、麦克风就在旁边。比这更小的话回声本身就
+    /// 快贴到 AEC 的残留底噪了，量出来的抑制量反映的是底噪而不是 AEC 的本事 ——
+    /// 第一版用 -12 dB，量出来只有 17 dB，差点让人以为 AEC 不行。
+    const ECHO_GAIN: f32 = 0.5;
+
+    fn energy_db(samples: &[f32]) -> f32 {
+        if samples.is_empty() {
+            return -120.0;
+        }
+        let rms = (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt();
+        if rms <= 1e-9 {
+            -120.0
+        } else {
+            20.0 * rms.log10()
+        }
+    }
+
+    /// 造一段像人说话的信号：带限到人声频段的噪声 × 音节包络。
+    ///
+    /// # 为什么不用正弦
+    ///
+    /// 第一版用的是两个正弦加一点噪声，量出来 AEC 只消掉 2.9 dB，
+    /// 差点让人以为 AEC3 不行。**纯音对自适应滤波器是退化激励** ——
+    /// 它只激发两个频点，滤波器在别的方向上根本没信息可学，
+    /// 而真实语音是宽带的。同一套代码换成白噪声立刻就有 24.8 dB。
+    ///
+    /// 所以测 AEC 一定要用宽带信号。这里在白噪声上做两件事让它更像人声：
+    /// 带限到 300–3400 Hz，再乘一个 4 Hz 上下的音节包络。
+    fn speech_like(frames: usize, seed: u64, target_rms: f32) -> Vec<f32> {
+        let mut state = seed;
+        let mut hp_prev_in = 0.0f32;
+        let mut hp_prev_out = 0.0f32;
+        let mut lp_prev = 0.0f32;
+        // 一阶高通/低通的系数，300 Hz 和 3400 Hz
+        let hp_a = (-std::f32::consts::TAU * 300.0 / 48_000.0).exp();
+        let lp_b = 1.0 - (-std::f32::consts::TAU * 3400.0 / 48_000.0).exp();
+
+        let mut out: Vec<f32> = (0..frames * FRAME)
+            .map(|i| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                // (state >> 40) 是 24 位，除以 2^23 再减 1 落在 ±1。
+                let white = (state >> 40) as f32 / 8_388_608.0 - 1.0;
+
+                hp_prev_out = hp_a * (hp_prev_out + white - hp_prev_in);
+                hp_prev_in = white;
+                lp_prev += lp_b * (hp_prev_out - lp_prev);
+
+                // 音节包络：3.5 Hz，不到零（人说话时也有气声）
+                let t = i as f32 / 48_000.0;
+                let envelope = 0.25 + 0.75 * (0.5 + 0.5 * (t * 3.5 * std::f32::consts::TAU).sin());
+                lp_prev * envelope
+            })
+            .collect();
+
+        // 归一到指定的 RMS，这样测试里的分贝数是我们说了算的
+        let rms = (out.iter().map(|s| s * s).sum::<f32>() / out.len() as f32).sqrt();
+        if rms > 1e-9 {
+            let gain = target_rms / rms;
+            for s in out.iter_mut() {
+                *s = (*s * gain).clamp(-1.0, 1.0);
+            }
+        }
+        out
+    }
+
+    /// 远端：RMS -18 dB，音箱开到能听清的量级。
+    fn farend(frames: usize) -> Vec<f32> {
+        speech_like(frames, 0x2545_F491_4F6C_DD1D, 0.125)
+    }
+
+    /// **AEC3 真的能把回声消掉。** 这是「外放开黑不啸叫」的全部依据。
+    ///
+    /// 场景：对面在说话（远端），从我的音箱放出来，又被我的麦克风收回去。
+    /// 我自己一声不吭。那么麦克风里的东西**全都是回声**，AEC 之后应该几乎什么都不剩。
+    #[test]
+    fn aec_actually_cancels_the_echo() {
+        let apm = Apm::new(
+            48_000,
+            ApmConfig {
+                echo_cancel: true,
+                noise_suppression: false,
+                // 关掉 AGC：它会在回声被消掉之后把残留拉起来，
+                // 让这个测试量的不再是「消掉了多少」。
+                gain_control: false,
+                high_pass: true,
+                stream_delay_ms: Some(ECHO_DELAY_FRAMES as u16 * 10),
+            },
+        )
+        .expect("建不了 APM");
+
+        let frames = 400;
+        let far = farend(frames);
+        let mut echo_in = Vec::new();
+        let mut mic_out = Vec::new();
+
+        for i in 0..frames {
+            let far_frame = &far[i * FRAME..(i + 1) * FRAME];
+
+            // 这一帧要播出去 —— 先告诉 AEC
+            let mut render = far_frame.to_vec();
+            apm.analyze_render(&mut render).unwrap();
+
+            // 麦克风收到的：几帧之前播出去的东西，衰减一些。我自己没说话。
+            let mut mic = if i >= ECHO_DELAY_FRAMES {
+                let src =
+                    &far[(i - ECHO_DELAY_FRAMES) * FRAME..(i - ECHO_DELAY_FRAMES + 1) * FRAME];
+                src.iter().map(|s| s * ECHO_GAIN).collect::<Vec<f32>>()
+            } else {
+                vec![0.0; FRAME]
+            };
+            echo_in.extend_from_slice(&mic);
+
+            apm.process_capture(&mut mic).unwrap();
+            mic_out.extend_from_slice(&mic);
+        }
+
+        // 先看收敛过程，再下结论。一上来就取个平均，看不出「是还没收敛」
+        // 还是「就这个水平」—— 而这两件事的应对完全不一样。
+        println!("每 50 帧（0.5 秒）一段的回声抑制：");
+        for block in 0..frames / 50 {
+            let a = block * 50 * FRAME;
+            let b = (block + 1) * 50 * FRAME;
+            println!(
+                "  {:>4.1}s  {:>5.1} dB",
+                (block * 50) as f32 * 0.01,
+                energy_db(&echo_in[a..b]) - energy_db(&mic_out[a..b])
+            );
+        }
+
+        // 只看后半段：AEC3 要时间估出回声路径，前面那段是在收敛。
+        let tail = frames * FRAME / 2;
+        let before = energy_db(&echo_in[tail..]);
+        let after = energy_db(&mic_out[tail..]);
+        let cancelled = before - after;
+
+        println!("回声进去 {before:.1} dB，出来 {after:.1} dB，消掉了 {cancelled:.1} dB");
+        assert!(
+            before < 0.0,
+            "测试信号超了满刻度，量出来的分贝不作数：{before:.1} dB"
+        );
+
+        // 两条都要满足，因为它们说的是两件事：
+        //
+        // - **抑制量**决定会不会啸叫（回路增益要小于 1）
+        // - **残留的绝对电平**决定听不听得见。AEC3 压到一个固定的底噪就到头了，
+        //   所以回声越响，抑制量的数字越好看 —— 只看比值会被这一点骗到。
+        assert!(
+            cancelled > 25.0,
+            "AEC 只消掉了 {cancelled:.1} dB —— 外放开黑会啸叫"
+        );
+        assert!(after < -40.0, "残留回声 {after:.1} dB，还听得见");
+    }
+
+    /// **没有回声的时候，AEC 不该动我的声音。**
+    ///
+    /// 这是真正会砸掉产品的那条：戴耳机的人根本没有回声，如果开了 AEC
+    /// 之后他的声音被削掉一截，那这个功能就是负收益 —— 而绝大多数人戴耳机。
+    #[test]
+    fn aec_leaves_speech_alone_when_there_is_no_echo() {
+        let apm = Apm::new(
+            48_000,
+            ApmConfig {
+                echo_cancel: true,
+                noise_suppression: false,
+                gain_control: false,
+                high_pass: true,
+                stream_delay_ms: Some(ECHO_DELAY_FRAMES as u16 * 10),
+            },
+        )
+        .expect("建不了 APM");
+
+        let frames = 400;
+        let near = speech_like(frames, 0x9E37_79B9_7F4A_7C15, 0.125);
+        let silence = vec![0.0f32; FRAME];
+
+        let mut out = Vec::new();
+        for i in 0..frames {
+            // 远端全程静音：耳机用户的实际情况
+            let mut render = silence.clone();
+            apm.analyze_render(&mut render).unwrap();
+
+            let mut mic = near[i * FRAME..(i + 1) * FRAME].to_vec();
+            apm.process_capture(&mut mic).unwrap();
+            out.extend_from_slice(&mic);
+        }
+
+        let tail = frames * FRAME / 2;
+        let before = energy_db(&near[tail..]);
+        let after = energy_db(&out[tail..]);
+        let lost = before - after;
+
+        println!("没有回声时：进去 {before:.1} dB，出来 {after:.1} dB，掉了 {lost:.1} dB");
+        assert!(
+            lost < 3.0,
+            "没有回声却把声音削掉了 {lost:.1} dB —— 戴耳机的人开 AEC 反而变差"
+        );
+    }
+
+    // 双讲（两个人同时说）的表现没有在这里量。
+    //
+    // 试过了，量不出有意义的数字：合成的近端和远端在 AEC3 眼里是同一种东西
+    // （同样的带限噪声、同样的音节包络），抑制器分不开，于是把两个一起压到
+    // 残留底噪 —— 得到的是测试信号的性质，不是 AEC3 的性质。
+    //
+    // 真实双讲里两个人的声音在频谱和时序上都是可区分的。要认真量这件事
+    // 得用 ITU-T G.168 那样的标准测试集，或者干脆戴上耳机找个人说话。
+    // 在那之前，与其报一个站不住的数字，不如明说没量。
+}

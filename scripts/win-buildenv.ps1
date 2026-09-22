@@ -1,4 +1,4 @@
-# 准备 Windows 上的构建环境，然后在这个环境里跑命令。
+﻿# 准备 Windows 上的构建环境，然后在这个环境里跑命令。
 #
 # 为什么需要这个脚本：APM（webrtc-audio-processing）要从源码编 libwebrtc，
 # 而那套构建是 Linux 习惯的 —— meson + ninja + nm，还要 MSVC 环境和 libclang。

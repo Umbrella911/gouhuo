@@ -186,6 +186,22 @@ pub const MEASURED_E2E_MS: f64 = MEASURED_PROTOCOL_MS + DEVICE_BUDGET_MS + APM_B
 /// **不含声卡**（合成设备一到节拍就交出整帧）**也不含 APM**。
 pub const MEASURED_PIPELINE_MS: f64 = 36.7;
 
+/// **实测**的回声抑制量，分贝。
+///
+/// 条件：类语音的宽带回声（带限到 300–3400 Hz 的噪声 × 音节包络），
+/// 回声电平 −24 dB，声学回路延迟 30 ms。收敛之后稳定在这个数。
+///
+/// 残留的绝对电平是 −50 dB —— 那才是「听不听得见」的判据。
+/// AEC3 压到一个固定底噪就到头了，所以回声越响，抑制量的数字越好看；
+/// 只看比值会被这一点骗到。
+pub const MEASURED_AEC_DB: f64 = 26.0;
+
+/// **实测**：没有回声时 AEC 对人声的损伤，分贝。
+///
+/// 这条比抑制量更要紧 —— 绝大多数人戴耳机，根本没有回声。
+/// 开了 AEC 反而把他的声音削掉一截的话，这个功能就是负收益。
+pub const MEASURED_AEC_HARM_DB: f64 = 0.2;
+
 /// 实测的客户端界面进程常驻内存，MB。
 ///
 /// 连上服务器、名单和频道树都画出来之后的稳定值，dist profile。
@@ -249,6 +265,15 @@ const _: () = assert!(
 const _: () = assert!(
     MEASURED_CLIENT_EXE_MB < INSTALLER_MB,
     "光可执行文件就超过安装包的线了"
+);
+
+const _: () = assert!(
+    MEASURED_AEC_HARM_DB < 3.0,
+    "没有回声时 AEC 把人声削掉太多了 —— 戴耳机的人开它反而变差"
+);
+const _: () = assert!(
+    MEASURED_AEC_DB > 20.0,
+    "回声抑制量掉到 20 dB 以下，外放开黑会啸叫"
 );
 
 // 分段加起来要等于总数，别让某一段悄悄对不上。

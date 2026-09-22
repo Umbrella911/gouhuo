@@ -2,13 +2,14 @@
 // 这是 webrtc-audio-processing-sys 2.1.0 的**打过补丁的副本**（kaimai 项目）。
 //
 // 上游这个 crate 的构建脚本里一个 Windows 分支都没有，开箱在 MSVC 上编不过。
-// 打补丁的地方全部用 `kaimai patch:` 注释标出来了，一共六处：
+// 打补丁的地方全部用 `kaimai patch:` 注释标出来了，一共七处：
 //   1. meson 在 MSVC 下要 -Dcpp_std=c++20（WebRTC 用了 designated initializer）
 //   2. nm 要能从 rustc sysroot 里找（Windows 上 PATH 里没有 nm）
 //   3. cc-rs 的编译参数在 MSVC 下不能用 GCC 风格
 //   4. bindgen 解析 MSVC 的 STL 头要 _ALLOW_COMPILER_AND_STL_VERSION_MISMATCH
 //   5. MSVC 上要跳过符号前缀（对 COFF 归档不生效，反而让两边对不上）
 //   6. meson 产出的 lib<name>.a 要补一个 MSVC 认的 <name>.lib 名字
+//   7. 拷贝源码树用的是 `cp -a`，Windows 上没有这个命令
 //
 // 诊断全文见 docs/m2-apm-windows.md。这些补丁应该提给上游，合并之后就能
 // 删掉整个 third_party/ 目录、回到 crates.io 的版本。
@@ -224,12 +225,40 @@ mod webrtc {
         );
 
         // Copy the sources to under out directory so that we can patch it without consequences.
-        let mut cp = Command::new("cp");
-        // Copy recursively, preserve attributes. Use trailing dot trick to prevent creating
-        // `webrtc-audio-processing/webrtc-audio-processing` nesting on a 2nd invocation.
-        cp.arg("-a").arg(bundled_source_path.join(".")).arg(&webrtc_source_dir);
-        let status = cp.status().context("executing cp")?;
-        assert!(status.success(), "Command failed: {:?}", &cp);
+        //
+        // kaimai patch 7: 上游这里调的是 `cp -a`。Windows 上没有 `cp` ——
+        // 装了 Git for Windows 的机器上碰巧有一个，但那是个不该依赖的巧合：
+        // 它在不在 PATH 上取决于用户装 Git 时选了哪个选项。
+        // 用 std::fs 自己递归拷，顺便不用再操心 `-a` 在各平台上的差异。
+        copy_dir_recursive(bundled_source_path, &webrtc_source_dir)
+            .context("copying the bundled webrtc-audio-processing sources")?;
+
+        /// kaimai patch 7：递归拷贝目录，代替 `cp -a`。
+        ///
+        /// 上游用尾部 `.` 的技巧避免第二次调用时嵌套出
+        /// `webrtc-audio-processing/webrtc-audio-processing`；这里按
+        /// 「把内容拷进目标目录」来实现，同样没有嵌套问题。
+        fn copy_dir_recursive(from: &Path, to: &Path) -> std::io::Result<()> {
+            std::fs::create_dir_all(to)?;
+            for entry in std::fs::read_dir(from)? {
+                let entry = entry?;
+                let target = to.join(entry.file_name());
+                if entry.file_type()?.is_dir() {
+                    copy_dir_recursive(&entry.path(), &target)?;
+                } else {
+                    // 已经存在的可能是只读的（上一次拷过来的），先放开再覆盖。
+                    if let Ok(meta) = std::fs::metadata(&target) {
+                        let mut perms = meta.permissions();
+                        if perms.readonly() {
+                            perms.set_readonly(false);
+                            let _ = std::fs::set_permissions(&target, perms);
+                        }
+                    }
+                    std::fs::copy(entry.path(), &target)?;
+                }
+            }
+            Ok(())
+        }
 
         #[cfg(feature = "experimental-unlink-ns")]
         apply_patch("unlink-multichannel-noise-suppression-filters.patch")?;
