@@ -29,8 +29,12 @@ export struct ScanRow {
     verdict: string,
     /// 真的收到人声了。
     ok: bool,
-    /// 在设备下拉框里的位置，点一下就选中它。
-    index: int,
+    /// WASAPI 的设备 id。
+    ///
+    /// **带 id 而不是下拉框里的序号**：序号要靠两次列举的顺序一致才对得上，
+    /// 对不上就会悄悄选中别的设备 —— 用户点了 A 结果用上了 B，
+    /// 而界面上什么都不会说。
+    id: string,
 }
 
 export struct ChatRow {
@@ -114,6 +118,7 @@ export component App inherits Window {
     callback pick-capture(int);
     callback pick-render(int);
     callback scan-microphones();
+    callback pick-capture-id(string);
 
     // =======================================================================
     // 没连上：一个框，一个按钮
@@ -573,11 +578,22 @@ export component App inherits Window {
                         current-index <=> root.capture-index;
                         selected(v) => { root.pick-capture(root.capture-index); }
                     }
+                    // **始终显示现在真正打开的是哪个设备。**
+                    //
+                    // 「系统默认」到底是哪一个，用户是不知道的；而麦克风灯亮不亮、
+                    // 是哪个设备的灯在亮，是他唯一的旁证。这一行把那个旁证坐实。
+                    Text {
+                        text: root.capture-in-use == ""
+                            ? "正在打开设备…"
+                            : "正在用：" + root.capture-in-use;
+                        color: Theme.faint;
+                        font-size: 11px;
+                        wrap: word-wrap;
+                    }
                     // 玩家机器上默认麦克风经常是 Sonar / Synapse 这类虚拟设备，
                     // 而它们没在路由的时候是纯静音的。必须说出来。
                     if root.capture-is-virtual: Text {
-                        text: "现在用的是虚拟声卡（" + root.capture-in-use
-                            + "）。这类设备没在路由的时候是纯静音的，"
+                        text: "这是个虚拟声卡。这类设备没在路由的时候是纯静音的，"
                             + "条子不动就换一个带「麦克风」字样的真设备试试。";
                         color: Theme.warn;
                         font-size: 11px;
@@ -649,7 +665,7 @@ export component App inherits Window {
                             }
                             scantouch := TouchArea {
                                 mouse-cursor: pointer;
-                                clicked => { root.pick-capture(row.index); }
+                                clicked => { root.pick-capture-id(row.id); }
                             }
                         }
                         Text {

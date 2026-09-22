@@ -470,7 +470,6 @@ fn wire_scan(app: &App, state: &Arc<Mutex<State>>) {
         std::thread::spawn(move || {
             let results = scan_microphones(SCAN_PER_DEVICE);
             let _ = weak.upgrade_in_event_loop(move |app| {
-                let ids = state.lock().expect("state poisoned").capture_ids.clone();
                 let rows: Vec<ScanRow> = results
                     .iter()
                     .map(|result| ScanRow {
@@ -486,12 +485,7 @@ fn wire_scan(app: &App, state: &Arc<Mutex<State>>) {
                         .into(),
                         verdict: result.verdict().into(),
                         ok: result.hears_something(),
-                        // 对回下拉框里的位置。对不上就退回「系统默认」，
-                        // 总比点一下没反应强。
-                        index: ids
-                            .iter()
-                            .position(|id| id.as_deref() == Some(result.id.as_str()))
-                            .unwrap_or(0) as i32,
+                        id: result.id.clone().into(),
                     })
                     .collect();
                 app.set_scan_results(ModelRc::new(VecModel::from(rows)));
@@ -516,6 +510,33 @@ fn wire_settings(app: &App, state: &Arc<Mutex<State>>, hotkeys: Option<Rc<Hotkey
                 let id = locked.capture_ids.get(index as usize).cloned().flatten();
                 locked.settings.capture_device = id;
                 let _ = locked.settings.save();
+            }
+            restart_voice(&app, &state);
+        });
+    }
+
+    {
+        // 从检测结果里点一行：直接按设备 id 选，不经过下拉框的序号。
+        let state = Arc::clone(state);
+        let weak = app.as_weak();
+        app.on_pick_capture_id(move |id| {
+            let Some(app) = weak.upgrade() else { return };
+            let id = id.to_string();
+            {
+                let mut locked = state.lock().expect("state poisoned");
+                locked.settings.capture_device = Some(id.clone());
+                let _ = locked.settings.save();
+            }
+            // 下拉框跟着走。对不上就保持原样 —— 真正生效的是上面存的 id，
+            // 下拉框显示得对不对只是好看不好看的事。
+            let index = state
+                .lock()
+                .expect("state poisoned")
+                .capture_ids
+                .iter()
+                .position(|known| known.as_deref() == Some(id.as_str()));
+            if let Some(index) = index {
+                app.set_capture_index(index as i32);
             }
             restart_voice(&app, &state);
         });

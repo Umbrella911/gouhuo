@@ -462,3 +462,64 @@ mod live_scan {
         }
     }
 }
+
+#[cfg(test)]
+mod endurance {
+    use super::*;
+
+    /// 每个麦克风开着跑一段时间，看谁**中途死掉**。
+    ///
+    /// ```bash
+    /// cargo test -p voice-core --lib endurance -- --ignored --nocapture
+    /// ```
+    ///
+    /// 「麦克风灯闪一下就灭」对应的就是这里报出来的死亡 —— 设备打开了，
+    /// 但某一次读失败，两个线程一起退出，设备被还回去。
+    #[test]
+    #[ignore = "要真声卡，而且要跑十几秒"]
+    #[cfg(windows)]
+    fn every_microphone_survives_being_held_open() {
+        let endpoints =
+            crate::wasapi::list_endpoints(crate::wasapi::Direction::Capture).unwrap_or_default();
+        assert!(!endpoints.is_empty(), "一个录音设备都没有");
+
+        const HOLD: std::time::Duration = std::time::Duration::from_secs(6);
+        println!();
+        for endpoint in &endpoints {
+            let check = MicCheck::start(
+                Box::new(crate::wasapi::WasapiCapture::new(Some(endpoint.id.clone()))),
+                Box::new(crate::audio::NullRender::default()),
+                None,
+            )
+            .expect("起不了试麦");
+
+            // 每 200 ms 看一次还活着没有，记下死亡时刻
+            let started = std::time::Instant::now();
+            let mut died_at = None;
+            while started.elapsed() < HOLD {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                if check.error().is_some() {
+                    died_at = Some(started.elapsed());
+                    break;
+                }
+            }
+
+            let verdict = match (died_at, check.error()) {
+                (Some(t), Some(e)) => format!(
+                    "**{:.1} 秒后死了**：{}",
+                    t.as_secs_f32(),
+                    e.lines().next().unwrap_or("")
+                ),
+                _ if check.is_running() => format!("撑住了（{:.0} 秒）", HOLD.as_secs_f32()),
+                _ => "一帧都没读到".to_string(),
+            };
+            let kind = if endpoint.is_hardware {
+                ""
+            } else {
+                "（虚拟）"
+            };
+            println!("{}{kind}\n    {verdict}", endpoint.name);
+        }
+        println!();
+    }
+}
