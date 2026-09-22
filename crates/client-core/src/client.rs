@@ -63,7 +63,10 @@ pub struct Client {
     roster: Arc<Mutex<Roster>>,
     session_id: u32,
     udp_port: u16,
-    /// 语音密钥。UDP 那半边接上之后用。
+    /// 邀请链接里写的服务器地址。语音要往这儿发 —— **不要用控制面那条
+    /// TCP 连接的对端地址**：服务器可能在 NAT 后面，两者未必一样，
+    /// 而邀请链接里的那个才是用户实际能连上的。
+    host: String,
     voice: Arc<VoiceKeys>,
 }
 
@@ -143,6 +146,7 @@ impl Client {
             roster,
             session_id: welcome.session_id,
             udp_port: welcome.udp_port as u16,
+            host: invite.host.clone(),
             voice: Arc::new(voice),
         };
 
@@ -159,6 +163,11 @@ impl Client {
     /// 语音要发到服务器的哪个 UDP 端口。
     pub fn udp_port(&self) -> u16 {
         self.udp_port
+    }
+
+    /// 服务器的地址，取自邀请链接。
+    pub fn server_host(&self) -> &str {
+        &self.host
     }
 
     pub fn voice_keys(&self) -> &VoiceKeys {

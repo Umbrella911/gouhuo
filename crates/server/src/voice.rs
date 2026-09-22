@@ -56,6 +56,12 @@ struct VoicePeer {
     addr: Option<SocketAddr>,
     received: u64,
     replay: ReplayWindow,
+    /// 保活包**单独一个窗口**。
+    ///
+    /// 它跟语音是两条互不相干的序号流：语音每秒推进 100，保活每 2 秒才一个。
+    /// 共用一个窗口的话，保活的序号会飞快地落到窗口外，然后被当成重放丢掉 ——
+    /// 表现是「UDP 时通时不通」，而语音本身看着一切正常。
+    keepalive_replay: ReplayWindow,
 }
 
 /// UDP 这一半。
@@ -105,6 +111,7 @@ impl VoiceRouter {
                 addr: None,
                 received: 0,
                 replay: ReplayWindow::default(),
+                keepalive_replay: ReplayWindow::default(),
             },
         );
     }
@@ -155,7 +162,12 @@ impl VoiceRouter {
             Err(ProtocolError::Crypto) | Err(_) => return None,
         };
 
-        if !peer.replay.accept(header.seq) {
+        let window = if header.is_keepalive() {
+            &mut peer.keepalive_replay
+        } else {
+            &mut peer.replay
+        };
+        if !window.accept(header.seq) {
             return None;
         }
         peer.received += 1;
@@ -300,6 +312,7 @@ impl ReplayWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use protocol::FLAG_KEEPALIVE;
 
     #[test]
     fn in_order_packets_all_pass() {
@@ -414,6 +427,62 @@ mod tests {
         // 地址必须还是真人的 —— 否则就是一次不需要密钥的窃听
         let peers = router.peers.lock().unwrap();
         assert_eq!(peers[&7].addr, Some(real), "伪造的包把地址劫走了");
+    }
+
+    /// **保活和语音不能共用防重放窗口。**
+    ///
+    /// 语音每秒把窗口推进 100，保活每 2 秒才一个。共用一个窗口的话，
+    /// 保活的序号很快就落在窗口外被当成重放丢掉 —— 表现是「UDP 时通时不通」，
+    /// 而语音本身看着一切正常，极难查。
+    #[test]
+    fn keepalives_survive_a_flood_of_voice_packets() {
+        let router = VoiceRouter::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+        let up = [1u8; 32];
+        router.register(7, &up, &[2u8; 32]);
+        let cipher = VoiceCipher::new(&up);
+        let from: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+        let send = |seq: u32, flags: u8| {
+            let mut wire = Vec::new();
+            cipher
+                .seal(
+                    VoiceHeader {
+                        session: 7,
+                        seq,
+                        timestamp: seq.wrapping_mul(480),
+                        flags,
+                    },
+                    &[9; 40],
+                    &mut wire,
+                )
+                .unwrap();
+            router.accept(from, &wire)
+        };
+
+        // 保活先来一个
+        assert!(matches!(
+            send(0, FLAG_KEEPALIVE),
+            Some(Incoming::Keepalive(..))
+        ));
+
+        // 然后灌一大堆语音，远超窗口宽度
+        for seq in 0..500u32 {
+            assert!(
+                matches!(send(seq, 0), Some(Incoming::Voice(_))),
+                "语音包 {seq} 被丢了"
+            );
+        }
+
+        // 接着来的保活照样要收 —— 它有自己的窗口
+        for seq in 1..5u32 {
+            assert!(
+                matches!(send(seq, FLAG_KEEPALIVE), Some(Incoming::Keepalive(..))),
+                "语音灌了一波之后，保活 {seq} 被当成重放丢了"
+            );
+        }
+
+        // 但保活自己的重放还是要挡住
+        assert!(send(1, FLAG_KEEPALIVE).is_none(), "保活的重放没挡住");
     }
 
     #[test]

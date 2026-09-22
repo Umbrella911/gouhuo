@@ -130,7 +130,7 @@ fn a_chirp_makes_it_all_the_way_through() {
 
     let mut source = vec![0.0f32; FRAME_SAMPLES * LEAD_FRAMES];
     source.extend_from_slice(&chirp_f32(FRAME_SAMPLES * CHIRP_FRAMES));
-    source.extend(std::iter::repeat_n(0.0, FRAME_SAMPLES * TAIL_FRAMES));
+    source.extend(std::iter::repeat(0.0).take(FRAME_SAMPLES * TAIL_FRAMES));
 
     let capture = SyntheticCapture::new(source.clone()).then_silence();
     let alice_voice = Pipeline::start(
@@ -186,7 +186,7 @@ fn end_to_end_latency_is_measured_not_added_up() {
 
     let mut source = vec![0.0f32; FRAME_SAMPLES * LEAD_FRAMES];
     source.extend_from_slice(&chirp_f32(FRAME_SAMPLES * CHIRP_FRAMES));
-    source.extend(std::iter::repeat_n(0.0, FRAME_SAMPLES * TAIL_FRAMES));
+    source.extend(std::iter::repeat(0.0).take(FRAME_SAMPLES * TAIL_FRAMES));
 
     let capture = SyntheticCapture::new(source.clone()).then_silence();
     let capture_t0 = capture.first_frame_at();
@@ -307,7 +307,7 @@ fn voice_activity_follows_the_signal() {
     // 前 50 帧静音，中间 50 帧有声音，后面又静音
     let mut source = vec![0.0f32; FRAME_SAMPLES * 50];
     source.extend_from_slice(&chirp_f32(FRAME_SAMPLES * 50));
-    source.extend(std::iter::repeat_n(0.0, FRAME_SAMPLES * 50));
+    source.extend(std::iter::repeat(0.0).take(FRAME_SAMPLES * 50));
 
     let capture = SyntheticCapture::new(source).then_silence();
     let voice = Pipeline::start(
@@ -394,4 +394,43 @@ fn synthetic_devices_pace_themselves() {
         render.write(&frame).unwrap();
     }
     assert!(start.elapsed() > Duration::from_millis(80));
+}
+
+/// 拿**真声卡**跑一遍。默认跳过 —— CI 上没有音频设备。
+///
+/// ```bash
+/// cargo test -p client-core --test voice_pipeline -- --ignored --nocapture
+/// ```
+///
+/// 它只验「设备打得开、UDP 通得了」，不验听感：频道里只有一个人，
+/// 播出去的全是静音，所以不会有啸叫。
+#[test]
+#[ignore = "要真声卡"]
+#[cfg(windows)]
+fn real_devices_open_and_udp_comes_up() {
+    let server = start_server();
+    let alice = join(&server, "阿狸");
+
+    let voice = Pipeline::start(
+        voice_config(&alice, &server, TransmitMode::Always),
+        Box::new(voice_core::wasapi::WasapiCapture::new(None)),
+        Box::new(voice_core::wasapi::WasapiRender::new(None)),
+        None,
+    )
+    .expect("起不了语音链路");
+
+    // 保活每 2 秒一次，给它两轮
+    std::thread::sleep(Duration::from_secs(5));
+    let stats = voice.stats();
+    println!("真设备：{stats:?}");
+
+    assert!(stats.udp_ok, "UDP 没通 —— 保活没回来：{stats:?}");
+    assert!(
+        stats.packets_sent > 100,
+        "麦克风没出数据（5 秒该有约 500 帧）：{stats:?}"
+    );
+    assert_eq!(
+        stats.underruns, 0,
+        "播放欠载了 —— 设备节拍跟不上：{stats:?}"
+    );
 }

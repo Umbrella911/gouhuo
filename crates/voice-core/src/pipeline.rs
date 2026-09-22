@@ -165,6 +165,8 @@ impl Speaker {
 pub struct Pipeline {
     stop: Arc<AtomicBool>,
     transmitting: Arc<AtomicBool>,
+    muted: Arc<AtomicBool>,
+    deafened: Arc<AtomicBool>,
     socket: Arc<UdpSocket>,
     shared: Arc<Shared>,
     threads: Vec<JoinHandle<()>>,
@@ -184,6 +186,12 @@ struct Shared {
 impl Shared {
     fn now_ms(&self) -> u64 {
         self.started.elapsed().as_millis() as u64
+    }
+
+    /// 从链路起来算的微秒数。u32 大约 71 分钟回绕 —— 只拿来算往返时间，
+    /// 用回绕减法就行。
+    fn now_us(&self) -> u32 {
+        self.started.elapsed().as_micros() as u32
     }
 }
 
@@ -212,6 +220,8 @@ impl Pipeline {
 
         let stop = Arc::new(AtomicBool::new(false));
         let transmitting = Arc::new(AtomicBool::new(false));
+        let muted = Arc::new(AtomicBool::new(false));
+        let deafened = Arc::new(AtomicBool::new(false));
         let shared = Arc::new(Shared {
             speakers: Mutex::new(BTreeMap::new()),
             packets_sent: AtomicU64::new(0),
@@ -231,6 +241,7 @@ impl Pipeline {
             let socket = Arc::clone(&socket);
             let stop = Arc::clone(&stop);
             let transmitting = Arc::clone(&transmitting);
+            let muted = Arc::clone(&muted);
             let shared = Arc::clone(&shared);
             let processor = processor.clone();
             let session_id = cfg.session_id;
@@ -244,6 +255,7 @@ impl Pipeline {
                     socket,
                     &stop,
                     &transmitting,
+                    &muted,
                     &shared,
                     session_id,
                     key,
@@ -268,10 +280,11 @@ impl Pipeline {
         // ---- 播放 ----
         {
             let stop = Arc::clone(&stop);
+            let deafened = Arc::clone(&deafened);
             let shared = Arc::clone(&shared);
             let processor = processor.clone();
             threads.push(spawn("kaimai-voice-play", move || {
-                play_loop(&mut *render, processor, &stop, &shared);
+                play_loop(&mut *render, processor, &stop, &deafened, &shared);
             })?);
         }
 
@@ -282,14 +295,17 @@ impl Pipeline {
             let session_id = cfg.session_id;
             let key = cfg.upstream_key;
             let server = cfg.server;
+            let shared = Arc::clone(&shared);
             threads.push(spawn("kaimai-voice-keepalive", move || {
-                keepalive_loop(socket, &stop, session_id, key, server);
+                keepalive_loop(socket, &stop, &shared, session_id, key, server);
             })?);
         }
 
         Ok(Self {
             stop,
             transmitting,
+            muted,
+            deafened,
             socket,
             shared,
             threads,
@@ -299,6 +315,16 @@ impl Pipeline {
     /// 按下/松开说话键。
     pub fn set_transmitting(&self, on: bool) {
         self.transmitting.store(on, Ordering::Relaxed);
+    }
+
+    /// 闭麦。压过说话键和 VAD。
+    pub fn set_muted(&self, muted: bool) {
+        self.muted.store(muted, Ordering::Relaxed);
+    }
+
+    /// 关耳朵。链路照常转，只是播出去的是静音 —— 见 [`play_loop`]。
+    pub fn set_deafened(&self, deafened: bool) {
+        self.deafened.store(deafened, Ordering::Relaxed);
     }
 
     /// 单独调某个人的音量。0.0 是静音，1.0 是原样。
@@ -378,6 +404,7 @@ fn send_loop(
     socket: Arc<UdpSocket>,
     stop: &AtomicBool,
     transmitting: &AtomicBool,
+    muted: &AtomicBool,
     shared: &Shared,
     session_id: u32,
     key: [u8; 32],
@@ -411,13 +438,16 @@ fn send_loop(
             processor.process_capture(&mut frame);
         }
 
-        let sending = match mode {
-            TransmitMode::PushToTalk => transmitting.load(Ordering::Relaxed),
-            TransmitMode::VoiceActivity { threshold_db } => {
-                frame_db(&frame) > threshold_db || transmitting.load(Ordering::Relaxed)
-            }
-            TransmitMode::Always => true,
-        };
+        // 闭麦压过一切。按着说话键也不行 —— 用户点了闭麦就是不想出声，
+        // 这时候还漏出去一声是很糟糕的那种 bug。
+        let sending = !muted.load(Ordering::Relaxed)
+            && match mode {
+                TransmitMode::PushToTalk => transmitting.load(Ordering::Relaxed),
+                TransmitMode::VoiceActivity { threshold_db } => {
+                    frame_db(&frame) > threshold_db || transmitting.load(Ordering::Relaxed)
+                }
+                TransmitMode::Always => true,
+            };
 
         if !sending {
             if was_sending {
@@ -495,12 +525,11 @@ fn recv_loop(
             shared
                 .last_keepalive_ms
                 .store(shared.now_ms().max(1), Ordering::Relaxed);
-            let sent_ms = header.timestamp as u64;
-            let rtt = shared.now_ms().saturating_sub(sent_ms);
-            shared.rtt_us.store(
-                (rtt.min(u32::MAX as u64 / 1000) * 1000) as u32,
-                Ordering::Relaxed,
-            );
+            // 时间戳装的是发出去那一刻的微秒数，跟 shared 同一个原点。
+            // **用微秒不是毫秒**：本机回环的往返是几十微秒，按毫秒算一律是 0，
+            // 界面上就永远显示 0.0 ms，看着像坏了。
+            let rtt = shared.now_us().wrapping_sub(header.timestamp);
+            shared.rtt_us.store(rtt, Ordering::Relaxed);
             continue;
         }
 
@@ -530,6 +559,7 @@ fn play_loop(
     render: &mut dyn Render,
     processor: Option<Arc<dyn AudioProcessor>>,
     stop: &AtomicBool,
+    deafened: &AtomicBool,
     shared: &Shared,
 ) {
     crate::clock::boost_current_thread();
@@ -573,6 +603,14 @@ fn play_loop(
             }
         }
 
+        // 关了耳朵就播静音。
+        //
+        // **照样要把这一帧走完**：解码器的状态要跟着推进（跳帧会让恢复时
+        // 第一帧解错），APM 的参考信号也不能断（断了它会算错回声延迟）。
+        if deafened.load(Ordering::Relaxed) {
+            mix.fill(0.0);
+        }
+
         // 多路叠加会超出 ±1。硬截会变成方波（很难听的失真），
         // 用 tanh 把峰值压回来 —— 小信号几乎不变，大信号平滑地压缩。
         for sample in mix.iter_mut() {
@@ -594,28 +632,34 @@ fn play_loop(
 fn keepalive_loop(
     socket: Arc<UdpSocket>,
     stop: &AtomicBool,
+    shared: &Shared,
     session_id: u32,
     key: [u8; 32],
     server: SocketAddr,
 ) {
     let cipher = VoiceCipher::new(&key);
     let mut wire = Vec::with_capacity(VOICE_HEADER_LEN + 32);
-    let started = Instant::now();
-    let mut seq = u32::MAX; // 保活用倒着走的 seq，不跟语音的 seq 抢
-                            // 一上来立刻发一个：服务端要靠它学到我们的地址，不然只听不说的人
-                            // 会完全听不见声音。
+    // 保活自己的序号，从 0 开始正着走。服务端给保活留了**单独的防重放窗口**，
+    // 所以它跟语音的序号互不干扰 —— 两边都得这么认。
+    //
+    // 第一版让它从 u32::MAX 倒着走，结果是：语音每秒把窗口推进 100，
+    // 两秒后倒着走的保活序号已经落在窗口外，被当成重放丢掉。
+    // 表现是「UDP 时通时不通」，而语音本身看着一切正常。
+    let mut seq: u32 = 0;
+    // 一上来立刻发一个：服务端要靠它学到我们的地址，不然只听不说的人
+    // 会完全听不见声音。
     loop {
         let header = VoiceHeader {
             session: session_id,
             seq,
             // 时间戳这里装的是「发出去的时刻」，回来就是一次 RTT
-            timestamp: started.elapsed().as_millis() as u32,
+            timestamp: shared.now_us(),
             flags: FLAG_KEEPALIVE,
         };
         if cipher.seal(header, &[], &mut wire).is_ok() {
             let _ = socket.send_to(&wire, server);
         }
-        seq = seq.wrapping_sub(1);
+        seq = seq.wrapping_add(1);
 
         // 分成小段睡，这样停的时候不用等满一个周期
         let deadline = Instant::now() + KEEPALIVE_INTERVAL;

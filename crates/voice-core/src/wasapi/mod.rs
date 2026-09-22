@@ -21,9 +21,15 @@
 //!    所以这里把所有活动端点全都列出来。
 
 mod device;
+// 长跑用的采集/播放流，实现 crate::audio 的两个 trait。
+// 要 codec feature 只是因为帧长常量定在 audio 里。
+#[cfg(feature = "codec")]
+mod live;
 mod stream;
 
 pub use device::*;
+#[cfg(feature = "codec")]
+pub use live::*;
 pub use stream::*;
 
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};

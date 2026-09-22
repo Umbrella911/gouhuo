@@ -14,13 +14,24 @@
 //! 所以网络卡住了界面照样能动 —— 这在语音软件里是必须的，
 //! 用户第一件想做的事就是点「离开」。
 
+use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 
 use client_core::{Client, ConnectError, Event};
-use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
+use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 use voice_core::identity::Identity;
+use voice_core::pipeline::{Pipeline, PipelineConfig, TransmitMode, DEFAULT_JITTER_FRAMES};
+
+/// 多久去问一次语音链路的状态。
+///
+/// 说话指示靠它更新，所以不能太慢 —— 慢了那个点就跟不上声音。
+/// 200 ms 肉眼看着是跟手的，同时每秒只有 5 次加锁。
+const VOICE_POLL: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// VAD 的阈值。安静房间里够用；机械键盘会把它顶起来，那是 APM 降噪的事。
+const VAD_THRESHOLD_DB: f32 = -45.0;
 
 slint::include_modules!();
 
@@ -109,6 +120,13 @@ fn dark_titlebar(_app: &App) {}
 #[derive(Default)]
 struct State {
     client: Option<Client>,
+    /// 语音链路。丢掉它就会把音频线程收干净。
+    voice: Option<Arc<Pipeline>>,
+}
+
+thread_local! {
+    /// 定时器丢掉就停了，所以要让它活到窗口关掉为止。
+    static VOICE_TIMER: RefCell<Option<slint::Timer>> = const { RefCell::new(None) };
 }
 
 /// 点「加入」之后发生的事。
@@ -194,9 +212,120 @@ fn on_connected(
     app.set_connected(true);
     app.set_self_muted(false);
     app.set_self_deafened(false);
+    app.set_voice_error("".into());
+    app.set_udp_ok(false);
     refresh(app, &client);
 
+    start_voice(app, state, &client);
     pump_events(app.as_weak(), Arc::clone(state), client, events);
+}
+
+/// 起语音链路，并开一个定时器把它的状态搬到界面上。
+///
+/// 设备打不开不该让人掉线 —— 文字和名单照样能用，只是没声音。所以这里
+/// 失败只是把原因显示出来，不动连接。
+fn start_voice(app: &App, state: &Arc<Mutex<State>>, client: &Client) {
+    let Some(addr) = resolve_voice_addr(client) else {
+        app.set_voice_error("服务器没给出语音端口".into());
+        return;
+    };
+
+    let cfg = PipelineConfig {
+        session_id: client.session_id(),
+        server: addr,
+        upstream_key: *client.voice_keys().upstream.as_bytes(),
+        downstream_key: *client.voice_keys().downstream.as_bytes(),
+        jitter_frames: DEFAULT_JITTER_FRAMES,
+        // 默认语音激活。按键说话要等全局热键做出来 —— 在那之前默认按键说话的话，
+        // 用户进来会发现怎么说都没人听见。
+        mode: TransmitMode::VoiceActivity {
+            threshold_db: VAD_THRESHOLD_DB,
+        },
+    };
+
+    match Pipeline::start(
+        cfg,
+        Box::new(voice_core::wasapi::WasapiCapture::new(None)),
+        Box::new(voice_core::wasapi::WasapiRender::new(None)),
+        audio_processor(),
+    ) {
+        Ok(pipeline) => {
+            state.lock().expect("state poisoned").voice = Some(Arc::new(pipeline));
+            spawn_voice_poll(app.as_weak(), Arc::clone(state));
+        }
+        Err(e) => app.set_voice_error(format!("{e}").into()),
+    }
+}
+
+/// 回声消除/降噪。要 `--features apm`，见 Cargo.toml。
+#[cfg(feature = "apm")]
+fn audio_processor() -> Option<Box<dyn voice_core::pipeline::AudioProcessor>> {
+    use voice_core::apm::{Apm, ApmConfig};
+    // APM 起不来不该让语音也用不了。戴耳机的人根本不需要它。
+    match Apm::new(voice_core::audio::SAMPLE_RATE, ApmConfig::default()) {
+        Ok(apm) => Some(Box::new(apm)),
+        Err(_) => None,
+    }
+}
+
+#[cfg(not(feature = "apm"))]
+fn audio_processor() -> Option<Box<dyn voice_core::pipeline::AudioProcessor>> {
+    None
+}
+
+fn resolve_voice_addr(client: &Client) -> Option<std::net::SocketAddr> {
+    use std::net::ToSocketAddrs;
+    if client.udp_port() == 0 {
+        return None;
+    }
+    (client.server_host(), client.udp_port())
+        .to_socket_addrs()
+        .ok()?
+        .next()
+}
+
+/// 定时把语音状态搬到界面上：谁在说话、UDP 通没通。
+fn spawn_voice_poll(weak: slint::Weak<App>, state: Arc<Mutex<State>>) {
+    // 用 Slint 自己的定时器而不是线程：它就在界面线程上跑，
+    // 省掉一次跨线程投递，而这件事每秒要做五次。
+    let timer = slint::Timer::default();
+    timer.start(slint::TimerMode::Repeated, VOICE_POLL, move || {
+        let Some(app) = weak.upgrade() else { return };
+        let (voice, client) = {
+            let state = state.lock().expect("state poisoned");
+            (state.voice.clone(), state.client.clone())
+        };
+        let (Some(voice), Some(client)) = (voice, client) else {
+            return;
+        };
+        let stats = voice.stats();
+        app.set_udp_ok(stats.udp_ok);
+        update_speaking(&app, &client, &stats.speaking);
+    });
+    VOICE_TIMER.with(|slot| *slot.borrow_mut() = Some(timer));
+}
+
+/// 只改「谁在说话」那一列，不整个重建列表。
+///
+/// 这件事每秒发生五次，而整个重建会让列表的滚动位置跳回顶上。
+fn update_speaking(app: &App, client: &Client, speaking: &[u32]) {
+    let rows = app.get_rows();
+    let me = client.roster().me;
+    for i in 0..rows.row_count() {
+        let Some(mut row) = rows.row_data(i) else {
+            continue;
+        };
+        if row.is_channel {
+            continue;
+        }
+        // 自己说没说话服务端不会转回来，所以自己那一行永远不亮。
+        // 要亮的话得看本地有没有在发 —— 等按键说话做出来再说。
+        let now = speaking.contains(&(row.id as u32)) && row.id as u32 != me;
+        if row.speaking != now {
+            row.speaking = now;
+            rows.set_row_data(i, row);
+        }
+    }
 }
 
 /// 把事件从读线程搬到界面线程。
@@ -214,7 +343,12 @@ fn pump_events(
             let state = Arc::clone(&state);
             let posted = weak.upgrade_in_event_loop(move |app| match event {
                 Event::Disconnected(reason) => {
-                    state.lock().expect("state poisoned").client = None;
+                    let mut locked = state.lock().expect("state poisoned");
+                    locked.client = None;
+                    // 丢掉链路会 join 掉所有音频线程。**必须做** ——
+                    // 留着的话麦克风还开着，而用户已经不在频道里了。
+                    locked.voice = None;
+                    drop(locked);
                     app.set_connected(false);
                     app.set_error_headline("连接断开".into());
                     app.set_error_advice(reason.into());
@@ -327,7 +461,11 @@ fn wire_actions(app: &App, state: &Arc<Mutex<State>>) {
                 return;
             };
             // 关着耳朵的时候单独开麦没有意义，服务端也会把它改回去。
-            client.set_self_state(!app.get_self_muted(), app.get_self_deafened());
+            let muted = !app.get_self_muted();
+            client.set_self_state(muted, app.get_self_deafened());
+            if let Some(voice) = current_voice(&state) {
+                voice.set_muted(muted);
+            }
         });
     }
 
@@ -341,6 +479,10 @@ fn wire_actions(app: &App, state: &Arc<Mutex<State>>) {
             let deafened = !app.get_self_deafened();
             // 关耳朵连带闭麦。服务端也会这么改，这里跟着改是为了按下去立刻有反馈。
             client.set_self_state(app.get_self_muted() || deafened, deafened);
+            if let Some(voice) = current_voice(&state) {
+                voice.set_deafened(deafened);
+                voice.set_muted(app.get_self_muted() || deafened);
+            }
         });
     }
 
@@ -351,6 +493,7 @@ fn wire_actions(app: &App, state: &Arc<Mutex<State>>) {
             if let Some(client) = current(&state) {
                 client.disconnect();
             }
+            state.lock().expect("state poisoned").voice = None;
             if let Some(app) = weak.upgrade() {
                 // 主动离开不是错误，别把上一次的报错留在登录页上。
                 app.set_connected(false);
@@ -362,6 +505,10 @@ fn wire_actions(app: &App, state: &Arc<Mutex<State>>) {
 }
 
 /// 返回 `(身份, 是不是这次新建的)`。
+fn current_voice(state: &Arc<Mutex<State>>) -> Option<Arc<Pipeline>> {
+    state.lock().expect("state poisoned").voice.clone()
+}
+
 fn load_identity() -> std::io::Result<(Identity, bool)> {
     let path = Identity::default_path()?;
     Identity::load_or_create(&path)

@@ -180,10 +180,10 @@ impl Qpc {
 }
 
 /// RAII 包一下事件句柄，免得早退路径漏掉 CloseHandle。
-struct Event(HANDLE);
+pub(crate) struct Event(pub(crate) HANDLE);
 
 impl Event {
-    fn new() -> windows::core::Result<Self> {
+    pub(crate) fn new() -> windows::core::Result<Self> {
         Ok(Self(unsafe { CreateEventW(None, false, false, None)? }))
     }
 }
@@ -244,17 +244,19 @@ unsafe fn format_of(wfx: *const WAVEFORMATEX) -> Format {
 }
 
 /// 一个初始化好的流：客户端 + 事件 + 实际格式。
-struct Opened {
-    client: IAudioClient,
-    event: Event,
-    format: Format,
-    frame_bytes: usize,
-    buffer_frames: u32,
+pub(crate) struct Opened {
+    pub(crate) client: IAudioClient,
+    pub(crate) event: Event,
+    pub(crate) format: Format,
+    #[allow(dead_code)]
+    pub(crate) frame_bytes: usize,
+    pub(crate) buffer_frames: u32,
     /// 设备周期换算成帧。队列深度的物理下限就是它 —— 见 measure_render。
-    period_frames: u32,
+    #[allow(dead_code)]
+    pub(crate) period_frames: u32,
 }
 
-fn initialize(
+pub(crate) fn initialize(
     device: &IMMDevice,
     direction: Direction,
     share_mode: ShareMode,

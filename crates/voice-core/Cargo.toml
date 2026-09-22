@@ -9,7 +9,9 @@ description = "客户端语音内核：音频 IO / APM / Opus / 抖动缓冲 / �
 
 [features]
 # 默认带上 APM。客户端要它，服务端不要 —— 见下。
-default = ["pipeline", "apm"]
+# 默认**不带 apm**：那套 C++ 工具链（meson + ninja）是这个项目里最难装的一环，
+# 不该挡在「git clone 完 cargo build」前面。要回声消除就显式打开。
+default = ["pipeline"]
 # 回声消除 / 降噪 / AGC。**这是唯一需要 C++ 工具链（meson + ninja）的东西。**
 #
 # 服务端只转发 Opus 包，从头到尾不碰音频采样，所以它关掉这个 feature

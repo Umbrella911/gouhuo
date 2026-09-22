@@ -56,6 +56,8 @@ export component App inherits Window {
     in-out property <bool> self-deafened: false;
     // UDP 通不通。不通的时候要让用户看见，而不是让他纳闷为什么没声音。
     in property <bool> udp-ok: false;
+    // 语音那边出的错（设备打不开、采样率不对）。要能直接显示给用户。
+    in property <string> voice-error;
 
     // ---- 回调 ----
     callback join();
@@ -199,11 +201,18 @@ export component App inherits Window {
 
                                 if !row.is-channel: Dot {
                                     y: (parent.height - self.height) / 2;
-                                    tint: row.deafened
-                                        ? Theme.danger
-                                        : (row.muted
-                                            ? Theme.warn
-                                            : (row.speaking ? Theme.speaking : Theme.faint));
+                                    // 正在说话压过静音状态：一个人可能自己没闭麦
+                                    // 但别人也没听见，那种时候「他在说话」更有用。
+                                    tint: row.speaking
+                                        ? Theme.speaking
+                                        : (row.deafened
+                                            ? Theme.danger
+                                            : (row.muted ? Theme.warn : Theme.faint));
+                                    // 说话时那个点要看得出来在动
+                                    width: row.speaking ? 10px : 8px;
+                                    height: self.width;
+                                    border-radius: self.width / 2;
+                                    animate width { duration: 100ms; }
                                 }
 
                                 Text {
@@ -262,9 +271,12 @@ export component App inherits Window {
                                     tint: root.udp-ok ? Theme.speaking : Theme.warn;
                                 }
                                 Text {
-                                    text: root.udp-ok ? "语音已连通" : "语音未连通";
-                                    color: Theme.faint;
+                                    text: root.voice-error != ""
+                                        ? "语音出错"
+                                        : (root.udp-ok ? "语音已连通" : "语音连接中…");
+                                    color: root.voice-error != "" ? Theme.danger : Theme.faint;
                                     font-size: 11px;
+                                    overflow: elide;
                                 }
                             }
                         }
@@ -316,6 +328,21 @@ export component App inherits Window {
                     }
                 }
                 Rectangle { height: 1px; background: Theme.line; }
+
+                // 语音出错要占住位置一起显示。麦克风没声音的时候，用户第一件
+                // 想知道的就是「为什么」，而弹窗一关就没了。
+                if root.voice-error != "": Rectangle {
+                    background: #2a1d1d;
+                    VerticalLayout {
+                        padding: 12px;
+                        Text {
+                            text: root.voice-error;
+                            color: Theme.danger;
+                            font-size: 12px;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
 
                 ScrollView {
                     vertical-stretch: 1;
