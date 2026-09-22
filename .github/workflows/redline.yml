@@ -9,10 +9,6 @@ env:
   CARGO_TERM_COLOR: always
   # VS 自带的 cmake 是 4.x，libopus 的 CMakeLists 声明的最低版本太老会被直接拒。
   CMAKE_POLICY_VERSION_MINIMUM: "3.5"
-  # MAX_PATH。APM 的 bundled 构建里，abseil 的相对路径 + out 目录能顶到 265 字符
-  # （Windows 拿"当前目录 + 相对路径"在规范化**之前**比 260 上限）。
-  # 构建根必须短，否则 cl 会报"源文件不存在"——而文件其实在。见 docs/m2-apm-windows.md。
-  CARGO_TARGET_DIR: C:\t
 
 jobs:
   # DCO：每个提交都要有 Signed-off-by。
@@ -54,8 +50,7 @@ jobs:
   # 这事会自己复发：新文件基本都是照抄同目录的旧文件。服务端改 MPL 那次就抓到
   # 一个（wasapi/live.rs 是前一个 commit 新增的，头还写着 GPL）。靠人眼盯不住。
   #
-  # 不跟 deterministic 合并，因为它完全不需要编译 —— 独立跑在 ubuntu 上几秒出结果，
-  # 不用排在 MSVC + meson 那一长串前置后面。
+  # 不跟 deterministic 合并，因为它完全不需要编译 —— 独立跑在 ubuntu 上几秒出结果。
   license:
     runs-on: ubuntu-latest
     steps:
@@ -71,50 +66,17 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy, rustfmt, llvm-tools
+          components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
 
-      # ---- APM 的构建前置 ----
-      # 上游 webrtc-audio-processing-sys 要从源码编 libwebrtc（meson + ninja），
-      # 而它的构建脚本没有 Windows 分支。third_party/ 下是打过补丁的副本，
-      # 但下面这几样外部工具还是得自己准备。详见 docs/m2-apm-windows.md。
-      - name: 装 meson 和 ninja
-        run: pip install meson ninja
-
-      - name: 注入 MSVC 环境
-        shell: pwsh
-        run: |
-          # meson 要在 PATH 上看得见 cl.exe 才会选 MSVC 后端。
-          # 不用第三方 action，自己从 vcvars 里捞 —— 少一个供应链依赖。
-          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-          $vcvars = Join-Path $vs "VC\Auxiliary\Build\vcvars64.bat"
-          if (-not (Test-Path $vcvars)) { throw "找不到 vcvars64.bat" }
-          cmd /c "`"$vcvars`" >nul 2>&1 && set" | ForEach-Object {
-            if ($_ -match '^([^=]+)=(.*)$') {
-              $name, $value = $matches[1], $matches[2]
-              if ($name -in @('INCLUDE','LIB','LIBPATH','PATH')) {
-                if ($name -eq 'PATH') { Add-Content $env:GITHUB_PATH $value.Split(';') }
-                else { Add-Content $env:GITHUB_ENV "$name=$value" }
-              }
-            }
-          }
-
-      - name: 定位 libclang（bindgen 要用）
-        shell: pwsh
-        run: |
-          $candidates = @(
-            "C:\Program Files\LLVM\bin",
-            "${env:ProgramFiles}\Microsoft Visual Studio\2022\Enterprise\VC\Tools\Llvm\x64\bin"
-          )
-          $found = $candidates | Where-Object { Test-Path (Join-Path $_ "libclang.dll") } | Select-Object -First 1
-          if (-not $found) { throw "找不到 libclang.dll" }
-          Add-Content $env:GITHUB_ENV "LIBCLANG_PATH=$found"
+      # APM 曾经要 meson + ninja + libclang + MSVC 环境注入，还要一个极短的
+      # CARGO_TARGET_DIR 绕 MAX_PATH —— 因为它要从源码编 libwebrtc。
+      # 换成纯 Rust 的 sonora 之后这一整段都没了，见 docs/apm-backend.md。
+      # 现在唯一的原生依赖是 libopus，而 cmake 在 windows runner 上本来就有。
 
       - name: fmt
         run: cargo fmt --all --check
       - name: clippy
-        # third_party/ 是 vendor 进来的第三方代码，不在工作区成员里，本来就不会被扫。
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: test
         run: cargo test --workspace
@@ -158,6 +120,6 @@ jobs:
         # 闸的数字来自 redline::GATE_PROTOCOL_MS，不在这里重复写 ——
         # 两处各写一份迟早会漂移，而漂移的那天 CI 是绿的。
         #
-        # 只卡协议这一段：设备那段由声卡和驱动决定，APM 那段由 libwebrtc 决定，
-        # 这两段变了不是我们改坏了。协议段一旦变慢，一定是我们干的。
+        # 只卡协议这一段：设备那段由声卡和驱动决定，APM 那段由上游的 APM
+        # 实现决定，这两段变了不是我们改坏了。协议段一旦变慢，一定是我们干的。
         run: cargo run --release -p latency-probe -- --seconds 30 --assert-gate

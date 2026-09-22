@@ -8,7 +8,7 @@
 名字就是这软件干的事，不用解释。**刻意避开「开黑」**：KOOK 的前身就叫开黑啦，
 那块心智已经被占死了，蹭不到，只会被比下去。
 
-**当前进度：M1、M2 完成，端到端实测 91.9 ms，在 120 ms 产品线内。
+**当前进度：M1、M2 完成，端到端实测 91.8 ms，在 120 ms 产品线内。
 M3 进行中：一键加入的密码学基础已经做完（身份 + 邀请链接）。还没有 UI。**
 
 ---
@@ -27,9 +27,9 @@ M3 进行中：一键加入的密码学基础已经做完（身份 + 邀请链�
 
 | 指标 | 产品线 | 防回归闸 | 当前实测 |
 |---|---|---|---|
-| 端到端延迟（同城） | < 120 ms | < 100 ms | **91.9 ms** = 协议 46.5 + 设备 30.4 + APM 15.0 |
+| 端到端延迟（同城） | < 120 ms | < 100 ms | **91.8 ms** = 协议 46.5 + 设备 30.4 + APM 14.9 |
 | └ 协议链路（CI 唯一卡的一段） | — | **< 55 ms** | **46.5 ms** |
-| 通话中 CPU（单核占比） | < 6% | < 4% | **2.84%** = 编解码 2.18% + APM 0.66% |
+| 通话中 CPU（单核占比） | < 6% | < 4% | **2.97%** = 编解码 2.18% + APM 0.79% |
 | 静音时带宽（DTX 生效） | **< 5 kbps** | — | **1.2 kbps**（前提：DTX 帧根本不发） |
 | 说话时单条上行 | < 80 kbps | — | **10 ms 帧 61.3 kbps；20 ms 帧 39.0 kbps** |
 | voice-core 常驻内存 | < 100 MB | — | 未测（要等 voice-core 拆成独立进程） |
@@ -236,21 +236,25 @@ Win10 之后共享模式也能把引擎周期压到驱动支持的最小值，�
 
 ### APM：AEC3 吃掉 15 ms
 
-`webrtc-audio-processing` 开箱在 Windows/MSVC 上编不过。`third_party/` 下是打过
-补丁的副本，六处补丁全部用 `kaimai patch:` 标出来了，诊断和复现配方见
-[`docs/m2-apm-windows.md`](docs/m2-apm-windows.md)。补丁应该提给上游，合并之后
-删掉整个 `third_party/` 即可。
+用 [`sonora`](https://github.com/dignifiedquire/sonora) —— libwebrtc
+AudioProcessing 模块（M145）的**纯 Rust 移植**。不需要任何 C++ 工具链。
+
+M2 时用的是 C++ 的 `webrtc-audio-processing`（M131）：它在 Windows/MSVC 上
+开箱编不过，我们打了七个补丁、vendor 了 5.3 MB 源码、写了个环境准备脚本才跑起来，
+而最贵的代价是 **APM 因此默认关着**。2026-09 换成纯 Rust 之后那些全没了，
+APM 现在是默认开的。换之前做了 A/B，数字和它的局限见
+[`docs/apm-backend.md`](docs/apm-backend.md)。
 
 逐块计价（10 ms 帧，近端 + 远端两次调用）：
 
 | 配置 | CPU | 延迟 |
 |---|---|---|
-| 全关（基线） | 0.04% | 0.00 ms |
-| 只开 AGC2 | 0.04% | 0.00 ms |
-| 只开 高通 | 0.14% | 1.00 ms |
-| 只开 降噪 | 0.21% | 7.00 ms |
-| 只开 AEC3 | 0.58% | 9.00 ms |
-| **全开（实际配置）** | **0.66%** | **15.00 ms** |
+| 全关（基线） | 0.01% | 0.00 ms |
+| 只开 AGC2 | 0.03% | 0.00 ms |
+| 只开 高通 | 0.21% | 0.92 ms |
+| 只开 降噪 | 0.27% | 6.92 ms |
+| 只开 AEC3 | 0.71% | 8.92 ms |
+| **全开（实际配置）** | **0.79%** | **14.92 ms** |
 
 延迟是互相关量出来的（APM 不自报这个数），并且用**冲激法独立验过一遍** ——
 整条红线过不过压在这个数上，一种量法不够。
@@ -259,21 +263,17 @@ Win10 之后共享模式也能把引擎周期压到驱动支持的最小值，�
 没有 AEC3 外放开黑就啸叫，没有降噪机械键盘声直接糊到队友耳朵里。
 放开产品线之后这 15 ms 是买得起的 —— 详见下一节。
 
-顺手量到两件事：
+顺手量到一件事：APM 强制 **10 ms** 处理帧（`audio_processing.h:83`）。
+打包粒度不受影响，20 ms 一个包跑两次 APM 即可 —— 不改变 M1 的帧长结论。
 
-- APM 强制 **10 ms** 处理帧（`audio_processing.h:83`）。打包粒度不受影响，
-  20 ms 一个包跑两次 APM 即可 —— 不改变 M1 的帧长结论
-- 静态库 strip 之后 **38 MB**。这不等于安装包大 38 MB（链接器会丢死代码），
-  但安装包那条线要等 M5 打包实测才算数
-
-### 端到端 91.9 ms
+### 端到端 91.8 ms
 
 ```
 协议链路   46.5 ms   （M1：10 ms 帧 + 缓冲 2 帧 + 同城两跳）
 设备       30.4 ms   （M2：采集 10.4 + 渲染队列 20.0）
-APM        15.0 ms   （M2：AEC3 + 降噪 + AGC2 + 高通）
+APM        14.9 ms   （AEC3 + 降噪 + AGC2 + 高通）
 --------------------
-合计       91.9 ms   产品线 120 ms，防回归闸 100 ms
+合计       91.8 ms   产品线 120 ms，防回归闸 100 ms
 ```
 
 在产品线内，而且比 Discord / TeamSpeak 同类配置（普遍 100–150 ms）要好。
@@ -433,7 +433,7 @@ KAIMAI_DATA=./data kaimai-server
 依赖」直接冲突。真到了要换的那天，改的是 `conn` 一个文件，`state` 一行都不用动。
 
 同样的理由，`voice-core` 的 APM 被拆成了 feature：服务端只转发 Opus 包，
-从头到尾不碰音频采样。带上 APM 等于要求自部署的人先装 meson 和 ninja。
+从头到尾不碰音频采样，带上 APM 只是白白多编几个 crate、多占体积。
 
 认证是三个来回：`Hello` → `Challenge`（服务端出随机数）→ `Authenticate`
 （签那个随机数）→ `Welcome`。**随机数必须服务端出** —— 让客户端自己选要签的内容
@@ -540,7 +540,7 @@ Windows 上更糟，Hyper-V / WSL / Docker 会在那段里成片地做保留 —
 Tauri 会好一些，但它依赖 WebView2 —— 界面行为要看用户机器上装的是哪个版本，
 而这对一个要「装完就能用」的软件是个不该有的变量。
 
-客户端那 12.5 MB **还不是安装包**：音频那半边（Opus + libwebrtc 的 APM）
+客户端那 12.5 MB **还不是安装包**：音频那半边（Opus + APM）
 还没链进去。记在 `redline.rs` 里是为了让它涨的时候看得见。
 
 ### 一键加入
@@ -592,15 +592,16 @@ M1 的 46.5 ms 和这个 36.7 ms 是两回事：前者注入过网络损伤（�
 松开按键（或 VAD 判定没人声）之后，先补一个带 `FLAG_TERMINATOR` 的包让对面
 立刻收尾，然后只留每两秒一次的保活。静默带宽因此是 57 字节 / 2 秒 ≈ **0.23 kbps**。
 
-### APM 是可选的
+### APM 默认开着，但仍然可选
 
-回声消除那套 C++ 工具链（meson + ninja）是整个项目里最难装的一环，
-不该挡在「git clone 完 cargo build」前面。所以它是个 feature，编译期和运行期
-都可选，没有它链路照样通 —— 戴耳机用没问题。要开：
+回声消除和降噪是「外放开黑不啸叫」的全部依据，所以客户端**默认带着它**，
+`git clone` 完 `cargo run` 跑出来就是完整的。
 
-```bash
-cargo run -p client --features apm
-```
+它仍然是个 feature，是为了服务端：那边只转发 Opus 包，从头到尾不碰音频采样。
+
+> M2 时它是默认**关**着的，因为当时那套 C++ 工具链挡在「git clone 完
+> cargo build」前面。换成纯 Rust 之后这个理由没了 —— 一个卖点功能
+> 不该要用户自己去开。见 [`docs/apm-backend.md`](docs/apm-backend.md)。
 
 ### 全局热键：Raw Input，不是钩子
 
@@ -733,13 +734,19 @@ cargo run -p client --features apm
 ### APM：回声消除实测
 
 ```bash
-.\scripts\win-buildenv.ps1 -Run "cargo run -p client --features apm"
+cargo test -p voice-core echo:: -- --nocapture            # 合成的线性回路
+cargo test -p voice-core acoustic -- --ignored --nocapture # 真音箱真麦克风
 ```
 
-| | 实测 |
+| | 合成（线性回路） |
 |---|---|
-| 回声抑制 | **26.0 dB**（残留绝对电平 −50.1 dB） |
-| 没有回声时对人声的损伤 | **0.2 dB** |
+| 回声抑制 | **57.9 dB**（残留绝对电平 −82.0 dB） |
+| 没有回声时对人声的损伤 | **1.1 dB** |
+
+**合成的数字不能当产品表现看** —— 那条回声路径是纯线性的（延迟 + 衰减），
+而真正区分 AEC 好坏的是音箱的非线性失真、时钟漂移、房间混响。真声学往返
+的测试也写了，但这台机器上的麦克风都自带噪声门，量不出可信的数 ——
+经过见 [`docs/apm-backend.md`](docs/apm-backend.md)。
 
 第二条比第一条更要紧：绝大多数人戴耳机，根本没有回声。开了 AEC 反而把他的
 声音削掉一截的话，这个功能就是负收益。
@@ -832,16 +839,15 @@ cargo run --release -p device-probe
 
 加 `--exclusive` 会顺带测独占模式，**那几秒里别的程序发不出声**。
 
-**Windows 上首次构建要额外准备**（APM 要从源码编 libwebrtc）：
+**构建不需要任何额外准备** —— `cargo build` 就行，APM 和 Opus 都在里面。
 
-```bash
-pip install meson ninja
-rustup component add llvm-tools
-```
+唯一的例外是 cmake：`audiopus_sys` 从源码编 libopus 要用它，而它不一定在
+PATH 上。缺了的话跑 [`scripts/win-buildenv.ps1`](scripts/win-buildenv.ps1)，
+它会去 Visual Studio 里找一份。
 
-还要从 MSVC 开发者环境里跑（meson 要在 PATH 上看得见 `cl.exe`），并把
-`LIBCLANG_PATH` 指向一份 libclang（VS 自带的就行）。
-细节和踩过的坑见 [`docs/m2-apm-windows.md`](docs/m2-apm-windows.md)。
+> M2 时这里要装 meson、ninja、llvm-tools、libclang，还要从 MSVC 开发者环境里跑，
+> 因为 APM 那份 C++ 要从源码编 libwebrtc。2026-09 换成纯 Rust 的 sonora 之后
+> 全都不需要了，见 [`docs/apm-backend.md`](docs/apm-backend.md)。
 
 ---
 
@@ -858,12 +864,10 @@ crates/
   client/          Slint 界面。只负责画和转发点击
   latency-probe/   M1：协议链路延迟
   device-probe/    M2：WASAPI 设备延迟 + APM
-third_party/
-  webrtc-audio-processing-sys/  打过 Windows 补丁的副本，补丁标了 `kaimai patch:`
 docs/
   m1-baseline.txt     M1 的完整报告存档
   m2-baseline.txt     M2 的完整报告存档
-  m2-apm-windows.md   APM 在 Windows 上编不过的诊断和补丁说明
+  apm-backend.md      APM 用哪个实现，怎么选的，以及量它的那些坑
 ```
 
 README 里的每个数字都出自这两份存档。
@@ -888,8 +892,11 @@ README 里的每个数字都出自这两份存档。
 ## 路线图
 
 - **M1** ✅ 协议链路延迟下限
-- **M2** ✅ 设备 30.4 ms + APM 15.0 ms 都已实测，端到端 91.9 ms，在产品线内。
+- **M2** ✅ 设备 30.4 ms + APM 都已实测，端到端在产品线内。
   红线也在这一步重定过一次：拆成「产品线」和「防回归闸」两组
+  - 2026-09 把 APM 从 C++ 的 libwebrtc 换成纯 Rust 的 sonora：不再需要任何
+    C++ 工具链，APM 因此默认打开。端到端 91.9 → 91.8 ms，CPU 2.84 → 2.97%。
+    见 [`docs/apm-backend.md`](docs/apm-backend.md)
 - **M3**（进行中）控制面（TCP + TLS）、密钥协商、服务端、邀请链接
   - ✅ 身份（Ed25519 + DPAPI 存储 + 导出导入）、证书指纹、邀请链接
   - ✅ 控制面消息定义（protobuf）+ 分帧
@@ -928,7 +935,6 @@ README 里的每个数字都出自这两份存档。
 | `crates/protocol` | MIT OR Apache-2.0 |
 | `crates/voice-core`、`crates/transport`、`crates/server` | MPL-2.0 |
 | 其余（客户端、探针） | GPL-3.0-or-later |
-| `third_party/` | BSD-3-Clause（上游原样保留） |
 
 `protocol` 放开是为了让别人能自由写第三方客户端、机器人、别的语言的实现 ——
 照着协议写的人越多，这个协议的生态越好。

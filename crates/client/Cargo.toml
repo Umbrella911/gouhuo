@@ -13,20 +13,14 @@ path = "src/main.rs"
 [dependencies]
 client-core.workspace = true
 protocol.workspace = true
-# 整条语音链路。**默认不开 apm** —— 它要 meson + ninja + C++ 工具链
-# （见 docs/m2-apm-windows.md），开着的话「git clone 完 cargo run」就跑不起来。
-# 装好了工具链之后用 `--features apm` 打开回声消除和降噪。
-voice-core = { workspace = true, default-features = false, features = ["pipeline"] }
+# 整条语音链路，**带回声消除和降噪**（voice-core 的默认 feature 里就有 apm）。
+# 不需要任何外部工具链 —— git clone 完 cargo run 就是完整的。
+voice-core.workspace = true
 slint = { workspace = true, features = ["raw-window-handle-06"] }
 raw-window-handle = "0.6"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Time", "Win32_Graphics_Dwm"] }
-
-[features]
-default = []
-# 回声消除 / 降噪 / AGC。要先跑 scripts/win-buildenv.ps1。
-apm = ["voice-core/apm"]
 
 [build-dependencies]
 slint-build.workspace = true

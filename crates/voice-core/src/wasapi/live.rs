@@ -265,7 +265,7 @@ impl Capture for WasapiCapture {
                 if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 {
                     // 设备明确说「这一段是静音」，里面的字节没有意义，不能当数据用。
                     silent_frames.fetch_add(frames as u64, Ordering::Relaxed);
-                    pending.extend(std::iter::repeat(0.0).take(frames as usize));
+                    pending.extend(std::iter::repeat_n(0.0, frames as usize));
                 } else {
                     // SAFETY: data 指向 frames * channels 个样点，格式由 format 描述。
                     unsafe {

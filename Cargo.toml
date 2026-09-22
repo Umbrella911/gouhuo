@@ -10,8 +10,6 @@ members = [
     "crates/client-core",
     "crates/client",
 ]
-# vendor 进来的第三方源码不是工作区成员，只是 [patch] 的目标。
-exclude = ["third_party"]
 
 [workspace.package]
 version = "0.0.1"
@@ -47,19 +45,17 @@ slint = "1"
 slint-build = "1" 
 # WASAPI 要走 COM 接口，windows-sys 只有裸 FFI，接不了 IMMDeviceEnumerator/IAudioClient。
 windows = "0.62"
-# APM（AEC3 / 降噪 / AGC）。bundled 会从源码编 libwebrtc 的 APM 模块。
-webrtc-audio-processing = { version = "2.1", features = ["bundled"] }
+# APM（AEC3 / 降噪 / AGC）。libwebrtc AudioProcessing 模块（M145）的纯 Rust 移植。
+#
+# 一直到 2026-09 用的是 C++ 的 webrtc-audio-processing，它在 Windows/MSVC 上
+# 开箱编不过 —— 七个补丁、5.3 MB vendor 源码、一个环境准备脚本，而且 APM
+# 因此默认关着。sonora 不需要任何 C++ 工具链，所以 APM 现在是默认开的。
+# 换之前的 A/B 和它的局限见 docs/apm-backend.md。
+sonora = "0.2"
 
 # M1 只关心延迟数字，所以 release 必须是真 release。
 # 注意：不开 panic = "abort"，否则 cargo test --release 跑不了。
 # 体积相关的开关（panic=abort / strip）等到打客户端安装包时在 bin 的 profile 里加。
-# 上游的 webrtc-audio-processing-sys 在 Windows/MSVC 上编不过（构建脚本里
-# 一个 Windows 分支都没有）。third_party/ 下是打过补丁的副本，补丁很小，
-# 全部用 `kaimai patch:` 标出来了。诊断见 docs/m2-apm-windows.md。
-# 补丁合并到上游之后，删掉这一段和整个 third_party/ 即可。
-[patch.crates-io]
-webrtc-audio-processing-sys = { path = "third_party/webrtc-audio-processing-sys" }
-
 [profile.release]
 opt-level = 3
 lto = "thin"

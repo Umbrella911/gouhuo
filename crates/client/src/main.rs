@@ -710,8 +710,7 @@ fn transmit_mode(settings: &Settings) -> TransmitMode {
     }
 }
 
-/// 回声消除/降噪。要 `--features apm`，见 Cargo.toml。
-#[cfg(feature = "apm")]
+/// 回声消除 / 降噪 / 自动增益。
 fn audio_processor() -> Option<Box<dyn voice_core::pipeline::AudioProcessor>> {
     use voice_core::apm::{Apm, ApmConfig};
     // APM 起不来不该让语音也用不了。戴耳机的人根本不需要它。
@@ -719,11 +718,6 @@ fn audio_processor() -> Option<Box<dyn voice_core::pipeline::AudioProcessor>> {
         Ok(apm) => Some(Box::new(apm)),
         Err(_) => None,
     }
-}
-
-#[cfg(not(feature = "apm"))]
-fn audio_processor() -> Option<Box<dyn voice_core::pipeline::AudioProcessor>> {
-    None
 }
 
 fn resolve_voice_addr(client: &Client) -> Option<std::net::SocketAddr> {

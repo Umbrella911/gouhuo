@@ -80,9 +80,11 @@ const MONITOR_MAX_FRAMES: usize = 3;
 
 /// 采集之后、编码之前要做的处理。
 ///
-/// 抽成 trait 是为了让 APM 成为**可选**的 —— 它那套 C++ 工具链是整个项目里
-/// 最难装的一环（见 `docs/m2-apm-windows.md`），不该让「想编一下试试」的人
-/// 先跨过它。没有 APM 的链路照样能通，只是没有回声消除和降噪，戴耳机用没问题。
+/// 抽成 trait 是为了让 APM 成为**可选**的：服务端不要它（只转发 Opus 包），
+/// 而没有 APM 的链路照样能通，只是没有回声消除和降噪，戴耳机用没问题。
+///
+/// 注意 `Apm` 内部有一把 `Mutex`（sonora 的方法是 `&mut self`，而这个 trait
+/// 是 `&self` + `Arc`），所以采集和渲染会互相挡一下。量级见 `apm` 的模块文档。
 pub trait AudioProcessor: Send + Sync {
     /// 处理麦克风采到的一帧（回声消除、降噪、增益）。
     fn process_capture(&self, frame: &mut [f32]);

@@ -2,28 +2,33 @@
 name = "voice-core"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
+# 工作区是 1.80，这里单独抬到 1.91 —— sonora（APM）要这个版本。
+# **只抬这一个 crate**：protocol 是给第三方照着实现的，没理由被一个
+# 客户端音频依赖拖着升。
+rust-version = "1.91"
 # 引擎层：要能链进闭源产品，见 LICENSING.md
 license = "MPL-2.0"
 description = "客户端语音内核：音频 IO / APM / Opus / 抖动缓冲 / 传输 / 热键。M1 只含抖动缓冲、实时时钟与度量。"
 
 [features]
 # 默认带上 APM。客户端要它，服务端不要 —— 见下。
-# 默认**不带 apm**：那套 C++ 工具链（meson + ninja）是这个项目里最难装的一环，
-# 不该挡在「git clone 完 cargo build」前面。要回声消除就显式打开。
-default = ["pipeline"]
-# 回声消除 / 降噪 / AGC。**这是唯一需要 C++ 工具链（meson + ninja）的东西。**
+default = ["pipeline", "apm"]
+# 回声消除 / 降噪 / AGC。
 #
-# 服务端只转发 Opus 包，从头到尾不碰音频采样，所以它关掉这个 feature
-# 编译。否则自部署的人为了编一个转发器要先装一整套 C++ 构建环境，
-# 跟「单二进制、自部署零依赖」直接冲突。
-apm = ["dep:webrtc-audio-processing"]
+# **2026-09 之前这个是默认关着的**，因为当时用的是 C++ 的 libwebrtc APM，
+# 要 meson + ninja + 一整套工具链，挡在「git clone 完 cargo build」前面。
+# 换成纯 Rust 的 sonora 之后那个理由没了 —— 跑起来就该有回声消除和降噪，
+# 而「外放开黑不啸叫」正是这个产品的卖点，不该要用户自己去开。
+# 换的过程和 A/B 数字见 docs/apm-backend.md。
+#
+# 仍然是个 feature，是为了服务端：它只转发 Opus 包，从头到尾不碰音频采样，
+# 带上 APM 只是白白多编几个 crate、多占体积。
+apm = ["dep:sonora"]
 # Opus 编解码。要 cmake（从源码编 libopus），所以也是可选的 ——
 # 服务端只转发 Opus 包，从不解码。
 codec = ["dep:opus"]
-# 整条语音链路。**不强制要 apm** —— APM 那个 C++ 工具链是这个项目里最难装的
-# 一环（见 docs/m2-apm-windows.md），不该让「想编一下试试」的人先跨过它。
-# 没有 APM 的链路照样能通，只是没有回声消除和降噪，戴耳机用没问题。
+# 整条语音链路。**不强制要 apm** —— 没有 APM 的链路照样能通，
+# 只是没有回声消除和降噪。默认那份是带 APM 的，见 `default`。
 pipeline = ["codec"]
 
 [dependencies]
@@ -31,8 +36,8 @@ protocol.workspace = true
 ed25519-dalek.workspace = true
 getrandom.workspace = true
 sha2.workspace = true
-webrtc-audio-processing = { workspace = true, optional = true }
 opus = { workspace = true, optional = true }
+sonora = { workspace = true, optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = [

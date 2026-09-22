@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MPL-2.0
 //! APM：回声消除、降噪、自动增益。
 //!
-//! 用 libwebrtc 的 AudioProcessing 模块（`webrtc-audio-processing` crate）。
-//! **绝对不要自己写 AEC** —— AEC3 是十几年的积累，自研的结果一定是外放开黑就啸叫。
+//! 用 [`sonora`] —— libwebrtc AudioProcessing 模块（M145）的**纯 Rust 移植**，
+//! AEC3 + 降噪 + AGC2 + 高通。**绝对不要自己写 AEC** —— AEC3 是十几年的积累，
+//! 自研的结果一定是外放开黑就啸叫。
 //!
 //! 这里只是一层薄封装，做三件事：
 //! 1. 把「我们这个产品要什么」固化成一份配置，而不是让每个调用方自己拼
@@ -29,14 +30,41 @@
 //! 两路是不是大致同步。真接上 WASAPI 之后要通过
 //! [`ApmConfig::stream_delay_ms`] 把设备那段延迟告诉它（M2 已经量出来了：
 //! 采集 10.4 ms + 渲染 20 ms）。
-
-use webrtc_audio_processing::config::{
-    EchoCanceller, GainController, GainController2, HighPassFilter, NoiseSuppression,
-    NoiseSuppressionLevel,
-};
-use webrtc_audio_processing::{Config, Processor};
-
-pub use webrtc_audio_processing::Error;
+//!
+//! # 为什么是纯 Rust 那份，不是 C++ 的
+//!
+//! 一直到 2026-09 用的都是 `webrtc-audio-processing`（C++ 的 libwebrtc，M131）。
+//! 它在 Windows/MSVC 上开箱编不过，我们打了七个补丁、vendor 了 5.3 MB 源码、
+//! 写了一个环境准备脚本才跑起来 —— 而最贵的代价是 **APM 因此默认关着**，
+//! `git clone` 完 `cargo run` 跑出来的客户端没有回声消除也没有降噪。
+//!
+//! sonora 不需要任何 C++ 工具链：没有 meson、ninja、abseil、MAX_PATH、
+//! 伪造的 `nm.exe`、符号前缀。18 秒 `cargo build` 编完。
+//!
+//! 换之前做了 A/B（两个后端跑同一份测量代码）：CPU 0.66% → 0.79%
+//! （+0.13 个百分点），延迟 15.00 → 14.92 ms，合成回声抑制 26.0 → 57.9 dB。
+//! 完整数字和它的**局限**见 `docs/apm-backend.md` —— 特别是那句
+//! 「两边不是同一个版本」（M131 vs M145）。
+//!
+//! # 三处实现差异
+//!
+//! 这三处都是 API 形状的差异，不是行为差异，但都影响性能账：
+//!
+//! **一、`&mut self` vs `&self`。** C++ 的 APM 内部自己带锁（而且 capture 和
+//! render 是**两把独立的锁**），所以那个 crate 的方法是 `&self`。sonora 是普通的
+//! Rust 结构体，方法是 `&mut self`。而 [`crate::pipeline::AudioProcessor`] 要求
+//! `&self` + `Send + Sync`（它被 `Arc` 着跨线程用），所以这里包了一把 `Mutex`。
+//!
+//! 代价是**采集和渲染被串起来了**：采集线程可能被渲染线程挡一下。一帧十几微秒、
+//! 10 ms 的预算，量级上是 0.1%，但这是实时线程，写在这里免得以后有人忘了。
+//!
+//! **二、不是原地处理。** sonora 的签名是「源和目标两个 slice」，我们的接口是
+//! 原地改。所以这里挂了一块 scratch，每帧多一次 480 点的拷贝。
+//!
+//! **三、没有「只分析不修改」的远端接口。** C++ 那份有 `analyze_render_frame`，
+//! 外放场景下我们不打算改远端音频，用它能省一次拷贝。sonora 只有
+//! `process_render_f32`，所以 [`Apm::analyze_render`] 是往 scratch 里丢、
+//! 把结果扔掉 —— 参考信号照样喂给了 AEC，行为一致，只是多一次拷贝。
 
 /// APM 各模块的开关。
 ///
@@ -131,26 +159,66 @@ impl std::fmt::Display for ApmModule {
     }
 }
 
-/// 一路 APM。单声道。
+use std::sync::Mutex;
+
+use sonora::config::{
+    EchoCanceller, GainController2, HighPassFilter, NoiseSuppression, NoiseSuppressionLevel,
+};
+use sonora::{AudioProcessing, Config, StreamConfig};
+
+pub use sonora::Error;
+
+/// 一路 APM，纯 Rust 实现。单声道。
+///
+/// 接口跟 [`crate::apm::Apm`] 一一对应，可以直接换着用。
 pub struct Apm {
-    processor: Processor,
+    inner: Mutex<Inner>,
     frame_samples: usize,
     sample_rate: u32,
 }
 
+struct Inner {
+    apm: AudioProcessing,
+    /// 处理结果先落在这里，再拷回调用方的 buffer。见模块文档「三处实现差异」的第二条。
+    scratch: Vec<f32>,
+    /// `Some` 时每帧都要重设一次 —— 镜像 C++ 那份的行为，见模块文档。
+    ///
+    /// C++ 那份把 `stream_delay_ms` 放在 `EchoCanceller::Full` 里，但底层
+    /// 每次 `process_capture` 之前都会调一遍 `set_stream_delay_ms`。
+    /// sonora 把它暴露成普通的运行时 setter，所以这里显式照着做，
+    /// 保证两个后端喂给 AEC3 的东西完全一样 —— 否则 A/B 比的就不是同一件事。
+    stream_delay_ms: Option<i32>,
+}
+
 impl Apm {
     pub fn new(sample_rate: u32, cfg: ApmConfig) -> Result<Self, Error> {
-        let processor = Processor::new(sample_rate)?;
-        processor.set_config(build_config(cfg));
-        let frame_samples = processor.num_samples_per_frame();
+        let stream = StreamConfig::new(sample_rate, 1);
+        let frame_samples = stream.num_frames();
+
+        let mut apm = AudioProcessing::builder()
+            .config(build_config(cfg))
+            .capture_config(stream)
+            .render_config(stream)
+            .build();
+
+        let stream_delay_ms = cfg.stream_delay_ms.map(i32::from);
+        // 建好就先设一次，让第一帧就有值可用。
+        if let Some(d) = stream_delay_ms {
+            apm.set_stream_delay_ms(d)?;
+        }
+
         Ok(Self {
-            processor,
+            inner: Mutex::new(Inner {
+                apm,
+                scratch: vec![0.0; frame_samples],
+                stream_delay_ms,
+            }),
             frame_samples,
             sample_rate,
         })
     }
 
-    /// 一帧多少个采样点。48 kHz 下是 480（10 ms）。**喂别的长度会 panic。**
+    /// 一帧多少个采样点。48 kHz 下是 480（10 ms）。
     pub fn frame_samples(&self) -> usize {
         self.frame_samples
     }
@@ -162,45 +230,84 @@ impl Apm {
     /// 处理近端（麦克风）的一帧，**就地修改**。
     pub fn process_capture(&self, mono: &mut [f32]) -> Result<(), Error> {
         debug_assert_eq!(mono.len(), self.frame_samples, "APM 只吃 10 ms 帧");
-        self.processor.process_capture_frame([mono])
+        let mut guard = self.lock();
+        let Inner {
+            apm,
+            scratch,
+            stream_delay_ms,
+        } = &mut *guard;
+        // 每帧重设，镜像 C++ 那份的行为。
+        if let Some(d) = *stream_delay_ms {
+            apm.set_stream_delay_ms(d)?;
+        }
+        apm.process_capture_f32(&[&*mono], &mut [scratch.as_mut_slice()])?;
+        mono.copy_from_slice(scratch);
+        Ok(())
     }
 
     /// 处理远端（我们要播出去的）的一帧，**就地修改**。
-    ///
-    /// 不打算改远端音频的话用 [`Apm::analyze_render`]，省一次拷贝。
     pub fn process_render(&self, mono: &mut [f32]) -> Result<(), Error> {
         debug_assert_eq!(mono.len(), self.frame_samples, "APM 只吃 10 ms 帧");
-        self.processor.process_render_frame([mono])
+        let mut guard = self.lock();
+        let Inner { apm, scratch, .. } = &mut *guard;
+        apm.process_render_f32(&[&*mono], &mut [scratch.as_mut_slice()])?;
+        mono.copy_from_slice(scratch);
+        Ok(())
     }
 
-    /// 只把远端喂给 AEC 当参考，不修改它。外放场景下就该用这个。
+    /// 只把远端喂给 AEC 当参考，不修改它。
+    ///
+    /// sonora 没有「只分析」的接口，所以结果往 scratch 里丢了 —— 喂给 AEC 的
+    /// 东西跟 C++ 那份一样，只是多一次拷贝。见模块文档「三处实现差异」的第三条。
     pub fn analyze_render(&self, mono: &mut [f32]) -> Result<(), Error> {
         debug_assert_eq!(mono.len(), self.frame_samples, "APM 只吃 10 ms 帧");
-        self.processor.analyze_render_frame([mono])
+        let mut guard = self.lock();
+        let Inner { apm, scratch, .. } = &mut *guard;
+        apm.process_render_f32(&[&*mono], &mut [scratch.as_mut_slice()])
+    }
+
+    /// 锁中毒了就把它捡回来。
+    ///
+    /// 中毒意味着别的线程在持锁时 panic 了。APM 里存的是滤波器状态，不是
+    /// 什么要维持不变量的东西 —— 最坏的结果是 AEC 要重新收敛一次。
+    /// 为这个把整条语音链路弄断，才是更糟的选择。
+    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
+/// 把 [`ApmConfig`] 翻译成 sonora 的配置。
+///
+/// **必须跟 `apm.rs` 的 `build_config` 逐项对齐** —— 两边配出来的东西不一样的话，
+/// A/B 比的就不是同一件事了。
 fn build_config(cfg: ApmConfig) -> Config {
     Config {
-        // AEC 和降噪都会强制打开高通，所以这里显式跟随，免得"关掉高通"这个
-        // 配置项在报告里看起来生效了、实际没有。
+        // 跟 C++ 那份一样：AEC 和降噪会强制打开高通，这里显式跟随，
+        // 免得"关掉高通"这个配置项在报告里看起来生效了、实际没有。
         high_pass_filter: (cfg.high_pass || cfg.echo_cancel || cfg.noise_suppression).then_some(
             HighPassFilter {
                 apply_in_full_band: true,
             },
         ),
-        echo_canceller: cfg.echo_cancel.then_some(EchoCanceller::Full {
-            stream_delay_ms: cfg.stream_delay_ms,
+        // sonora 把 stream_delay_ms 挪到了运行时 setter，所以这里只有开关。
+        echo_canceller: cfg.echo_cancel.then_some(EchoCanceller {
+            // **必须显式写 false，不能用 default()。**
+            //
+            // sonora 这个字段默认是 true，而上游那个 crate 在 FFI 那层
+            // 把它**硬编码成了 false**（注释原话：高通已经有独立的配置项了，
+            // 这里再开一次是重复）。用 default() 的话两个后端配出来的东西不一样，
+            // A/B 就成了在比两份不同的配置。
+            enforce_high_pass_filtering: false,
+            ..EchoCanceller::default()
         }),
         noise_suppression: cfg.noise_suppression.then_some(NoiseSuppression {
-            // Moderate 而不是 High：再往上语音失真开始听得出来，
-            // 而我们的场景是「听清队友」不是「录播客」。
             level: NoiseSuppressionLevel::Moderate,
-            analyze_linear_aec_output: false,
+            // 上游叫 analyze_linear_aec_output，这边叫 ..._when_available，同一个东西。
+            analyze_linear_aec_output_when_available: false,
         }),
-        gain_controller: cfg
-            .gain_control
-            .then_some(GainController::GainController2(GainController2::default())),
+        // 两边的 GainController2 都是 derive 的 Default（adaptive_digital: None），
+        // 所以 default() 在两个后端里是同一个意思。
+        gain_controller2: cfg.gain_control.then_some(GainController2::default()),
         ..Default::default()
     }
 }
@@ -325,6 +432,11 @@ mod tests {
     }
 }
 
+/// 真音箱真麦克风下的回声抑制。要 `codec` 是因为帧长常量和采集/播放 trait 在 `audio` 里。
+#[cfg(all(test, windows, feature = "codec"))]
+#[path = "apm_acoustic.rs"]
+mod acoustic;
+
 #[cfg(test)]
 mod echo {
     use super::*;
@@ -340,7 +452,8 @@ mod echo {
     /// 第一版用 -12 dB，量出来只有 17 dB，差点让人以为 AEC 不行。
     const ECHO_GAIN: f32 = 0.5;
 
-    fn energy_db(samples: &[f32]) -> f32 {
+    /// `pub(super)`：[`super::acoustic`] 要用同一个算法，否则两边的 dB 对不上。
+    pub(super) fn energy_db(samples: &[f32]) -> f32 {
         if samples.is_empty() {
             return -120.0;
         }
@@ -363,7 +476,7 @@ mod echo {
     ///
     /// 所以测 AEC 一定要用宽带信号。这里在白噪声上做两件事让它更像人声：
     /// 带限到 300–3400 Hz，再乘一个 4 Hz 上下的音节包络。
-    fn speech_like(frames: usize, seed: u64, target_rms: f32) -> Vec<f32> {
+    pub(super) fn speech_like(frames: usize, seed: u64, target_rms: f32) -> Vec<f32> {
         let mut state = seed;
         let mut hp_prev_in = 0.0f32;
         let mut hp_prev_out = 0.0f32;
@@ -411,6 +524,13 @@ mod echo {
     ///
     /// 场景：对面在说话（远端），从我的音箱放出来，又被我的麦克风收回去。
     /// 我自己一声不吭。那么麦克风里的东西**全都是回声**，AEC 之后应该几乎什么都不剩。
+    /// **AEC3 真的能把回声消掉。** 这是「外放开黑不啸叫」的全部依据。
+    ///
+    /// 场景：对面在说话（远端），从我的音箱放出来，又被我的麦克风收回去。
+    /// 我自己一声不吭。那么麦克风里的东西**全都是回声**，AEC 之后应该几乎什么都不剩。
+    ///
+    /// 注意这是**线性**回路，量到的是"滤波器收敛得多好"。真声学回路的非线性
+    /// 失真、时钟漂移、混响都不在这里 —— 那个在 `mod acoustic`。
     #[test]
     fn aec_actually_cancels_the_echo() {
         let apm = Apm::new(
@@ -490,6 +610,10 @@ mod echo {
         assert!(after < -40.0, "残留回声 {after:.1} dB，还听得见");
     }
 
+    /// **没有回声的时候，AEC 不该动我的声音。**
+    ///
+    /// 这是真正会砸掉产品的那条：戴耳机的人根本没有回声，如果开了 AEC
+    /// 之后他的声音被削掉一截，那这个功能就是负收益 —— 而绝大多数人戴耳机。
     /// **没有回声的时候，AEC 不该动我的声音。**
     ///
     /// 这是真正会砸掉产品的那条：戴耳机的人根本没有回声，如果开了 AEC

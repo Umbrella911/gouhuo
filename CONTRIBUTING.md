@@ -62,9 +62,11 @@ python scripts/check-spdx.py
 期望值是从 `cargo metadata` 读出来的，所以改了某个 crate 的许可，
 这个检查会自动跟着变，不用改脚本。
 
-Windows 上首次构建要额外准备（APM 要从源码编 libwebrtc），
-用 [`scripts/win-buildenv.ps1`](scripts/win-buildenv.ps1) 检查环境缺什么。
-背景见 [`docs/m2-apm-windows.md`](docs/m2-apm-windows.md)。
+构建不需要额外准备 —— `cargo build` 就行。唯一可能缺的是 cmake
+（`audiopus_sys` 从源码编 libopus 要用），缺了就跑
+[`scripts/win-buildenv.ps1`](scripts/win-buildenv.ps1)，它会去 Visual Studio
+里找一份。APM 曾经要一整套 C++ 工具链，换成纯 Rust 之后不需要了，
+经过见 [`docs/apm-backend.md`](docs/apm-backend.md)。
 
 ## 改到红线相关的东西
 

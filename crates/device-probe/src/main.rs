@@ -188,6 +188,7 @@ fn apm_section(args: &Args) {
     println!("  level       输出/输入幅度比。AGC 会明显改它，接近 0 说明信号被吃掉了");
 
     apm_verdict(shipping_delay, shipping_cpu);
+    apm_caveats();
 }
 
 fn apm_verdict(delay_ms: Option<f64>, cpu_pct: Option<f64>) {
@@ -259,13 +260,21 @@ fn apm_verdict(delay_ms: Option<f64>, cpu_pct: Option<f64>) {
         }
         None => println!("  CPU：没测出来"),
     }
+}
 
+/// 两个后端都报完之后说一次，不跟着后端重复。
+fn apm_caveats() {
     println!();
     println!("  仍然没测的：");
-    println!("    - 真回声下 AEC3 的效果（这里远端喂的是静音，没有回声可消）");
     println!("    - 声学往返（音箱 → 空气 → 麦克风）");
     println!("    - 虚拟声卡那一层、蓝牙耳机");
+    println!("    - 双讲（两个人同时说）");
     println!("    - 内存和安装包红线（要等 voice-core 独立进程和 Tauri 打包）");
+    println!();
+    println!("  回声抑制本身**不在这里量** —— 这一段远端喂的是静音，没有回声可消。");
+    println!("  那个在单元测试里：");
+    println!("    cargo test -p voice-core echo:: -- --nocapture          （合成的线性回路）");
+    println!("    cargo test -p voice-core acoustic -- --ignored --nocapture （真音箱真麦克风）");
 }
 
 fn table(list: &[&DeviceInfo]) {

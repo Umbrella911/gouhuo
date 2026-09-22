@@ -1,17 +1,22 @@
 # `webrtc-audio-processing` 在 Windows/MSVC 上编不过：诊断与补丁
 
 > **状态：已解决。** `third_party/webrtc-audio-processing-sys/` 是打过补丁的副本，
-> 六处补丁全部用 `kaimai patch:` 标出来了。环境准备用
+> 七处补丁全部用 `kaimai patch:` 标出来了。环境准备用
 > [`scripts/win-buildenv.ps1`](../scripts/win-buildenv.ps1)。
 > 下面是完整诊断 —— 留着是为了把补丁提给上游时有据可依，
 > 以及以后有人问"为什么仓库里躺着 5 MB 第三方 C++ 源码"时能有个答案。
+>
+> **另见 [`apm-backend.md`](apm-backend.md)（2026-09-22）：这篇的结论可能会被推翻。**
+> 现在有了纯 Rust 的 APM 移植（sonora），不需要任何 C++ 工具链 ——
+> 下面这七个缺口在那条路上一个都不存在。A/B 通过的话，
+> `third_party/` 和这篇文档会一起删掉。
 
 调查时间：2026-09-20。机器：Windows 11 Pro / rustc 1.96 MSVC / VS BuildTools 18（MSVC 14.51）。
 
 ## 一句话结论
 
 **`webrtc-audio-processing` 2.1.0 开箱在 Windows/MSVC 上编不过，但不是死路。**
-打六个小补丁就能跑起来，补丁都在 `third_party/` 那份副本里。
+打七个小补丁就能跑起来，补丁都在 `third_party/` 那份副本里。
 
 libwebrtc 的 APM 本体（含 abseil）在 MSVC 下**能完整编出来** —— 我编出来了，
 59814 个符号也前缀成功了。缺的是那个 Rust `-sys` crate 的构建脚本里
@@ -108,6 +113,11 @@ crate 的 out 目录本身就吃掉 ~100 字符
 
 `build.rs` 用它们拷源码树和打补丁。Git for Windows 自带，但要在 PATH 上，
 而从 PowerShell 跑 cargo 时通常不在。
+
+（**缺口是六个，补丁是七处** —— 这一个缺口花了两处修改：`cp -a` 换成了
+`build.rs` 里自己写的递归拷贝，见 `kaimai patch: 7`。装了 Git 的机器上
+碰巧有 `cp`，但那是个不该依赖的巧合：它在不在 PATH 上取决于用户装 Git
+时选了哪个选项。）
 
 ### 6. 符号前缀和库名
 
