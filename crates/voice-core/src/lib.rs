@@ -19,6 +19,8 @@ pub mod hotkey;
 pub mod identity;
 pub mod jitter;
 pub mod metrics;
+#[cfg(feature = "pipeline")]
+pub mod miccheck;
 pub mod net;
 #[cfg(feature = "pipeline")]
 pub mod pipeline;

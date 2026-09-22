@@ -22,6 +22,7 @@ use std::sync::{Arc, Mutex};
 use client_core::{Client, ConnectError, Event};
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 use voice_core::identity::Identity;
+use voice_core::miccheck::MicCheck;
 use voice_core::pipeline::{Pipeline, PipelineConfig, TransmitMode, DEFAULT_JITTER_FRAMES};
 
 /// 多久去问一次语音链路的状态。
@@ -108,6 +109,7 @@ fn main() -> Result<(), slint::PlatformError> {
     wire_actions(&app, &state);
     wire_settings(&app, &state, hotkeys.clone());
     load_devices(&app, &state);
+    spawn_status_poll(app.as_weak(), Arc::clone(&state));
     if let Some(hotkeys) = hotkeys {
         spawn_ptt_poll(app.as_weak(), Arc::clone(&state), hotkeys);
     }
@@ -168,6 +170,11 @@ struct State {
     client: Option<Client>,
     /// 语音链路。丢掉它就会把音频线程收干净。
     voice: Option<Arc<Pipeline>>,
+    /// 没连服务器时的独立试麦。
+    ///
+    /// 跟 `voice` **永远不会同时存在** —— 两个都要开同一副耳机，
+    /// 虽然共享模式下不会打架，但麦克风会被采两遍，电平也会对不上。
+    mic_check: Option<Arc<MicCheck>>,
     settings: Settings,
     /// 采集流的把手：实际打开的设备叫什么。
     capture: Option<voice_core::wasapi::CaptureDiagnostics>,
@@ -288,6 +295,9 @@ fn on_connected(
 /// 设备打不开不该让人掉线 —— 文字和名单照样能用，只是没声音。所以这里
 /// 失败只是把原因显示出来，不动连接。
 fn start_voice(app: &App, state: &Arc<Mutex<State>>, client: &Client) {
+    // 先把独立试麦停掉：两个都开的话麦克风会被采两遍。
+    stop_mic_check(state);
+
     let Some(addr) = resolve_voice_addr(client) else {
         app.set_voice_error("服务器没给出语音端口".into());
         return;
@@ -323,8 +333,6 @@ fn start_voice(app: &App, state: &Arc<Mutex<State>>, client: &Client) {
             let mut locked = state.lock().expect("state poisoned");
             locked.voice = Some(Arc::new(pipeline));
             locked.capture = Some(diagnostics);
-            drop(locked);
-            spawn_voice_poll(app.as_weak(), Arc::clone(state));
         }
         Err(e) => app.set_voice_error(format!("{e}").into()),
     }
@@ -390,7 +398,26 @@ fn load_devices(app: &App, state: &Arc<Mutex<State>>) {
 /// 比为了热切换在音频线程里加一套状态机划算得多。
 fn restart_voice(app: &App, state: &Arc<Mutex<State>>) {
     let client = state.lock().expect("state poisoned").client.clone();
-    let Some(client) = client else { return };
+    let Some(client) = client else {
+        // 没连服务器：重起的是独立试麦。
+        let was_monitoring = {
+            let locked = state.lock().expect("state poisoned");
+            locked
+                .mic_check
+                .as_ref()
+                .map(|m| m.is_monitoring())
+                .unwrap_or(false)
+        };
+        stop_mic_check(state);
+        app.set_capture_in_use("".into());
+        start_mic_check(app, state);
+        if was_monitoring {
+            if let Some(mic) = state.lock().expect("state poisoned").mic_check.clone() {
+                mic.set_monitoring(true);
+            }
+        }
+        return;
+    };
 
     let was_monitoring = current_voice(state)
         .map(|v| v.is_monitoring())
@@ -449,11 +476,24 @@ fn wire_settings(app: &App, state: &Arc<Mutex<State>>, hotkeys: Option<Rc<Hotkey
         let state = Arc::clone(state);
         let weak = app.as_weak();
         app.on_toggle_monitor(move || {
-            let (Some(app), Some(voice)) = (weak.upgrade(), current_voice(&state)) else {
-                return;
+            let Some(app) = weak.upgrade() else { return };
+            let (voice, mic) = {
+                let locked = state.lock().expect("state poisoned");
+                (locked.voice.clone(), locked.mic_check.clone())
             };
-            let on = !voice.is_monitoring();
-            voice.set_monitoring(on);
+            let on = match (&voice, &mic) {
+                (Some(voice), _) => {
+                    let on = !voice.is_monitoring();
+                    voice.set_monitoring(on);
+                    on
+                }
+                (None, Some(mic)) => {
+                    let on = !mic.is_monitoring();
+                    mic.set_monitoring(on);
+                    on
+                }
+                (None, None) => return,
+            };
             app.set_monitoring(on);
         });
     }
@@ -475,9 +515,19 @@ fn wire_settings(app: &App, state: &Arc<Mutex<State>>, hotkeys: Option<Rc<Hotkey
 
     {
         let weak = app.as_weak();
+        let state = Arc::clone(state);
         app.on_toggle_settings(move || {
             let Some(app) = weak.upgrade() else { return };
-            app.set_show_settings(!app.get_show_settings());
+            let opening = !app.get_show_settings();
+            app.set_show_settings(opening);
+            if opening {
+                // 没连服务器也要能看电平、能试听 —— 这正是连不上时最想知道的事。
+                start_mic_check(&app, &state);
+            } else {
+                // 关掉设置就把设备还回去。常驻几小时的软件不该一直占着麦克风，
+                // 而且麦克风灯一直亮着会让人不安。
+                stop_mic_check(&state);
+            }
         });
     }
 
@@ -602,35 +652,95 @@ fn resolve_voice_addr(client: &Client) -> Option<std::net::SocketAddr> {
         .next()
 }
 
-/// 定时把语音状态搬到界面上：谁在说话、UDP 通没通。
-fn spawn_voice_poll(weak: slint::Weak<App>, state: Arc<Mutex<State>>) {
-    // 用 Slint 自己的定时器而不是线程：它就在界面线程上跑，
-    // 省掉一次跨线程投递，而这件事每秒要做五次。
+/// 定时把音频状态搬到界面上。**整个程序只有一个**，连着和没连着都靠它。
+///
+/// 用 Slint 自己的定时器而不是线程：它就在界面线程上跑，省掉一次跨线程投递，
+/// 而这件事每秒要做二十次。
+fn spawn_status_poll(weak: slint::Weak<App>, state: Arc<Mutex<State>>) {
     let timer = slint::Timer::default();
     timer.start(slint::TimerMode::Repeated, VOICE_POLL, move || {
         let Some(app) = weak.upgrade() else { return };
-        let (voice, client) = {
-            let state = state.lock().expect("state poisoned");
-            (state.voice.clone(), state.client.clone())
+        let (voice, mic_check, client, capture) = {
+            let locked = state.lock().expect("state poisoned");
+            (
+                locked.voice.clone(),
+                locked.mic_check.clone(),
+                locked.client.clone(),
+                locked.capture.clone(),
+            )
         };
-        let (Some(voice), Some(client)) = (voice, client) else {
-            return;
-        };
-        let stats = voice.stats();
-        app.set_udp_ok(stats.udp_ok);
-        app.set_input_level(db_to_level(stats.input_db));
-        app.set_monitoring(voice.is_monitoring());
-        if let Some(capture) = state.lock().expect("state poisoned").capture.clone() {
+
+        // 实际用的是哪个设备、是不是虚拟声卡。两条路共用同一个把手。
+        if let Some(capture) = capture {
             if capture.has_opened() {
                 app.set_capture_in_use(capture.device_name().into());
                 app.set_capture_is_virtual(capture.is_virtual());
             }
         }
-        // 「现在在不在往外发」。自己说话服务端不会转回来，只能看本地。
-        app.set_transmitting(transmitting_now(&app, &voice, stats.input_db));
-        update_speaking(&app, &client, &stats.speaking);
+
+        if let Some(voice) = voice {
+            let stats = voice.stats();
+            app.set_udp_ok(stats.udp_ok);
+            app.set_input_level(db_to_level(stats.input_db));
+            app.set_monitoring(voice.is_monitoring());
+            app.set_transmitting(transmitting_now(&app, &voice, stats.input_db));
+            if let Some(client) = client {
+                update_speaking(&app, &client, &stats.speaking);
+            }
+        } else if let Some(mic) = mic_check {
+            app.set_input_level(db_to_level(mic.input_db()));
+            app.set_monitoring(mic.is_monitoring());
+            // 没连服务器时「在不在发」没有意义，但电平条要靠它变色 ——
+            // 用跟语音激活一样的判据，这样调灵敏度时看到的效果是真的。
+            let threshold = state
+                .lock()
+                .expect("state poisoned")
+                .settings
+                .vad_threshold_db;
+            app.set_transmitting(!app.get_ptt_mode() && mic.input_db() > threshold);
+            if let Some(error) = mic.error() {
+                app.set_voice_error(error.into());
+            }
+        }
     });
     VOICE_TIMER.with(|slot| *slot.borrow_mut() = Some(timer));
+}
+
+/// 开一次独立试麦（没连服务器的时候用）。
+fn start_mic_check(app: &App, state: &Arc<Mutex<State>>) {
+    if state.lock().expect("state poisoned").voice.is_some() {
+        // 已经连上了，语音链路就在跑，用它的电平。
+        return;
+    }
+    let (capture_id, render_id) = {
+        let locked = state.lock().expect("state poisoned");
+        (
+            locked.settings.capture_device.clone(),
+            locked.settings.render_device.clone(),
+        )
+    };
+    let capture = voice_core::wasapi::WasapiCapture::new(capture_id);
+    let diagnostics = capture.diagnostics();
+    app.set_voice_error("".into());
+
+    match MicCheck::start(
+        Box::new(capture),
+        Box::new(voice_core::wasapi::WasapiRender::new(render_id)),
+        audio_processor(),
+    ) {
+        Ok(check) => {
+            let mut locked = state.lock().expect("state poisoned");
+            locked.mic_check = Some(Arc::new(check));
+            locked.capture = Some(diagnostics);
+        }
+        Err(e) => app.set_voice_error(format!("{e}").into()),
+    }
+}
+
+/// 停掉独立试麦。连服务器之前必须停 —— 不然麦克风会被采两遍。
+fn stop_mic_check(state: &Arc<Mutex<State>>) {
+    let mut locked = state.lock().expect("state poisoned");
+    locked.mic_check = None;
 }
 
 /// 现在这一刻在不在往外发。

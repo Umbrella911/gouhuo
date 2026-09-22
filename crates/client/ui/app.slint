@@ -104,7 +104,7 @@ export component App inherits Window {
     // =======================================================================
     // 没连上：一个框，一个按钮
     // =======================================================================
-    if !root.connected: VerticalLayout {
+    if !root.connected && !root.show-settings: VerticalLayout {
         alignment: center;
         padding: 48px;
 
@@ -174,6 +174,13 @@ export component App inherits Window {
                 }
             }
 
+            // 连不上的时候最想确认的就是「是不是我麦克风的问题」，
+            // 所以这个入口必须在登录页上就有。
+            Btn {
+                label: "先试试麦克风";
+                clicked => { root.toggle-settings(); }
+            }
+
             if root.my-fingerprint != "": Text {
                 text: "你的身份指纹 " + root.my-fingerprint;
                 color: Theme.faint;
@@ -186,7 +193,7 @@ export component App inherits Window {
     // =======================================================================
     // 连上了：左边频道树，右边文字
     // =======================================================================
-    if root.connected: HorizontalLayout {
+    if root.connected && !root.show-settings: HorizontalLayout {
         spacing: 0;
 
         // ---- 左：频道树 + 成员 ----
@@ -204,7 +211,7 @@ export component App inherits Window {
                         padding-right: Theme.pad;
                         spacing: 8px;
                         Text {
-                            text: root.show-settings ? "设置" : root.server-name;
+                            text: root.server-name;
                             color: Theme.text;
                             font-size: 15px;
                             font-weight: 600;
@@ -216,186 +223,15 @@ export component App inherits Window {
                             width: 34px;
                             height: 28px;
                             y: (parent.height - self.height) / 2;
-                            label: root.show-settings ? "←" : "⚙";
+                            label: "⚙";
                             clicked => { root.toggle-settings(); }
                         }
                     }
                 }
                 Rectangle { height: 1px; background: Theme.line; }
 
-                if root.show-settings: ScrollView {
-                    VerticalLayout {
-                        padding: Theme.pad;
-                        spacing: 14px;
-                        alignment: start;
 
-                        Text {
-                            text: "说话方式";
-                            color: Theme.dim;
-                            font-size: 12px;
-                        }
-                        HorizontalLayout {
-                            spacing: 6px;
-                            Btn {
-                                label: "语音激活";
-                                primary: !root.ptt-mode;
-                                clicked => { root.set-ptt-mode(false); }
-                            }
-                            Btn {
-                                label: "按住说话";
-                                primary: root.ptt-mode;
-                                clicked => { root.set-ptt-mode(true); }
-                            }
-                        }
-
-                        Text {
-                            text: "按住说话的键";
-                            color: Theme.dim;
-                            font-size: 12px;
-                        }
-                        Btn {
-                            label: root.rebinding
-                                ? "按一个键…（点这里取消）"
-                                : (root.ptt-label == "" ? "还没设置，点这里设" : root.ptt-label);
-                            primary: root.rebinding;
-                            clicked => {
-                                if (root.rebinding) { root.cancel-rebind(); }
-                                else { root.rebind-ptt(); }
-                            }
-                        }
-                        Text {
-                            text: "键盘任意键，或者鼠标侧键。游戏全屏时也有效，"
-                                + "而且不会把这个键从游戏那边抢走。";
-                            color: Theme.faint;
-                            font-size: 11px;
-                            wrap: word-wrap;
-                        }
-
-                        Rectangle { height: 1px; background: Theme.line; }
-
-                        Text {
-                            text: "麦克风";
-                            color: Theme.dim;
-                            font-size: 12px;
-                        }
-                        ComboBox {
-                            model: root.capture-devices;
-                            current-index <=> root.capture-index;
-                            selected(v) => { root.pick-capture(root.capture-index); }
-                        }
-                        // 玩家机器上默认麦克风经常是 Sonar / Synapse 这类虚拟设备，
-                        // 而它们没在路由的时候是纯静音的。必须说出来。
-                        if root.capture-is-virtual: Text {
-                            text: "现在用的是虚拟声卡（" + root.capture-in-use
-                                + "）。这类设备没在路由的时候是纯静音的，"
-                                + "条子不动就换一个带「麦克风」字样的真设备试试。";
-                            color: Theme.warn;
-                            font-size: 11px;
-                            wrap: word-wrap;
-                        }
-                        LevelBar {
-                            level: root.input-level;
-                            threshold: root.vad-level;
-                            active: root.transmitting;
-                            show-threshold: !root.ptt-mode;
-                        }
-                        Text {
-                            text: root.input-level < 0.02
-                                ? "没收到声音。说句话看看条子动不动。"
-                                : (root.ptt-mode
-                                    ? "按住说话键时才会发出去。"
-                                    : (root.transmitting
-                                        ? "正在发送。"
-                                        : "有声音，但没过竖线那道坎，所以没发出去。"));
-                            color: root.input-level >= 0.02 && !root.transmitting && !root.ptt-mode
-                                ? Theme.warn
-                                : Theme.faint;
-                            font-size: 11px;
-                            wrap: word-wrap;
-                        }
-                        // 条子一直不动的三个常见原因，按从常见到不常见排。
-                        // 第三条最坑：Windows 的隐私设置挡掉麦克风时，
-                        // 应用拿到的是**静音**而不是报错，看起来跟设备坏了一模一样。
-                        if root.input-level < 0.02: Text {
-                            text: "一直不动的话：换上面那个下拉框里别的设备试试；"
-                                + "检查 Windows 音量合成器里这个麦克风有没有被静音；"
-                                + "再看看「设置 → 隐私和安全性 → 麦克风」里有没有允许桌面应用访问 —— "
-                                + "被挡住的时候拿到的是静音，跟设备坏了看起来一模一样。";
-                            color: Theme.faint;
-                            font-size: 11px;
-                            wrap: word-wrap;
-                        }
-
-                        if !root.ptt-mode: VerticalLayout {
-                            spacing: 4px;
-                            Text {
-                                text: "语音激活的灵敏度";
-                                color: Theme.faint;
-                                font-size: 11px;
-                            }
-                            Slider {
-                                minimum: 0;
-                                maximum: 1;
-                                value <=> root.vad-level;
-                                changed(v) => { root.set-vad(v); }
-                            }
-                            Text {
-                                text: "往左更灵敏（轻声也发），往右更迟钝（键盘声不会发出去）。";
-                                color: Theme.faint;
-                                font-size: 11px;
-                                wrap: word-wrap;
-                            }
-                        }
-
-                        Text {
-                            text: "耳机 / 扬声器";
-                            color: Theme.dim;
-                            font-size: 12px;
-                        }
-                        ComboBox {
-                            model: root.render-devices;
-                            current-index <=> root.render-index;
-                            selected(v) => { root.pick-render(root.render-index); }
-                        }
-
-                        Btn {
-                            label: root.monitoring ? "停止试听" : "试听自己的麦";
-                            primary: root.monitoring;
-                            clicked => { root.toggle-monitor(); }
-                        }
-                        if root.monitoring: Rectangle {
-                            background: #2a2417;
-                            border-radius: 6px;
-                            VerticalLayout {
-                                padding: 10px;
-                                Text {
-                                    text: "用扬声器试听会啸叫，戴耳机。听到的是直接回放，"
-                                        + "别人听到的还会多过一道压缩。";
-                                    color: Theme.warn;
-                                    font-size: 11px;
-                                    wrap: word-wrap;
-                                }
-                            }
-                        }
-
-                        // 选了按住说话却没绑键 = 一个字都发不出去。必须说出来。
-                        if root.ptt-mode && root.ptt-label == "": Rectangle {
-                            background: #2a2417;
-                            border-radius: 6px;
-                            VerticalLayout {
-                                padding: 10px;
-                                Text {
-                                    text: "还没绑键，现在谁都听不见你说话。";
-                                    color: Theme.warn;
-                                    font-size: 12px;
-                                    wrap: word-wrap;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if !root.show-settings: ScrollView {
+                ScrollView {
                     VerticalLayout {
                         padding: 6px;
                         spacing: 1px;
@@ -624,6 +460,215 @@ export component App inherits Window {
                             clicked => { root.send-text(); }
                         }
                     }
+                }
+            }
+        }
+    }
+    // =======================================================================
+    // 设置。**连不连服务器都能开** —— 「我的麦克风好不好使」这个问题，
+    // 恰恰在连不上的时候最想知道：是我麦克风坏了，还是服务器的问题？
+    // =======================================================================
+    if root.show-settings: VerticalLayout {
+        Rectangle {
+            height: 52px;
+            background: Theme.panel;
+            HorizontalLayout {
+                padding-left: Theme.pad;
+                padding-right: Theme.pad;
+                spacing: 8px;
+                Btn {
+                    width: 40px;
+                    y: (parent.height - self.height) / 2;
+                    label: "←";
+                    clicked => { root.toggle-settings(); }
+                }
+                Text {
+                    text: "设置";
+                    color: Theme.text;
+                    font-size: 15px;
+                    font-weight: 600;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
+            }
+        }
+        Rectangle { height: 1px; background: Theme.line; }
+        ScrollView {
+            vertical-stretch: 1;
+            HorizontalLayout {
+                alignment: center;
+                VerticalLayout {
+                    // 设备名字很长，260px 的侧栏里挤得没法看。
+                    width: 460px;
+                VerticalLayout {
+                    padding: Theme.pad;
+                    spacing: 14px;
+                    alignment: start;
+
+                    Text {
+                        text: "说话方式";
+                        color: Theme.dim;
+                        font-size: 12px;
+                    }
+                    HorizontalLayout {
+                        spacing: 6px;
+                        Btn {
+                            label: "语音激活";
+                            primary: !root.ptt-mode;
+                            clicked => { root.set-ptt-mode(false); }
+                        }
+                        Btn {
+                            label: "按住说话";
+                            primary: root.ptt-mode;
+                            clicked => { root.set-ptt-mode(true); }
+                        }
+                    }
+
+                    Text {
+                        text: "按住说话的键";
+                        color: Theme.dim;
+                        font-size: 12px;
+                    }
+                    Btn {
+                        label: root.rebinding
+                            ? "按一个键…（点这里取消）"
+                            : (root.ptt-label == "" ? "还没设置，点这里设" : root.ptt-label);
+                        primary: root.rebinding;
+                        clicked => {
+                            if (root.rebinding) { root.cancel-rebind(); }
+                            else { root.rebind-ptt(); }
+                        }
+                    }
+                    Text {
+                        text: "键盘任意键，或者鼠标侧键。游戏全屏时也有效，"
+                            + "而且不会把这个键从游戏那边抢走。";
+                        color: Theme.faint;
+                        font-size: 11px;
+                        wrap: word-wrap;
+                    }
+
+                    Rectangle { height: 1px; background: Theme.line; }
+
+                    Text {
+                        text: "麦克风";
+                        color: Theme.dim;
+                        font-size: 12px;
+                    }
+                    ComboBox {
+                        model: root.capture-devices;
+                        current-index <=> root.capture-index;
+                        selected(v) => { root.pick-capture(root.capture-index); }
+                    }
+                    // 玩家机器上默认麦克风经常是 Sonar / Synapse 这类虚拟设备，
+                    // 而它们没在路由的时候是纯静音的。必须说出来。
+                    if root.capture-is-virtual: Text {
+                        text: "现在用的是虚拟声卡（" + root.capture-in-use
+                            + "）。这类设备没在路由的时候是纯静音的，"
+                            + "条子不动就换一个带「麦克风」字样的真设备试试。";
+                        color: Theme.warn;
+                        font-size: 11px;
+                        wrap: word-wrap;
+                    }
+                    LevelBar {
+                        level: root.input-level;
+                        threshold: root.vad-level;
+                        active: root.transmitting;
+                        show-threshold: !root.ptt-mode;
+                    }
+                    Text {
+                        text: root.input-level < 0.02
+                            ? "没收到声音。说句话看看条子动不动。"
+                            : (root.ptt-mode
+                                ? "按住说话键时才会发出去。"
+                                : (root.transmitting
+                                    ? "正在发送。"
+                                    : "有声音，但没过竖线那道坎，所以没发出去。"));
+                        color: root.input-level >= 0.02 && !root.transmitting && !root.ptt-mode
+                            ? Theme.warn
+                            : Theme.faint;
+                        font-size: 11px;
+                        wrap: word-wrap;
+                    }
+                    // 条子一直不动的三个常见原因，按从常见到不常见排。
+                    // 第三条最坑：Windows 的隐私设置挡掉麦克风时，
+                    // 应用拿到的是**静音**而不是报错，看起来跟设备坏了一模一样。
+                    if root.input-level < 0.02: Text {
+                        text: "一直不动的话：换上面那个下拉框里别的设备试试；"
+                            + "检查 Windows 音量合成器里这个麦克风有没有被静音；"
+                            + "再看看「设置 → 隐私和安全性 → 麦克风」里有没有允许桌面应用访问 —— "
+                            + "被挡住的时候拿到的是静音，跟设备坏了看起来一模一样。";
+                        color: Theme.faint;
+                        font-size: 11px;
+                        wrap: word-wrap;
+                    }
+
+                    if !root.ptt-mode: VerticalLayout {
+                        spacing: 4px;
+                        Text {
+                            text: "语音激活的灵敏度";
+                            color: Theme.faint;
+                            font-size: 11px;
+                        }
+                        Slider {
+                            minimum: 0;
+                            maximum: 1;
+                            value <=> root.vad-level;
+                            changed(v) => { root.set-vad(v); }
+                        }
+                        Text {
+                            text: "往左更灵敏（轻声也发），往右更迟钝（键盘声不会发出去）。";
+                            color: Theme.faint;
+                            font-size: 11px;
+                            wrap: word-wrap;
+                        }
+                    }
+
+                    Text {
+                        text: "耳机 / 扬声器";
+                        color: Theme.dim;
+                        font-size: 12px;
+                    }
+                    ComboBox {
+                        model: root.render-devices;
+                        current-index <=> root.render-index;
+                        selected(v) => { root.pick-render(root.render-index); }
+                    }
+
+                    Btn {
+                        label: root.monitoring ? "停止试听" : "试听自己的麦";
+                        primary: root.monitoring;
+                        clicked => { root.toggle-monitor(); }
+                    }
+                    if root.monitoring: Rectangle {
+                        background: #2a2417;
+                        border-radius: 6px;
+                        VerticalLayout {
+                            padding: 10px;
+                            Text {
+                                text: "用扬声器试听会啸叫，戴耳机。听到的是直接回放，"
+                                    + "别人听到的还会多过一道压缩。";
+                                color: Theme.warn;
+                                font-size: 11px;
+                                wrap: word-wrap;
+                            }
+                        }
+                    }
+
+                    // 选了按住说话却没绑键 = 一个字都发不出去。必须说出来。
+                    if root.ptt-mode && root.ptt-label == "": Rectangle {
+                        background: #2a2417;
+                        border-radius: 6px;
+                        VerticalLayout {
+                            padding: 10px;
+                            Text {
+                                text: "还没绑键，现在谁都听不见你说话。";
+                                color: Theme.warn;
+                                font-size: 12px;
+                                wrap: word-wrap;
+                            }
+                        }
+                    }
+                }
                 }
             }
         }

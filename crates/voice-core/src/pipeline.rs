@@ -793,7 +793,10 @@ fn keepalive_loop(
 const SILENT_DB_CENTI: i32 = -12_000;
 
 /// 一帧的能量，分贝（满刻度 0 dB）。
-fn frame_db(frame: &[f32]) -> f32 {
+///
+/// `miccheck` 也用它 —— 电平表在两个地方必须是同一套算法，
+/// 不然用户会发现「试麦时条子动，进了频道就不动了」。
+pub(crate) fn frame_db(frame: &[f32]) -> f32 {
     if frame.is_empty() {
         return -120.0;
     }
