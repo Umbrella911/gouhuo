@@ -4,3 +4,12 @@
 
 # 本机构建路径变通，见文件内注释
 /.cargo/config.toml
+
+# 服务端运行时的数据目录。**里面有 TLS 私钥。**
+# 默认叫 kaimai-data，在仓库里跑一下服务端就会生成。
+/kaimai-data
+/*-data
+
+# 客户端的身份和设置（正常在 %APPDATA%，但 KAIMAI_DATA 指到别处时会落这儿）
+identity.key
+settings.txt
