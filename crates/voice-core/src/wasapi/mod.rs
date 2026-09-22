@@ -40,14 +40,25 @@ use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITH
 /// 用 MULTITHREADED 而不是 APARTMENTTHREADED：音频线程不跑消息循环，
 /// STA 在这里只会带来莫名其妙的死锁。
 pub struct ComGuard {
+    /// 这次初始化算不算数。**只有算数的时候才能反初始化。**
+    ///
+    /// 三种返回值要区别对待：
+    ///
+    /// - `S_OK`：我们初始化的，要配对反初始化
+    /// - `S_FALSE`：这个线程已经初始化过了，但**这次调用也加了一次引用计数**，
+    ///   照样要配对
+    /// - `RPC_E_CHANGED_MODE`：别人已经用 STA 初始化过这个线程了。
+    ///   我们这次**没算数**，这时候再去 CoUninitialize 会把别人的引用减掉一次 ——
+    ///   在界面线程上这么干，Slint 的 COM 会在我们手里被拆掉。
+    initialized: bool,
     _not_send: std::marker::PhantomData<*const ()>,
 }
 
 impl ComGuard {
     pub fn new() -> Self {
-        // 返回 S_FALSE 表示这个线程已经初始化过了，也算成功 —— 照样要配对 CoUninitialize。
-        let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.ok();
+        let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
         Self {
+            initialized: hr.is_ok(),
             _not_send: std::marker::PhantomData,
         }
     }
@@ -61,6 +72,8 @@ impl Default for ComGuard {
 
 impl Drop for ComGuard {
     fn drop(&mut self) {
-        unsafe { CoUninitialize() };
+        if self.initialized {
+            unsafe { CoUninitialize() };
+        }
     }
 }

@@ -28,6 +28,8 @@
 //! 48 kHz —— 先把这条路跑通，重采样以后再说。
 
 use std::io;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use windows::Win32::Foundation::WAIT_OBJECT_0;
 use windows::Win32::Media::Audio::{
@@ -77,6 +79,23 @@ impl OpenedOn {
     }
 }
 
+/// 按 id 打开设备；打不开就退回系统默认。
+///
+/// 存下来的设备 id 会失效 —— 耳机拔了、蓝牙断了、驱动重装了。那种时候
+/// **绝不能就此没声音**：用户拔个耳机而已，他不会想到要去设置里重选一遍。
+/// 退回默认至少还能说话，名字也会在界面上显示成实际用的那个。
+fn open_or_default(
+    id: Option<&str>,
+    direction: Direction,
+) -> windows::core::Result<windows::Win32::Media::Audio::IMMDevice> {
+    if let Some(id) = id {
+        if let Ok(device) = crate::wasapi::open_device(Some(id), direction) {
+            return Ok(device);
+        }
+    }
+    crate::wasapi::open_device(None, direction)
+}
+
 fn err(context: &str, e: windows::core::Error) -> io::Error {
     io::Error::other(format!("{context}：{}", describe_error(&e)))
 }
@@ -98,6 +117,17 @@ fn wrong_rate(format: &Format, which: &str) -> io::Error {
 pub struct WasapiCapture {
     device_id: Option<String>,
     stream: Option<CaptureStream>,
+    /// 实际打开的那个设备叫什么。**要显示给用户** —— 「为什么没声音」
+    /// 十有八九是选错了设备，而用户根本不知道我们在用哪一个。
+    name: Arc<Mutex<String>>,
+    /// 实际打开的那个是不是真硬件。虚拟声卡要在界面上提醒。
+    is_hardware: Arc<AtomicBool>,
+    /// 设备明确标成「这一段是静音」的帧数。
+    ///
+    /// 全是它的话，说明设备那边真的什么都没收到（麦克风没插、被静音了、
+    /// 或者是一个没在路由的虚拟设备），不是我们解错了数据。
+    silent_frames: Arc<AtomicU64>,
+    total_frames: Arc<AtomicU64>,
     /// 已经转成 48 kHz 单声道、还没被取走的采样点。
     ///
     /// 设备一次给多少帧由它的周期决定，跟我们要的 10 ms 不一定对得上，
@@ -124,15 +154,36 @@ impl WasapiCapture {
         Self {
             device_id,
             stream: None,
+            name: Arc::new(Mutex::new(String::new())),
+            is_hardware: Arc::new(AtomicBool::new(true)),
+            silent_frames: Arc::new(AtomicU64::new(0)),
+            total_frames: Arc::new(AtomicU64::new(0)),
             pending: Vec::with_capacity(FRAME_SAMPLES * 4),
+        }
+    }
+
+    /// 一个能从别的线程读的把手：设备名字和静音统计。
+    ///
+    /// 采集流本身跑在音频线程上，界面碰不得；这个只是几个共享的格子。
+    pub fn diagnostics(&self) -> CaptureDiagnostics {
+        CaptureDiagnostics {
+            name: Arc::clone(&self.name),
+            is_hardware: Arc::clone(&self.is_hardware),
+            silent_frames: Arc::clone(&self.silent_frames),
+            total_frames: Arc::clone(&self.total_frames),
         }
     }
 
     fn open(&mut self) -> io::Result<&mut CaptureStream> {
         if self.stream.is_none() {
             let com = crate::wasapi::ComGuard::new();
-            let device = crate::wasapi::open_device(self.device_id.as_deref(), Direction::Capture)
+            let device = open_or_default(self.device_id.as_deref(), Direction::Capture)
                 .map_err(|e| err("打不开录音设备", e))?;
+            *self.name.lock().expect("name poisoned") = crate::wasapi::device_name(&device);
+            self.is_hardware.store(
+                crate::wasapi::device_is_hardware(&device),
+                Ordering::Relaxed,
+            );
             let Opened {
                 client,
                 event,
@@ -162,9 +213,13 @@ impl WasapiCapture {
 impl Capture for WasapiCapture {
     fn read(&mut self, out: &mut [f32]) -> io::Result<bool> {
         self.open()?;
-        // 分开借 stream 和 pending：两个字段互不相干，整体借 self 会被借用检查挡住。
+        // 分开借：这几个字段互不相干，整体借 self 会被借用检查挡住。
         let Self {
-            stream, pending, ..
+            stream,
+            pending,
+            silent_frames,
+            total_frames,
+            ..
         } = self;
         let stream = stream.as_mut().expect("刚打开过");
         stream.opened_on.check("录音")?;
@@ -197,8 +252,10 @@ impl Capture for WasapiCapture {
                         .map_err(|e| err("取录音数据", e))?;
                 }
 
+                total_frames.fetch_add(frames as u64, Ordering::Relaxed);
                 if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 {
                     // 设备明确说「这一段是静音」，里面的字节没有意义，不能当数据用。
+                    silent_frames.fetch_add(frames as u64, Ordering::Relaxed);
                     pending.extend(std::iter::repeat(0.0).take(frames as usize));
                 } else {
                     // SAFETY: data 指向 frames * channels 个样点，格式由 format 描述。
@@ -253,6 +310,44 @@ unsafe fn downmix_into(
     }
 }
 
+/// 从别的线程看采集流的状态。
+#[derive(Clone)]
+pub struct CaptureDiagnostics {
+    name: Arc<Mutex<String>>,
+    is_hardware: Arc<AtomicBool>,
+    silent_frames: Arc<AtomicU64>,
+    total_frames: Arc<AtomicU64>,
+}
+
+impl CaptureDiagnostics {
+    /// 实际打开的设备叫什么。设备还没打开时是空的。
+    pub fn device_name(&self) -> String {
+        self.name.lock().expect("name poisoned").clone()
+    }
+
+    /// 设备标成静音的采样点占比。
+    ///
+    /// 接近 1 就是**设备那边真的什么都没收到** —— 麦克风没插、被静音了、
+    /// 或者选中的是一个没在路由的虚拟设备。这跟「我们解错了数据」是两回事，
+    /// 而排查「为什么没声音」时分清这两者能省掉一半的来回。
+    pub fn silent_ratio(&self) -> f32 {
+        let total = self.total_frames.load(Ordering::Relaxed);
+        if total == 0 {
+            return 0.0;
+        }
+        self.silent_frames.load(Ordering::Relaxed) as f32 / total as f32
+    }
+
+    /// 实际打开的是不是虚拟声卡。
+    pub fn is_virtual(&self) -> bool {
+        !self.is_hardware.load(Ordering::Relaxed)
+    }
+
+    pub fn has_opened(&self) -> bool {
+        self.total_frames.load(Ordering::Relaxed) > 0
+    }
+}
+
 // ===========================================================================
 // 播放
 // ===========================================================================
@@ -289,7 +384,7 @@ impl WasapiRender {
     fn open(&mut self) -> io::Result<&mut RenderStream> {
         if self.stream.is_none() {
             let com = crate::wasapi::ComGuard::new();
-            let device = crate::wasapi::open_device(self.device_id.as_deref(), Direction::Render)
+            let device = open_or_default(self.device_id.as_deref(), Direction::Render)
                 .map_err(|e| err("打不开播放设备", e))?;
             let Opened {
                 client,
@@ -492,5 +587,76 @@ mod tests {
         assert!(text2.contains("48000"), "{text2}");
         assert!(text2.contains("设置"), "要说清楚去哪儿改：{text2}");
         let _ = text;
+    }
+}
+
+#[cfg(test)]
+mod device_scan {
+    use super::*;
+    use crate::audio::Capture;
+
+    /// 挨个打开每个**真硬件**麦克风，报一下它到底在不在出声。
+    ///
+    /// 默认跳过 —— 要真设备，而且会把每个麦克风都开一遍。
+    ///
+    /// ```bash
+    /// cargo test -p voice-core --lib device_scan -- --ignored --nocapture
+    /// ```
+    ///
+    /// 「为什么没声音」的排查顺序是：先看这个表，找出哪个设备有电平，
+    /// 然后在设置里选它。系统默认那个经常是虚拟声卡，而虚拟声卡没在路由的
+    /// 时候是纯静音的。
+    #[test]
+    #[ignore = "要真声卡"]
+    fn which_microphones_actually_hear_something() {
+        let endpoints = crate::wasapi::list_endpoints(Direction::Capture).unwrap_or_default();
+        assert!(!endpoints.is_empty(), "一个录音设备都没有");
+
+        println!();
+        println!("{:<52} {:>8}  说明", "设备", "峰值 dB");
+        for endpoint in &endpoints {
+            let mut capture = WasapiCapture::new(Some(endpoint.id.clone()));
+            let mut frame = vec![0.0f32; FRAME_SAMPLES];
+            let mut peak = f32::NEG_INFINITY;
+            let mut note = String::new();
+
+            // 半秒够看出有没有信号了
+            for _ in 0..50 {
+                match capture.read(&mut frame) {
+                    Ok(true) => {
+                        let rms =
+                            (frame.iter().map(|s| s * s).sum::<f32>() / frame.len() as f32).sqrt();
+                        let db = if rms <= 1e-9 {
+                            -120.0
+                        } else {
+                            20.0 * rms.log10()
+                        };
+                        peak = peak.max(db);
+                    }
+                    Ok(false) => break,
+                    Err(e) => {
+                        // 打不开是常事：设备被独占了、驱动不认共享格式。
+                        // 这正是要报出来的东西。
+                        note = format!("{e}").lines().next().unwrap_or("").to_string();
+                        break;
+                    }
+                }
+            }
+
+            let kind = if endpoint.is_hardware {
+                ""
+            } else {
+                "（虚拟）"
+            };
+            let name = format!("{}{kind}", endpoint.name);
+            let level = if peak.is_finite() {
+                format!("{peak:>8.1}")
+            } else {
+                "       -".to_string()
+            };
+            println!("{name:<52} {level}  {note}");
+        }
+        println!();
+        println!("峰值在 -50 dB 以上才算真的收到音。-120 是纯数字静音。");
     }
 }

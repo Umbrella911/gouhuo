@@ -411,18 +411,32 @@ fn real_devices_open_and_udp_comes_up() {
     let server = start_server();
     let alice = join(&server, "阿狸");
 
+    let capture = voice_core::wasapi::WasapiCapture::new(None);
+    let diagnostics = capture.diagnostics();
     let voice = Pipeline::start(
         voice_config(&alice, &server, TransmitMode::Always),
-        Box::new(voice_core::wasapi::WasapiCapture::new(None)),
+        Box::new(capture),
         Box::new(voice_core::wasapi::WasapiRender::new(None)),
         None,
     )
     .expect("起不了语音链路");
 
-    // 保活每 2 秒一次，给它两轮
-    std::thread::sleep(Duration::from_secs(5));
+    // 保活每 2 秒一次，给它两轮。顺便报一下麦克风电平 ——
+    // 「电平条不动」到底是麦克风没收到音还是我们算错了，就看这个。
+    voice.set_monitoring(false);
+    let mut peak = f32::NEG_INFINITY;
+    for _ in 0..50 {
+        std::thread::sleep(Duration::from_millis(100));
+        peak = peak.max(voice.stats().input_db);
+    }
     let stats = voice.stats();
     println!("真设备：{stats:?}");
+    println!("这 5 秒里麦克风的峰值电平：{peak:.1} dB（默认语音激活阈值是 -45 dB）");
+    println!("采集设备：{}", diagnostics.device_name());
+    println!(
+        "设备标成静音的采样点占比：{:.1}%（接近 100% 就是设备那边真的没收到音）",
+        diagnostics.silent_ratio() * 100.0
+    );
 
     assert!(stats.udp_ok, "UDP 没通 —— 保活没回来：{stats:?}");
     assert!(
@@ -432,5 +446,130 @@ fn real_devices_open_and_udp_comes_up() {
     assert_eq!(
         stats.underruns, 0,
         "播放欠载了 —— 设备节拍跟不上：{stats:?}"
+    );
+}
+
+/// 试听：把自己的麦克风混进播放，**但不发给任何人**。
+///
+/// 这是「找人试」之前唯一能自己回答的问题：麦克风到底有没有在收音。
+#[test]
+fn monitoring_plays_your_own_mic_without_sending_it() {
+    let server = start_server();
+    let alice = join(&server, "阿狸");
+
+    let mut source = vec![0.0f32; FRAME_SAMPLES * 20];
+    source.extend_from_slice(&chirp_f32(FRAME_SAMPLES * 60));
+    source.extend(std::iter::repeat(0.0).take(FRAME_SAMPLES * 20));
+
+    let capture = SyntheticCapture::new(source.clone()).then_silence();
+    let (render, played) = CollectingRender::new();
+    // 按住说话，但**不按** —— 所以一个语音包都不该发出去
+    let voice = Pipeline::start(
+        voice_config(&alice, &server, TransmitMode::PushToTalk),
+        Box::new(capture),
+        Box::new(render),
+        None,
+    )
+    .unwrap();
+    voice.set_monitoring(true);
+
+    std::thread::sleep(Duration::from_millis(1200));
+
+    let stats = voice.stats();
+    assert_eq!(
+        stats.packets_sent, 0,
+        "试听把声音发出去了 —— 别人会听到你在试麦：{stats:?}"
+    );
+
+    let played = played.lock().unwrap().clone();
+    let energy: f32 = played.iter().map(|s| s * s).sum();
+    assert!(energy > 0.0, "开了试听却一点声音都没有");
+
+    // 真的是麦克风那个信号，不是别的什么
+    let estimate = voice_core::signal::best_lag(
+        &to_i16(&source),
+        &to_i16(&played),
+        FRAME_SAMPLES * 30,
+        FRAME_SAMPLES * 20,
+        (SAMPLE_RATE as usize * 200) / 1000,
+    )
+    .expect("互相关跑不起来");
+    assert!(
+        estimate.peak > 0.5,
+        "播出来的跟麦克风进去的对不上，相关峰值只有 {:.2}",
+        estimate.peak
+    );
+}
+
+/// 关掉试听就该彻底安静 —— 而且再打开时不能先播一段旧的。
+#[test]
+fn monitoring_can_be_turned_off_cleanly() {
+    let server = start_server();
+    let alice = join(&server, "阿狸");
+
+    let capture = SyntheticCapture::new(chirp_f32(FRAME_SAMPLES * 200)).then_silence();
+    let (render, played) = CollectingRender::new();
+    let voice = Pipeline::start(
+        voice_config(&alice, &server, TransmitMode::PushToTalk),
+        Box::new(capture),
+        Box::new(render),
+        None,
+    )
+    .unwrap();
+
+    // 一开始没开，应该是静音
+    std::thread::sleep(Duration::from_millis(400));
+    let quiet: f32 = played.lock().unwrap().iter().map(|s| s * s).sum();
+    assert_eq!(quiet, 0.0, "没开试听却有声音");
+
+    voice.set_monitoring(true);
+    std::thread::sleep(Duration::from_millis(400));
+    let loud: f32 = played.lock().unwrap().iter().map(|s| s * s).sum();
+    assert!(loud > 0.0, "开了试听还是没声音");
+
+    voice.set_monitoring(false);
+    std::thread::sleep(Duration::from_millis(100));
+    let before = played.lock().unwrap().len();
+    std::thread::sleep(Duration::from_millis(400));
+    let after: f32 = played.lock().unwrap()[before..].iter().map(|s| s * s).sum();
+    assert_eq!(after, 0.0, "关了试听还在播");
+}
+
+/// 电平表要跟着麦克风动。
+///
+/// 它回答的是用户最常问的那个问题：「我说话了，为什么语音激活没触发？」——
+/// 看一眼电平条就知道是麦克风没收到音，还是收到了但没过阈值。
+#[test]
+fn the_input_level_follows_the_microphone() {
+    let server = start_server();
+    let alice = join(&server, "阿狸");
+
+    // 前面静音，后面有声音
+    let mut source = vec![0.0f32; FRAME_SAMPLES * 60];
+    source.extend_from_slice(&chirp_f32(FRAME_SAMPLES * 100));
+
+    let capture = SyntheticCapture::new(source).then_silence();
+    let voice = Pipeline::start(
+        voice_config(&alice, &server, TransmitMode::PushToTalk),
+        Box::new(capture),
+        Box::new(NullRender::default()),
+        None,
+    )
+    .unwrap();
+
+    std::thread::sleep(Duration::from_millis(400));
+    let silent = voice.stats().input_db;
+    std::thread::sleep(Duration::from_millis(600));
+    let speaking = voice.stats().input_db;
+
+    assert!(silent < -90.0, "静音时电平该贴底，实际 {silent:.1} dB");
+    assert!(
+        speaking > silent + 40.0,
+        "有声音时电平该明显抬起来：{silent:.1} -> {speaking:.1} dB"
+    );
+    // 默认 VAD 阈值是 -45 dB，正常说话必须能过
+    assert!(
+        speaking > -45.0,
+        "这个信号连默认阈值都过不去，电平算错了：{speaking:.1} dB"
     );
 }

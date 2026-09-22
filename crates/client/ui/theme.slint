@@ -115,3 +115,42 @@ export component Dot inherits Rectangle {
     border-radius: 4px;
     background: root.tint;
 }
+
+/// 电平条：一条填充 + 一根阈值刻线。
+///
+/// 阈值画在同一条尺上，是这个控件存在的全部理由 —— 用户最常问的
+/// 「我说话了为什么没触发」，看一眼就知道是**没收到音**还是**没过线**。
+export component LevelBar inherits Rectangle {
+    /// 0–1，已经从分贝映射好的。
+    in property <float> level;
+    /// 语音激活的阈值，同一把尺子。
+    in property <float> threshold;
+    /// 现在过线了没有。
+    in property <bool> active;
+    /// 要不要画阈值刻线（按住说话的时候没有意义）。
+    in property <bool> show-threshold: true;
+
+    height: 10px;
+    border-radius: 5px;
+    background: Theme.bg;
+    clip: true;
+
+    Rectangle {
+        x: 0;
+        width: parent.width * Math.clamp(root.level, 0.0, 1.0);
+        height: parent.height;
+        border-radius: parent.border-radius;
+        // 快满刻度了就变色 —— 那是爆麦，比太小还难听
+        background: root.level > 0.92
+            ? Theme.danger
+            : (root.active ? Theme.speaking : Theme.dim);
+        animate background { duration: 120ms; }
+    }
+
+    if root.show-threshold: Rectangle {
+        x: parent.width * Math.clamp(root.threshold, 0.0, 1.0);
+        width: 2px;
+        height: parent.height;
+        background: Theme.text;
+    }
+}

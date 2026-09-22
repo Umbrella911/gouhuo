@@ -146,8 +146,86 @@ impl DeviceInfo {
     }
 }
 
+/// 这个设备是真接在硬件总线上，还是虚拟声卡。
+///
+/// 判断依据是总线枚举器名，不是猜名字 —— HDAUDIO / USB / PCI 是真硬件，
+/// SWD 和厂商自己的枚举器是软件设备。
+pub fn device_is_hardware(device: &IMMDevice) -> bool {
+    matches!(
+        string_prop(device, &PKEY_Device_EnumeratorName)
+            .unwrap_or_default()
+            .as_str(),
+        "HDAUDIO" | "USB" | "PCI" | "BTHENUM" | "BTHHFENUM"
+    )
+}
+
+/// 一个端点，只带界面要显示的那点信息。
+///
+/// 跟 [`DeviceInfo`] 的分工：那个是**探针**用的，为了填满它要把每个设备
+/// 都打开一遍、逐个试独占格式，几十个端点上要花好几百毫秒。界面上的
+/// 下拉框每次打开设置都要列一次，不能这么干。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Endpoint {
+    pub id: String,
+    pub name: String,
+    pub is_default: bool,
+    /// 真接在硬件总线上，还是虚拟声卡。
+    ///
+    /// 界面上要标出来：玩家机器上默认设备**经常**是 SteelSeries Sonar、
+    /// 雷蛇 Synapse 这类虚拟设备，而它们没在路由的时候是纯静音的 ——
+    /// 「为什么没声音」十有八九就是这个。
+    pub is_hardware: bool,
+}
+
+/// 列端点，只读名字和总线。给界面的下拉框用。
+pub fn list_endpoints(direction: Direction) -> windows::core::Result<Vec<Endpoint>> {
+    // **自己初始化 COM。**
+    //
+    // 界面线程上它凑巧已经被界面框架初始化过了，所以不加这句也能跑 ——
+    // 直到某天换了框架、或者从别的线程调，设备列表就会静默地变成空的，
+    // 用户只看到一个「系统默认」而完全不知道为什么。
+    let _com = crate::wasapi::ComGuard::new();
+    let enumerator: IMMDeviceEnumerator =
+        unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)? };
+    let flow = match direction {
+        Direction::Render => eRender,
+        Direction::Capture => eCapture,
+    };
+    let default_id = unsafe { enumerator.GetDefaultAudioEndpoint(flow, eConsole) }
+        .ok()
+        .and_then(|device| unsafe { device.GetId() }.ok())
+        .map(|id| unsafe { id.to_string() }.unwrap_or_default());
+
+    let collection = unsafe { enumerator.EnumAudioEndpoints(flow, DEVICE_STATE_ACTIVE)? };
+    let count = unsafe { collection.GetCount()? };
+    let mut out = Vec::with_capacity(count as usize);
+    for index in 0..count {
+        let Ok(device) = (unsafe { collection.Item(index) }) else {
+            continue;
+        };
+        let Ok(id) = (unsafe { device.GetId() }) else {
+            continue;
+        };
+        let id = unsafe { id.to_string() }.unwrap_or_default();
+        let bus = string_prop(&device, &PKEY_Device_EnumeratorName).unwrap_or_default();
+        out.push(Endpoint {
+            is_default: default_id.as_deref() == Some(id.as_str()),
+            is_hardware: matches!(
+                bus.as_str(),
+                "HDAUDIO" | "USB" | "PCI" | "BTHENUM" | "BTHHFENUM"
+            ),
+            name: device_name(&device),
+            id,
+        });
+    }
+    // 默认设备排最前面 —— 绝大多数人不会改，让他一眼看到现在用的是哪个。
+    out.sort_by_key(|e| !e.is_default);
+    Ok(out)
+}
+
 /// 列出所有**活动**端点。非活动的（拔掉的、禁用的）不列 —— 它们测不了。
 pub fn enumerate() -> windows::core::Result<Vec<DeviceInfo>> {
+    let _com = crate::wasapi::ComGuard::new();
     let enumerator: IMMDeviceEnumerator =
         unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)? };
 
@@ -294,6 +372,14 @@ fn device_id(device: &IMMDevice) -> windows::core::Result<String> {
     let s = unsafe { id.to_string() }.unwrap_or_default();
     unsafe { CoTaskMemFree(Some(id.0 as *const _)) };
     Ok(s)
+}
+
+/// 设备给人看的名字。
+///
+/// 界面上要显示「现在用的是哪个麦克风」——「为什么没声音」十有八九
+/// 是选错了设备，而用户根本不知道我们在用哪一个。
+pub fn device_name(device: &IMMDevice) -> String {
+    friendly_name(device).unwrap_or_else(|_| "(读不到名字)".to_string())
 }
 
 fn friendly_name(device: &IMMDevice) -> windows::core::Result<String> {

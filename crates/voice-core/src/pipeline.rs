@@ -34,10 +34,10 @@
 //! 抖动缓冲是**固定深度**的。自适应缓冲 + PLC 是这个项目技术含量最高的地方，
 //! 单独一个里程碑做。这里先跑通。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -70,6 +70,13 @@ const SPEAKER_IDLE: Duration = Duration::from_secs(30);
 
 /// 多久收不到保活回包就认为 UDP 不通。
 const UDP_DEAD_AFTER: Duration = Duration::from_secs(8);
+
+/// 试听队列最深攒几帧。
+///
+/// 采集和播放是**两个设备、两个晶振**，就算都标称 10 ms 也会慢慢漂开
+/// （几十 ppm 是常态，大约每一百秒差一帧）。攒满了就丢最老的，空了就补静音 ——
+/// 一百秒掉一帧在试听里完全听不出来，而攒着不丢会让延迟越来越大。
+const MONITOR_MAX_FRAMES: usize = 3;
 
 /// 采集之后、编码之前要做的处理。
 ///
@@ -163,6 +170,11 @@ pub struct VoiceStats {
     pub underruns: u64,
     /// 现在谁在说话。
     pub speaking: Vec<u32>,
+    /// 麦克风当前的电平，分贝（满刻度 0 dB）。
+    ///
+    /// **是 APM 处理之后的值** —— 那才是真正会被发出去的东西。
+    /// 界面上拿它画电平条，用户据此判断「麦克风到底有没有在收音」。
+    pub input_db: f32,
 }
 
 struct Speaker {
@@ -197,6 +209,7 @@ pub struct Pipeline {
     muted: Arc<AtomicBool>,
     deafened: Arc<AtomicBool>,
     mode: Arc<AtomicU32>,
+    monitoring: Arc<AtomicBool>,
     socket: Arc<UdpSocket>,
     shared: Arc<Shared>,
     threads: Vec<JoinHandle<()>>,
@@ -210,6 +223,10 @@ struct Shared {
     /// 最近一次保活回来的时刻（Instant 不能放原子里，存成毫秒差）
     last_keepalive_ms: AtomicU64,
     rtt_us: AtomicU32,
+    /// 麦克风电平，存成 0.01 dB 一档的定点 —— 稳定版 Rust 没有原子浮点。
+    input_centi_db: AtomicI32,
+    /// 试听：采集线程往里放，播放线程取走。
+    monitor: Mutex<VecDeque<Vec<f32>>>,
     started: Instant,
 }
 
@@ -253,6 +270,7 @@ impl Pipeline {
         let muted = Arc::new(AtomicBool::new(false));
         let deafened = Arc::new(AtomicBool::new(false));
         let mode = Arc::new(AtomicU32::new(cfg.mode.encode()));
+        let monitoring = Arc::new(AtomicBool::new(false));
         let shared = Arc::new(Shared {
             speakers: Mutex::new(BTreeMap::new()),
             packets_sent: AtomicU64::new(0),
@@ -260,6 +278,8 @@ impl Pipeline {
             underruns: AtomicU64::new(0),
             last_keepalive_ms: AtomicU64::new(0),
             rtt_us: AtomicU32::new(0),
+            input_centi_db: AtomicI32::new(SILENT_DB_CENTI),
+            monitor: Mutex::new(VecDeque::new()),
             started: Instant::now(),
         });
 
@@ -273,6 +293,7 @@ impl Pipeline {
             let stop = Arc::clone(&stop);
             let transmitting = Arc::clone(&transmitting);
             let muted = Arc::clone(&muted);
+            let monitoring = Arc::clone(&monitoring);
             let shared = Arc::clone(&shared);
             let processor = processor.clone();
             let session_id = cfg.session_id;
@@ -287,6 +308,7 @@ impl Pipeline {
                     &stop,
                     &transmitting,
                     &muted,
+                    &monitoring,
                     &shared,
                     session_id,
                     key,
@@ -338,6 +360,7 @@ impl Pipeline {
             muted,
             deafened,
             mode,
+            monitoring,
             socket,
             shared,
             threads,
@@ -357,6 +380,27 @@ impl Pipeline {
     /// 关耳朵。链路照常转，只是播出去的是静音 —— 见 [`play_loop`]。
     pub fn set_deafened(&self, deafened: bool) {
         self.deafened.store(deafened, Ordering::Relaxed);
+    }
+
+    /// 试听自己的麦克风。
+    ///
+    /// **用扬声器开这个会啸叫** —— 麦克风会把扬声器的声音收回去再放出来。
+    /// 界面上要写清楚「戴耳机」。开了 APM 的回声消除之后能好很多，
+    /// 但那是可选的，不能指望它。
+    pub fn set_monitoring(&self, on: bool) {
+        self.monitoring.store(on, Ordering::Relaxed);
+        if !on {
+            // 关掉的时候把攒着的帧倒干净，否则再打开会先播出一小段旧声音。
+            self.shared
+                .monitor
+                .lock()
+                .expect("monitor poisoned")
+                .clear();
+        }
+    }
+
+    pub fn is_monitoring(&self) -> bool {
+        self.monitoring.load(Ordering::Relaxed)
     }
 
     /// 换发送方式。链路不断，下一帧就生效。
@@ -407,6 +451,7 @@ impl Pipeline {
             packets_received: self.shared.packets_received.load(Ordering::Relaxed),
             underruns: self.shared.underruns.load(Ordering::Relaxed),
             speaking,
+            input_db: self.shared.input_centi_db.load(Ordering::Relaxed) as f32 / 100.0,
         }
     }
 }
@@ -448,6 +493,7 @@ fn send_loop(
     stop: &AtomicBool,
     transmitting: &AtomicBool,
     muted: &AtomicBool,
+    monitoring: &AtomicBool,
     shared: &Shared,
     session_id: u32,
     key: [u8; 32],
@@ -481,13 +527,29 @@ fn send_loop(
             processor.process_capture(&mut frame);
         }
 
+        // 电平和试听都取 **APM 之后**的帧 —— 那才是真正会被发出去的东西。
+        // 取处理之前的话，用户看到的电平里还带着回声和底噪，
+        // 而那正是 APM 要消掉的，会让他以为自己的麦克风有问题。
+        let level = frame_db(&frame);
+        shared
+            .input_centi_db
+            .store((level * 100.0) as i32, Ordering::Relaxed);
+
+        if monitoring.load(Ordering::Relaxed) {
+            let mut queue = shared.monitor.lock().expect("monitor poisoned");
+            if queue.len() >= MONITOR_MAX_FRAMES {
+                queue.pop_front();
+            }
+            queue.push_back(frame.clone());
+        }
+
         // 闭麦压过一切。按着说话键也不行 —— 用户点了闭麦就是不想出声，
         // 这时候还漏出去一声是很糟糕的那种 bug。
         let sending = !muted.load(Ordering::Relaxed)
             && match TransmitMode::decode(mode.load(Ordering::Relaxed)) {
                 TransmitMode::PushToTalk => transmitting.load(Ordering::Relaxed),
                 TransmitMode::VoiceActivity { threshold_db } => {
-                    frame_db(&frame) > threshold_db || transmitting.load(Ordering::Relaxed)
+                    level > threshold_db || transmitting.load(Ordering::Relaxed)
                 }
                 TransmitMode::Always => true,
             };
@@ -646,6 +708,18 @@ fn play_loop(
             }
         }
 
+        // 试听：把自己的麦克风混进来。
+        //
+        // **走的是直连，不过编解码**。过一遍 Opus 能听到「别人听你是什么效果」，
+        // 但要多等抖动缓冲那 20 ms，加起来就六十多毫秒 —— 延迟听自己说话
+        // 超过 50 ms 会明显干扰发音（延迟听觉反馈），用户会以为是软件有回声。
+        // 试听要回答的是「麦克风好不好使、增益够不够、有没有噪音」，直连够了。
+        if let Some(mine) = shared.monitor.lock().expect("monitor poisoned").pop_front() {
+            for (out, sample) in mix.iter_mut().zip(&mine) {
+                *out += sample;
+            }
+        }
+
         // 关了耳朵就播静音。
         //
         // **照样要把这一帧走完**：解码器的状态要跟着推进（跳帧会让恢复时
@@ -714,6 +788,9 @@ fn keepalive_loop(
         }
     }
 }
+
+/// 「完全没有声音」对应的分贝值，定点存法。
+const SILENT_DB_CENTI: i32 = -12_000;
 
 /// 一帧的能量，分贝（满刻度 0 dB）。
 fn frame_db(frame: &[f32]) -> f32 {

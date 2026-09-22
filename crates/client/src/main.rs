@@ -26,12 +26,13 @@ use voice_core::pipeline::{Pipeline, PipelineConfig, TransmitMode, DEFAULT_JITTE
 
 /// 多久去问一次语音链路的状态。
 ///
-/// 说话指示靠它更新，所以不能太慢 —— 慢了那个点就跟不上声音。
-/// 200 ms 肉眼看着是跟手的，同时每秒只有 5 次加锁。
-const VOICE_POLL: std::time::Duration = std::time::Duration::from_millis(200);
-
-/// VAD 的阈值。安静房间里够用；机械键盘会把它顶起来，那是 APM 降噪的事。
-const VAD_THRESHOLD_DB: f32 = -45.0;
+/// 定这个数的是**电平条**：200 ms 的条子看着是一跳一跳的，用户会以为卡了，
+/// 而它恰恰是用来判断「麦克风有没有在动」的，跟不上就失去了意义。
+/// 说话指示也跟着受益。
+///
+/// 每秒 20 次读几个原子变量加两次加锁，跟音频线程各自每秒 100 次比
+/// 完全不在一个量级上。
+const VOICE_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// 多久看一次按住说话的键有没有被按下。
 ///
@@ -41,7 +42,7 @@ const PTT_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 
 mod settings;
 
-use settings::{Settings, TalkMode};
+use settings::{db_to_level, level_to_db, Settings, TalkMode};
 use voice_core::hotkey::{Hotkeys, Key};
 
 slint::include_modules!();
@@ -87,6 +88,7 @@ fn main() -> Result<(), slint::PlatformError> {
             .unwrap_or_default()
             .into(),
     );
+    app.set_vad_level(db_to_level(stored.vad_threshold_db));
     if let Some(hotkeys) = &hotkeys {
         hotkeys.set_ptt(stored.ptt_key);
     }
@@ -105,6 +107,7 @@ fn main() -> Result<(), slint::PlatformError> {
     wire_join(&app, &identity, &state);
     wire_actions(&app, &state);
     wire_settings(&app, &state, hotkeys.clone());
+    load_devices(&app, &state);
     if let Some(hotkeys) = hotkeys {
         spawn_ptt_poll(app.as_weak(), Arc::clone(&state), hotkeys);
     }
@@ -166,6 +169,11 @@ struct State {
     /// 语音链路。丢掉它就会把音频线程收干净。
     voice: Option<Arc<Pipeline>>,
     settings: Settings,
+    /// 采集流的把手：实际打开的设备叫什么。
+    capture: Option<voice_core::wasapi::CaptureDiagnostics>,
+    /// 下拉框里第 n 项对应哪个设备 id。第 0 项是「系统默认」，所以是 None。
+    capture_ids: Vec<Option<String>>,
+    render_ids: Vec<Option<String>>,
 }
 
 thread_local! {
@@ -295,22 +303,176 @@ fn start_voice(app: &App, state: &Arc<Mutex<State>>, client: &Client) {
         mode,
     };
 
+    let (capture_id, render_id) = {
+        let locked = state.lock().expect("state poisoned");
+        (
+            locked.settings.capture_device.clone(),
+            locked.settings.render_device.clone(),
+        )
+    };
+    let capture = voice_core::wasapi::WasapiCapture::new(capture_id);
+    let diagnostics = capture.diagnostics();
+
     match Pipeline::start(
         cfg,
-        Box::new(voice_core::wasapi::WasapiCapture::new(None)),
-        Box::new(voice_core::wasapi::WasapiRender::new(None)),
+        Box::new(capture),
+        Box::new(voice_core::wasapi::WasapiRender::new(render_id)),
         audio_processor(),
     ) {
         Ok(pipeline) => {
-            state.lock().expect("state poisoned").voice = Some(Arc::new(pipeline));
+            let mut locked = state.lock().expect("state poisoned");
+            locked.voice = Some(Arc::new(pipeline));
+            locked.capture = Some(diagnostics);
+            drop(locked);
             spawn_voice_poll(app.as_weak(), Arc::clone(state));
         }
         Err(e) => app.set_voice_error(format!("{e}").into()),
     }
 }
 
-/// 设置面板：切换说话方式、绑按住说话的键。
+/// 把设备列表灌进下拉框，并记下「第 n 项是哪个 id」。
+///
+/// 第 0 项永远是「系统默认」—— 绝大多数人不该需要管这个，
+/// 而且它是唯一在换了耳机之后还能跟着走的选项。
+fn load_devices(app: &App, state: &Arc<Mutex<State>>) {
+    use voice_core::wasapi::{list_endpoints, Direction};
+
+    for (direction, is_capture) in [(Direction::Capture, true), (Direction::Render, false)] {
+        let endpoints = list_endpoints(direction).unwrap_or_default();
+        let mut labels: Vec<SharedString> = vec!["系统默认".into()];
+        let mut ids: Vec<Option<String>> = vec![None];
+        for endpoint in endpoints {
+            // 标出虚拟声卡。玩家机器上这类设备极多，而「没声音」十有八九
+            // 就是选中了一个没在路由的虚拟麦。
+            let suffix = if endpoint.is_hardware {
+                ""
+            } else {
+                "（虚拟）"
+            };
+            labels.push(format!("{}{suffix}", endpoint.name).into());
+            ids.push(Some(endpoint.id));
+        }
+
+        let saved = {
+            let locked = state.lock().expect("state poisoned");
+            if is_capture {
+                locked.settings.capture_device.clone()
+            } else {
+                locked.settings.render_device.clone()
+            }
+        };
+        let index = ids
+            .iter()
+            .position(|id| *id == saved)
+            // 存下来的设备没了（拔了耳机、换了机器）就退回「系统默认」，
+            // 跟 open_or_default 的行为一致。
+            .unwrap_or(0) as i32;
+
+        let model = ModelRc::new(VecModel::from(labels));
+        let mut locked = state.lock().expect("state poisoned");
+        if is_capture {
+            locked.capture_ids = ids;
+            drop(locked);
+            app.set_capture_devices(model);
+            app.set_capture_index(index);
+        } else {
+            locked.render_ids = ids;
+            drop(locked);
+            app.set_render_devices(model);
+            app.set_render_index(index);
+        }
+    }
+}
+
+/// 换设备。链路要重起 —— WASAPI 的流是绑在设备上的，换不了。
+///
+/// 重起会让声音断一下（几十毫秒）。这是换设备本来就该有的代价，
+/// 比为了热切换在音频线程里加一套状态机划算得多。
+fn restart_voice(app: &App, state: &Arc<Mutex<State>>) {
+    let client = state.lock().expect("state poisoned").client.clone();
+    let Some(client) = client else { return };
+
+    let was_monitoring = current_voice(state)
+        .map(|v| v.is_monitoring())
+        .unwrap_or(false);
+    {
+        let mut locked = state.lock().expect("state poisoned");
+        // 先丢掉旧的再起新的：同一个设备不能开两路，而且旧链路的线程
+        // 还占着那个设备。
+        locked.voice = None;
+        locked.capture = None;
+    }
+    app.set_voice_error("".into());
+    app.set_udp_ok(false);
+    app.set_capture_in_use("".into());
+    start_voice(app, state, &client);
+    if was_monitoring {
+        if let Some(voice) = current_voice(state) {
+            voice.set_monitoring(true);
+        }
+    }
+}
+
+/// 设置面板：切换说话方式、绑按住说话的键、试听麦克风、选设备。
 fn wire_settings(app: &App, state: &Arc<Mutex<State>>, hotkeys: Option<Rc<Hotkeys>>) {
+    {
+        let state = Arc::clone(state);
+        let weak = app.as_weak();
+        app.on_pick_capture(move |index| {
+            let Some(app) = weak.upgrade() else { return };
+            {
+                let mut locked = state.lock().expect("state poisoned");
+                let id = locked.capture_ids.get(index as usize).cloned().flatten();
+                locked.settings.capture_device = id;
+                let _ = locked.settings.save();
+            }
+            restart_voice(&app, &state);
+        });
+    }
+
+    {
+        let state = Arc::clone(state);
+        let weak = app.as_weak();
+        app.on_pick_render(move |index| {
+            let Some(app) = weak.upgrade() else { return };
+            {
+                let mut locked = state.lock().expect("state poisoned");
+                let id = locked.render_ids.get(index as usize).cloned().flatten();
+                locked.settings.render_device = id;
+                let _ = locked.settings.save();
+            }
+            restart_voice(&app, &state);
+        });
+    }
+
+    {
+        let state = Arc::clone(state);
+        let weak = app.as_weak();
+        app.on_toggle_monitor(move || {
+            let (Some(app), Some(voice)) = (weak.upgrade(), current_voice(&state)) else {
+                return;
+            };
+            let on = !voice.is_monitoring();
+            voice.set_monitoring(on);
+            app.set_monitoring(on);
+        });
+    }
+
+    {
+        let state = Arc::clone(state);
+        app.on_set_vad(move |level| {
+            let mode = {
+                let mut locked = state.lock().expect("state poisoned");
+                locked.settings.vad_threshold_db = level_to_db(level);
+                let _ = locked.settings.save();
+                transmit_mode(&locked.settings)
+            };
+            if let Some(voice) = current_voice(&state) {
+                voice.set_mode(mode);
+            }
+        });
+    }
+
     {
         let weak = app.as_weak();
         app.on_toggle_settings(move || {
@@ -395,7 +557,9 @@ fn spawn_ptt_poll(weak: slint::Weak<App>, state: Arc<Mutex<State>>, hotkeys: Rc<
             return;
         };
         if app.get_ptt_mode() {
-            voice.set_transmitting(hotkeys.is_down());
+            let down = hotkeys.is_down();
+            voice.set_transmitting(down);
+            app.set_transmitting(down);
         }
     });
     PTT_TIMER.with(|slot| *slot.borrow_mut() = Some(timer));
@@ -406,7 +570,7 @@ fn transmit_mode(settings: &Settings) -> TransmitMode {
     match settings.talk_mode {
         TalkMode::PushToTalk => TransmitMode::PushToTalk,
         TalkMode::VoiceActivity => TransmitMode::VoiceActivity {
-            threshold_db: VAD_THRESHOLD_DB,
+            threshold_db: settings.vad_threshold_db,
         },
     }
 }
@@ -454,9 +618,32 @@ fn spawn_voice_poll(weak: slint::Weak<App>, state: Arc<Mutex<State>>) {
         };
         let stats = voice.stats();
         app.set_udp_ok(stats.udp_ok);
+        app.set_input_level(db_to_level(stats.input_db));
+        app.set_monitoring(voice.is_monitoring());
+        if let Some(capture) = state.lock().expect("state poisoned").capture.clone() {
+            if capture.has_opened() {
+                app.set_capture_in_use(capture.device_name().into());
+                app.set_capture_is_virtual(capture.is_virtual());
+            }
+        }
+        // 「现在在不在往外发」。自己说话服务端不会转回来，只能看本地。
+        app.set_transmitting(transmitting_now(&app, &voice, stats.input_db));
         update_speaking(&app, &client, &stats.speaking);
     });
     VOICE_TIMER.with(|slot| *slot.borrow_mut() = Some(timer));
+}
+
+/// 现在这一刻在不在往外发。
+///
+/// 自己说话服务端不会转回来，所以这个只能在本地算。它跟链路里那段判断
+/// 是同一套规则 —— 两边写法不一样的话，界面显示「正在发送」而实际没发，
+/// 是最让人摸不着头脑的那种 bug。
+fn transmitting_now(app: &App, voice: &Pipeline, input_db: f32) -> bool {
+    match voice.mode() {
+        TransmitMode::Always => true,
+        TransmitMode::PushToTalk => app.get_transmitting(),
+        TransmitMode::VoiceActivity { threshold_db } => input_db > threshold_db,
+    }
 }
 
 /// 只改「谁在说话」那一列，不整个重建列表。

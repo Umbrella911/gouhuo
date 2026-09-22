@@ -34,6 +34,32 @@ pub struct Settings {
     pub talk_mode: TalkMode,
     /// 按住说话绑的键。`None` 表示还没绑。
     pub ptt_key: Option<Key>,
+    /// 语音激活的阈值，分贝。
+    pub vad_threshold_db: f32,
+    /// 用哪个麦克风。`None` 是系统默认。
+    ///
+    /// 存的是 WASAPI 的设备 id，重启之后还有效。设备没了会退回默认 ——
+    /// 拔个耳机不该让人从此说不了话。
+    pub capture_device: Option<String>,
+    /// 用哪个扬声器/耳机。
+    pub render_device: Option<String>,
+}
+
+/// 电平条和滑块用的分贝范围。
+///
+/// 下限 -60 dB：再往下是本底噪声，画出来也只是一条贴着左边的线。
+/// 上限 0 dB 是满刻度，超过就是削波了。
+pub const MIN_DB: f32 = -60.0;
+pub const MAX_DB: f32 = 0.0;
+
+/// 分贝 → 0–1。界面上电平条和阈值刻线共用这把尺子。
+pub fn db_to_level(db: f32) -> f32 {
+    ((db - MIN_DB) / (MAX_DB - MIN_DB)).clamp(0.0, 1.0)
+}
+
+/// 0–1 → 分贝。
+pub fn level_to_db(level: f32) -> f32 {
+    MIN_DB + level.clamp(0.0, 1.0) * (MAX_DB - MIN_DB)
 }
 
 impl Default for Settings {
@@ -45,9 +71,16 @@ impl Default for Settings {
             // 怎么说都没人听见，而且完全不知道为什么。
             talk_mode: TalkMode::VoiceActivity,
             ptt_key: None,
+            vad_threshold_db: DEFAULT_VAD_THRESHOLD_DB,
+            capture_device: None,
+            render_device: None,
         }
     }
 }
+
+/// 语音激活的默认阈值。安静房间里够用；机械键盘和风扇会把它顶起来，
+/// 那正是 APM 的降噪要解决的事。
+pub const DEFAULT_VAD_THRESHOLD_DB: f32 = -45.0;
 
 impl Settings {
     pub fn path() -> io::Result<PathBuf> {
@@ -88,6 +121,17 @@ impl Settings {
                     }
                 }
                 "ptt_key" => settings.ptt_key = value.parse().ok().and_then(Key::decode),
+                "capture_device" => settings.capture_device = non_empty(value),
+                "render_device" => settings.render_device = non_empty(value),
+                "vad_threshold_db" => {
+                    // 解析不出来或者离谱的值一律退回默认 —— 一个手滑打成
+                    // 正数的阈值会让用户一个字都发不出去。
+                    if let Ok(db) = value.parse::<f32>() {
+                        if db.is_finite() && (MIN_DB..=MAX_DB).contains(&db) {
+                            settings.vad_threshold_db = db;
+                        }
+                    }
+                }
                 // 认不出来的键跳过。将来加了新设置，老版本读到也不会炸。
                 _ => {}
             }
@@ -113,15 +157,25 @@ impl Settings {
              nick={}\n\
              last_invite={}\n\
              talk_mode={}\n\
-             ptt_key={}\n",
+             ptt_key={}\n\
+             vad_threshold_db={:.1}\n\
+             capture_device={}\n\
+             render_device={}\n",
             // 值里有换行的话会把文件切坏，所以过滤掉。
             // 昵称里的换行是粘贴时最容易带进来的东西。
             one_line(&self.nick),
             one_line(&self.last_invite),
             mode,
             self.ptt_key.map(Key::encode).unwrap_or(0),
+            self.vad_threshold_db,
+            one_line(self.capture_device.as_deref().unwrap_or("")),
+            one_line(self.render_device.as_deref().unwrap_or("")),
         )
     }
+}
+
+fn non_empty(value: &str) -> Option<String> {
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 fn one_line(value: &str) -> String {
@@ -138,6 +192,9 @@ mod tests {
             last_invite: "kaimai://j/abc".into(),
             talk_mode: TalkMode::PushToTalk,
             ptt_key: Some(Key::Keyboard(0x20)),
+            vad_threshold_db: -38.5,
+            capture_device: Some("{0.0.1.00000000}.{abc}".into()),
+            render_device: None,
         }
     }
 
@@ -210,6 +267,38 @@ mod tests {
             Settings::parse(&settings.serialize()).ptt_key,
             Some(Key::Mouse(5))
         );
+    }
+
+    /// 没设设备的时候要是 None，不能是空字符串 —— 空字符串会被当成
+    /// 一个不存在的设备 id 去打开。
+    #[test]
+    fn an_unset_device_is_none_not_empty() {
+        let settings = Settings::parse("capture_device=\nrender_device=\n");
+        assert_eq!(settings.capture_device, None);
+        assert_eq!(settings.render_device, None);
+    }
+
+    /// 离谱的阈值不能让用户一个字都发不出去。
+    #[test]
+    fn an_absurd_threshold_falls_back_to_the_default() {
+        for value in ["999", "-999", "abc", "NaN", "inf"] {
+            let settings = Settings::parse(&format!("vad_threshold_db={value}\n"));
+            assert_eq!(
+                settings.vad_threshold_db, DEFAULT_VAD_THRESHOLD_DB,
+                "阈值 `{value}` 该退回默认"
+            );
+        }
+    }
+
+    /// 电平条和滑块共用一把尺子，两边换算必须对得上。
+    #[test]
+    fn the_decibel_scale_round_trips() {
+        for db in [MIN_DB, -45.0, -20.0, MAX_DB] {
+            assert!((level_to_db(db_to_level(db)) - db).abs() < 0.01, "{db}");
+        }
+        // 超出范围的要夹住，不能跑出条子外面
+        assert_eq!(db_to_level(-200.0), 0.0);
+        assert_eq!(db_to_level(50.0), 1.0);
     }
 
     /// 设置文件跟身份文件放在一起，搬机器的时候一起走。
