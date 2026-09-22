@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use client_core::{Client, ConnectError, Event};
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 use voice_core::identity::Identity;
-use voice_core::miccheck::MicCheck;
+use voice_core::miccheck::{scan_microphones, MicCheck};
 use voice_core::pipeline::{Pipeline, PipelineConfig, TransmitMode, DEFAULT_JITTER_FRAMES};
 
 /// 多久去问一次语音链路的状态。
@@ -108,6 +108,7 @@ fn main() -> Result<(), slint::PlatformError> {
     wire_join(&app, &identity, &state);
     wire_actions(&app, &state);
     wire_settings(&app, &state, hotkeys.clone());
+    wire_scan(&app, &state);
     load_devices(&app, &state);
     spawn_status_poll(app.as_weak(), Arc::clone(&state));
     if let Some(hotkeys) = hotkeys {
@@ -438,6 +439,69 @@ fn restart_voice(app: &App, state: &Arc<Mutex<State>>) {
             voice.set_monitoring(true);
         }
     }
+}
+
+/// 每个麦克风试多久。
+///
+/// 太短的话用户还没来得及说出一个字就轮到下一个了；太长的话五个设备要等
+/// 半分钟。1.2 秒够说一句「喂喂」，五个设备一共 6 秒。
+const SCAN_PER_DEVICE: std::time::Duration = std::time::Duration::from_millis(1200);
+
+/// 挨个试每个麦克风，把结果显示出来。
+///
+/// 在后台线程上跑：每个设备都要真的打开一次，那几秒里界面不能是卡死的。
+fn wire_scan(app: &App, state: &Arc<Mutex<State>>) {
+    let state = Arc::clone(state);
+    let weak = app.as_weak();
+    app.on_scan_microphones(move || {
+        let Some(app) = weak.upgrade() else { return };
+        if app.get_scanning() {
+            return;
+        }
+        app.set_scanning(true);
+        app.set_scan_results(ModelRc::new(VecModel::from(Vec::<ScanRow>::new())));
+
+        // 检测要挨个打开设备，跟正在跑的试麦抢同一个麦克风。先停掉。
+        let was_checking = state.lock().expect("state poisoned").mic_check.is_some();
+        stop_mic_check(&state);
+
+        let weak = app.as_weak();
+        let state = Arc::clone(&state);
+        std::thread::spawn(move || {
+            let results = scan_microphones(SCAN_PER_DEVICE);
+            let _ = weak.upgrade_in_event_loop(move |app| {
+                let ids = state.lock().expect("state poisoned").capture_ids.clone();
+                let rows: Vec<ScanRow> = results
+                    .iter()
+                    .map(|result| ScanRow {
+                        name: format!(
+                            "{}{}",
+                            result.name,
+                            if result.is_hardware {
+                                ""
+                            } else {
+                                "（虚拟）"
+                            }
+                        )
+                        .into(),
+                        verdict: result.verdict().into(),
+                        ok: result.hears_something(),
+                        // 对回下拉框里的位置。对不上就退回「系统默认」，
+                        // 总比点一下没反应强。
+                        index: ids
+                            .iter()
+                            .position(|id| id.as_deref() == Some(result.id.as_str()))
+                            .unwrap_or(0) as i32,
+                    })
+                    .collect();
+                app.set_scan_results(ModelRc::new(VecModel::from(rows)));
+                app.set_scanning(false);
+                if was_checking {
+                    start_mic_check(&app, &state);
+                }
+            });
+        });
+    });
 }
 
 /// 设置面板：切换说话方式、绑按住说话的键、试听麦克风、选设备。

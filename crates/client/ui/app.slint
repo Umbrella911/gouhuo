@@ -23,6 +23,16 @@ export struct Row {
     count: int,
 }
 
+/// 一次麦克风检测的结果。
+export struct ScanRow {
+    name: string,
+    verdict: string,
+    /// 真的收到人声了。
+    ok: bool,
+    /// 在设备下拉框里的位置，点一下就选中它。
+    index: int,
+}
+
 export struct ChatRow {
     sender: string,
     body: string,
@@ -84,6 +94,9 @@ export component App inherits Window {
     in property <string> capture-in-use;
     /// 实际用的是不是虚拟声卡。是的话要提醒 —— 没在路由的虚拟麦是纯静音的。
     in property <bool> capture-is-virtual: false;
+    /// 正在挨个试麦克风。
+    in property <bool> scanning: false;
+    in property <[ScanRow]> scan-results;
 
     // ---- 回调 ----
     callback join();
@@ -100,6 +113,7 @@ export component App inherits Window {
     callback set-vad(float);
     callback pick-capture(int);
     callback pick-render(int);
+    callback scan-microphones();
 
     // =======================================================================
     // 没连上：一个框，一个按钮
@@ -589,6 +603,63 @@ export component App inherits Window {
                         font-size: 11px;
                         wrap: word-wrap;
                     }
+                    // 一键把每个麦克风都试一遍。用户对着一个下拉框是猜不出来哪个能用的，
+                    // 而程序挨个试只要几秒。
+                    Btn {
+                        label: root.scanning
+                            ? "正在挨个试…一直说话别停"
+                            : "挨个试一遍，找出哪个麦克风能用";
+                        primary: root.scanning;
+                        enabled: !root.scanning;
+                        clicked => { root.scan-microphones(); }
+                    }
+
+                    if root.scan-results.length > 0: VerticalLayout {
+                        spacing: 4px;
+                        for row[i] in root.scan-results: Rectangle {
+                            height: 42px;
+                            border-radius: 6px;
+                            background: scantouch.has-hover ? Theme.hover : Theme.raised;
+                            animate background { duration: 100ms; }
+
+                            HorizontalLayout {
+                                padding-left: 10px;
+                                padding-right: 10px;
+                                spacing: 8px;
+                                Dot {
+                                    y: (parent.height - self.height) / 2;
+                                    tint: row.ok ? Theme.speaking : Theme.faint;
+                                }
+                                VerticalLayout {
+                                    alignment: center;
+                                    horizontal-stretch: 1;
+                                    Text {
+                                        text: row.name;
+                                        color: row.ok ? Theme.text : Theme.dim;
+                                        font-size: 12px;
+                                        overflow: elide;
+                                    }
+                                    Text {
+                                        text: row.verdict;
+                                        color: row.ok ? Theme.speaking : Theme.faint;
+                                        font-size: 11px;
+                                        overflow: elide;
+                                    }
+                                }
+                            }
+                            scantouch := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.pick-capture(row.index); }
+                            }
+                        }
+                        Text {
+                            text: "点一行就选中那个设备。绿点表示检测时真的收到了人声。";
+                            color: Theme.faint;
+                            font-size: 11px;
+                            wrap: word-wrap;
+                        }
+                    }
+
                     // 条子一直不动的三个常见原因，按从常见到不常见排。
                     // 第三条最坑：Windows 的隐私设置挡掉麦克风时，
                     // 应用拿到的是**静音**而不是报错，看起来跟设备坏了一模一样。

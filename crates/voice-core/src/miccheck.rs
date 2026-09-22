@@ -186,6 +186,99 @@ impl Drop for MicCheck {
     }
 }
 
+/// 一个麦克风的检测结果。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScanResult {
+    /// WASAPI 的设备 id，选中它的时候要用。
+    pub id: String,
+    pub name: String,
+    pub is_hardware: bool,
+    /// 这段时间里的峰值电平，分贝。打不开就是 `None`。
+    pub peak_db: Option<f32>,
+    /// 打不开的原因，能直接显示给用户。
+    pub error: Option<String>,
+}
+
+impl ScanResult {
+    /// 真的收到人声了没有。
+    ///
+    /// −50 dB 这条线是这么定的：真硬件的底噪在 −100 dB 上下，
+    /// 虚拟设备没在路由时是 −120（纯数字零），而正常说话在 −30 到 −15 之间。
+    /// 中间空得很开，怎么定都不会误判。
+    pub fn hears_something(&self) -> bool {
+        self.peak_db.is_some_and(|db| db > -50.0)
+    }
+
+    /// 一句话说清楚这个设备现在什么情况。
+    pub fn verdict(&self) -> String {
+        match (&self.error, self.peak_db) {
+            (Some(e), _) => e.lines().next().unwrap_or("打不开").to_string(),
+            (None, None) => "打不开".to_string(),
+            (None, Some(db)) if db > -50.0 => format!("听到了（{db:.0} dB）"),
+            (None, Some(db)) if db > PURE_SILENCE_DB => {
+                format!("只有底噪（{db:.0} dB）—— 设备开着，但没收到人声")
+            }
+            (None, Some(_)) => "纯静音 —— 没在路由、被静音了、或者没插".to_string(),
+        }
+    }
+}
+
+/// 「这个设备送上来的全是零」的界线。
+///
+/// 实测过的三档差得很开：纯数字零正好是 −120（[`crate::pipeline::frame_db`]
+/// 的下限），真硬件的底噪在 −104 上下，正常说话在 −30 到 −15。
+/// 划在 −118 是为了只把「一个非零样点都没有」归进纯静音那一类 ——
+/// 这两类的下一步完全不一样：底噪说明设备在工作但没收到人声（静音键、
+/// 隐私设置），纯静音说明这个设备根本没在路由。
+const PURE_SILENCE_DB: f32 = -118.0;
+
+/// 挨个打开每个麦克风，看哪个真的收到声音。
+///
+/// **这个函数会阻塞**，每个设备占 `per_device`，要在后台线程上调。
+///
+/// # 为什么要有这个
+///
+/// 「为什么没声音」在 Windows 上有一堆长得一模一样的原因：选中的是没在路由的
+/// 虚拟声卡、麦克风被系统静音了、隐私设置挡住了、耳机没开机。用户面对一个
+/// 下拉框是猜不出来的 —— 而程序挨个试一遍只要几秒钟。
+///
+/// 调用方要提示用户**在检测期间一直说话**，否则每个设备都只会报底噪。
+pub fn scan_microphones(per_device: std::time::Duration) -> Vec<ScanResult> {
+    let Ok(endpoints) = crate::wasapi::list_endpoints(crate::wasapi::Direction::Capture) else {
+        return Vec::new();
+    };
+
+    endpoints
+        .into_iter()
+        .map(|endpoint| {
+            let mut capture = crate::wasapi::WasapiCapture::new(Some(endpoint.id.clone()));
+            let mut frame = vec![0.0f32; FRAME_SAMPLES];
+            let mut peak = f32::NEG_INFINITY;
+            let mut error = None;
+            let deadline = std::time::Instant::now() + per_device;
+
+            while std::time::Instant::now() < deadline {
+                match capture.read(&mut frame) {
+                    Ok(true) => peak = peak.max(crate::pipeline::frame_db(&frame)),
+                    Ok(false) => break,
+                    Err(e) => {
+                        error = Some(e.to_string());
+                        break;
+                    }
+                }
+            }
+
+            ScanResult {
+                id: endpoint.id,
+                name: endpoint.name,
+                is_hardware: endpoint.is_hardware,
+                peak_db: peak.is_finite().then_some(peak),
+                error,
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,5 +375,90 @@ mod tests {
         std::thread::sleep(Duration::from_millis(100));
         assert_eq!(check.error().as_deref(), Some("麦克风拔了"));
         assert!(!check.is_running(), "出错了还报在跑");
+    }
+}
+
+#[cfg(test)]
+mod verdicts {
+    use super::*;
+
+    fn result(peak_db: Option<f32>, error: Option<&str>) -> ScanResult {
+        ScanResult {
+            id: "x".into(),
+            name: "某个麦克风".into(),
+            is_hardware: true,
+            peak_db,
+            error: error.map(str::to_string),
+        }
+    }
+
+    /// 三种情况必须分得开，因为下一步完全不一样：
+    /// 有人声 → 就选它；只有底噪 → 麦克风没被收到音（静音键？隐私设置？）；
+    /// 纯静音 → 这个设备根本没在路由。
+    #[test]
+    fn the_three_cases_are_distinguishable() {
+        // 这三个数字是这台机器上实测出来的，不是编的：
+        // 说话 −25 上下、Arctis 的底噪 −104、Sonar 虚拟麦 正好 −120
+        assert!(result(Some(-25.0), None).hears_something());
+        assert!(!result(Some(-104.0), None).hears_something());
+        assert!(!result(Some(-120.0), None).hears_something());
+
+        assert!(result(Some(-25.0), None).verdict().contains("听到了"));
+        assert!(
+            result(Some(-104.0), None).verdict().contains("底噪"),
+            "真硬件的底噪被当成纯静音了：{}",
+            result(Some(-104.0), None).verdict()
+        );
+        assert!(result(Some(-120.0), None).verdict().contains("纯静音"));
+    }
+
+    /// 打不开的时候要把原因原样报出来 —— 采样率不对那条提示尤其要留着。
+    #[test]
+    fn an_open_failure_keeps_its_reason() {
+        let r = result(
+            None,
+            Some("录音设备现在是 44100 Hz，开麦这一版只支持 48000 Hz。\n去设置改"),
+        );
+        assert!(!r.hears_something());
+        assert!(r.verdict().contains("44100"));
+        // 只取第一行：界面上一行放得下，完整的那段在别处已经说过了
+        assert!(!r.verdict().contains('\n'));
+    }
+
+    #[test]
+    fn a_device_that_never_opened_is_not_reported_as_silent() {
+        assert_eq!(result(None, None).verdict(), "打不开");
+    }
+}
+
+#[cfg(test)]
+mod live_scan {
+    use super::*;
+
+    /// 真机上跑一遍「挨个试麦克风」，把界面会显示的东西打出来。
+    ///
+    /// ```bash
+    /// cargo test -p voice-core --lib live_scan -- --ignored --nocapture
+    /// ```
+    ///
+    /// **跑的时候要一直对着麦克风说话**，否则每个设备都只会报底噪。
+    #[test]
+    #[ignore = "要真声卡，而且要一边说话"]
+    #[cfg(windows)]
+    fn scan_reports_what_the_ui_would_show() {
+        let results = scan_microphones(std::time::Duration::from_millis(1200));
+        assert!(!results.is_empty(), "一个录音设备都没列出来");
+
+        println!();
+        for r in &results {
+            let mark = if r.hears_something() { "●" } else { "○" };
+            let kind = if r.is_hardware { "" } else { "（虚拟）" };
+            println!("{mark} {}{kind}\n    {}", r.name, r.verdict());
+        }
+        println!();
+        match results.iter().find(|r| r.hears_something()) {
+            Some(r) => println!("能用的：{}", r.name),
+            None => println!("一个都没收到人声 —— 要么没人说话，要么麦克风全被挡住了"),
+        }
     }
 }
