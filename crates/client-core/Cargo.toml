@@ -1,0 +1,19 @@
+[package]
+name = "client-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "客户端逻辑，不含界面：连接、认证、状态镜像。"
+
+[dependencies]
+protocol.workspace = true
+transport.workspace = true
+# 只要身份（Ed25519）。APM 是界面那边的事，这里不碰音频。
+voice-core = { workspace = true, default-features = false }
+rustls.workspace = true
+prost.workspace = true
+
+[dev-dependencies]
+# 集成测试直接对着真服务端跑 —— 没有 mock，没有假握手。
+server = { path = "../server" }

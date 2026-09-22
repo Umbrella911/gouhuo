@@ -7,6 +7,7 @@ members = [
     "crates/latency-probe",
     "crates/device-probe",
     "crates/server",
+    "crates/client-core",
 ]
 # vendor 进来的第三方源码不是工作区成员，只是 [patch] 的目标。
 exclude = ["third_party"]
@@ -37,6 +38,7 @@ protox = "0.9"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
 rcgen = "0.14"
 transport = { path = "crates/transport" }
+client-core = { path = "crates/client-core" }
 # WASAPI 要走 COM 接口，windows-sys 只有裸 FFI，接不了 IMMDeviceEnumerator/IAudioClient。
 windows = "0.62"
 # APM（AEC3 / 降噪 / AGC）。bundled 会从源码编 libwebrtc 的 APM 模块。

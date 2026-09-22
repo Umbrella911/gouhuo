@@ -232,6 +232,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "client-core"
+version = "0.0.1"
+dependencies = [
+ "prost",
+ "protocol",
+ "rustls",
+ "server",
+ "transport",
+ "voice-core",
+]
+
+[[package]]
 name = "cmake"
 version = "0.1.58"
 source = "registry+https://github.com/rust-lang/crates.io-index"

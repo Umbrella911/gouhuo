@@ -1,0 +1,340 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+//! 对着**真服务端**跑。没有 mock，没有假握手。
+//!
+//! 起一个真的开麦服务端，生成一条真的邀请链接，然后走用户实际走的那条路：
+//! 粘链接 → 连上 → 看到名单 → 说话 → 走人。
+//!
+//! 这个文件回答的是「界面之下的那一层到底能不能用」。等界面接上去的时候，
+//! 它只需要把这里已经验证过的东西画出来。
+
+use std::net::{TcpListener, UdpSocket};
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::Arc;
+use std::time::Duration;
+
+use client_core::{Client, ConnectError, Event};
+use protocol::control::rejected::Reason;
+use protocol::Invite;
+use server::conn::Hub;
+use server::state::{Config, Server};
+use transport::{server_config, ServerCert};
+use voice_core::identity::Identity;
+
+const WAIT: Duration = Duration::from_secs(5);
+
+struct TestServer {
+    invite: Invite,
+    hub: Arc<Hub>,
+}
+
+fn start(config: Config) -> TestServer {
+    let cert = ServerCert::generate().unwrap();
+    let fingerprint = cert.fingerprint();
+    let tls = Arc::new(server_config(&cert).unwrap());
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let voice = UdpSocket::bind("127.0.0.1:0").unwrap();
+
+    let invite_code = config.invite_code.clone();
+    let hub = Arc::new(Hub::new(Server::new(config), voice));
+    let voice_hub = Arc::clone(&hub);
+    std::thread::spawn(move || voice_hub.run_voice());
+    let accept_hub = Arc::clone(&hub);
+    std::thread::spawn(move || server::accept_loop(listener, tls, accept_hub));
+
+    TestServer {
+        invite: Invite {
+            host: addr.ip().to_string(),
+            port: addr.port(),
+            cert: fingerprint,
+            code: invite_code,
+        },
+        hub,
+    }
+}
+
+fn open_server() -> TestServer {
+    start(Config::default())
+}
+
+fn join(server: &TestServer, name: &str) -> (Client, Receiver<Event>) {
+    let link = server.invite.to_url().unwrap();
+    Client::connect(&link, &Identity::generate().unwrap(), name).expect("连不上")
+}
+
+/// 等一个满足条件的事件，中间别的事件丢掉。
+fn wait_for(events: &Receiver<Event>, mut matches: impl FnMut(&Event) -> bool) -> Event {
+    let deadline = std::time::Instant::now() + WAIT;
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        match events.recv_timeout(left) {
+            Ok(event) if matches(&event) => return event,
+            Ok(_) => continue,
+            Err(RecvTimeoutError::Timeout) => panic!("等的事件一直没来"),
+            Err(RecvTimeoutError::Disconnected) => panic!("事件通道断了"),
+        }
+    }
+}
+
+/// 用户实际经历的全部过程：粘一条链接进来，然后就在频道里了。
+#[test]
+fn an_invite_link_is_all_you_need() {
+    let server = open_server();
+    let (client, _events) = join(&server, "阿狸");
+
+    let roster = client.roster();
+    assert_eq!(roster.me, client.session_id());
+    assert_eq!(roster.name_of(roster.me), "阿狸");
+    assert_eq!(roster.users.len(), 1);
+
+    // 频道树已经在了，界面可以直接画
+    let tree = roster.tree();
+    assert_eq!(tree.len(), 1, "至少该有个根频道");
+    assert_eq!(tree[0].depth, 0);
+    assert_eq!(roster.my_channel(), tree[0].channel.id);
+
+    // 语音那半边要的东西也齐了
+    assert_ne!(client.udp_port(), 0, "没拿到语音端口");
+    assert_ne!(
+        client.voice_keys().upstream.as_bytes(),
+        client.voice_keys().downstream.as_bytes(),
+        "上下行密钥不该是同一把"
+    );
+}
+
+/// 第二个人进来，第一个人要收到「有人进来了」，而且带着名字 ——
+/// 界面要靠它播提示音和念 TTS。
+#[test]
+fn a_newcomer_shows_up_with_a_name() {
+    let server = open_server();
+    let (alice, alice_events) = join(&server, "阿狸");
+    let (bob, _bob_events) = join(&server, "波波");
+
+    let event = wait_for(&alice_events, |e| matches!(e, Event::Joined { .. }));
+    let Event::Joined { session, name } = event else {
+        unreachable!()
+    };
+    assert_eq!(name, "波波", "提示音要念名字，事件里就得带着");
+    assert_eq!(session, bob.session_id());
+
+    // 名单也跟上了
+    wait_for(&alice_events, |e| *e == Event::RosterChanged);
+    assert_eq!(alice.roster().users.len(), 2);
+}
+
+/// 自己登录不该被当成「有人进来了」—— 否则一进频道就先给自己播一声。
+#[test]
+fn my_own_login_is_not_announced() {
+    let server = open_server();
+    let (_client, events) = join(&server, "阿狸");
+
+    // 服务端会把自己的 UserState 也广播回来，这里应该只看到 RosterChanged
+    match events.recv_timeout(Duration::from_millis(500)) {
+        Ok(Event::Joined { name, .. }) => panic!("给自己播了一声进场：{name}"),
+        Ok(_) | Err(RecvTimeoutError::Timeout) => {}
+        Err(e) => panic!("{e}"),
+    }
+}
+
+#[test]
+fn text_goes_around_and_is_attributed() {
+    let server = open_server();
+    let (alice, alice_events) = join(&server, "阿狸");
+    let (bob, _bob_events) = join(&server, "波波");
+    wait_for(&alice_events, |e| matches!(e, Event::Joined { .. }));
+
+    bob.send_text("  在哪  ");
+
+    let event = wait_for(&alice_events, |e| matches!(e, Event::Text(_)));
+    let Event::Text(line) = event else {
+        unreachable!()
+    };
+    assert_eq!(line.body, "在哪", "前后空白该在客户端就去掉");
+    assert_eq!(line.sender_session, bob.session_id());
+    assert_eq!(line.sender_name, "波波");
+    assert!(line.timestamp_ms > 0, "时间戳该是服务端盖的");
+
+    // 也进了本地的聊天记录，界面直接读这个
+    assert_eq!(alice.roster().chat.back().unwrap().body, "在哪");
+}
+
+/// 空消息不该发出去 —— 用户手滑按了回车不该在别人屏幕上留一行空白。
+#[test]
+fn empty_text_is_not_sent() {
+    let server = open_server();
+    let (alice, alice_events) = join(&server, "阿狸");
+    let (bob, _bob_events) = join(&server, "波波");
+    wait_for(&alice_events, |e| matches!(e, Event::Joined { .. }));
+
+    bob.send_text("   ");
+    bob.send_text("");
+    bob.send_text("真的一条");
+
+    let event = wait_for(&alice_events, |e| matches!(e, Event::Text(_)));
+    let Event::Text(line) = event else {
+        unreachable!()
+    };
+    assert_eq!(line.body, "真的一条", "空消息被发出去了");
+    assert_eq!(alice.roster().chat.len(), 1);
+}
+
+#[test]
+fn self_state_propagates_to_everyone() {
+    let server = open_server();
+    let (alice, alice_events) = join(&server, "阿狸");
+    let (bob, _bob_events) = join(&server, "波波");
+    wait_for(&alice_events, |e| matches!(e, Event::Joined { .. }));
+
+    bob.set_self_state(false, true);
+
+    let deadline = std::time::Instant::now() + WAIT;
+    loop {
+        wait_for(&alice_events, |e| *e == Event::RosterChanged);
+        let roster = alice.roster();
+        let bob_user = roster.users.get(&bob.session_id()).unwrap();
+        if bob_user.self_deafened {
+            assert!(bob_user.self_muted, "关了耳朵就该同时闭麦");
+            break;
+        }
+        drop(roster);
+        assert!(std::time::Instant::now() < deadline, "状态一直没同步过来");
+    }
+}
+
+/// 有人走了，剩下的人要知道是谁走的 —— 名字得在事件里，
+/// 因为那时候他已经从名单里删掉了。
+#[test]
+fn leaving_is_announced_with_the_name() {
+    let server = open_server();
+    let (alice, alice_events) = join(&server, "阿狸");
+    let (bob, bob_events) = join(&server, "波波");
+    wait_for(&alice_events, |e| matches!(e, Event::Joined { .. }));
+    let bob_session = bob.session_id();
+
+    bob.disconnect();
+    // 断开的人自己也要收到通知，界面才知道该切回未连接状态
+    wait_for(&bob_events, |e| matches!(e, Event::Disconnected(_)));
+
+    let event = wait_for(&alice_events, |e| matches!(e, Event::Left { .. }));
+    let Event::Left { session, name } = event else {
+        unreachable!()
+    };
+    assert_eq!(session, bob_session);
+    assert_eq!(name, "波波");
+    assert_eq!(alice.roster().users.len(), 1);
+}
+
+/// 邀请码不对的时候，报错要告诉用户该去做什么。
+#[test]
+fn a_wrong_invite_code_tells_you_what_to_do() {
+    let server = start(Config {
+        require_invite: true,
+        invite_code: Some("winter2026".into()),
+        ..Config::default()
+    });
+
+    let mut wrong = server.invite.clone();
+    wrong.code = Some("猜的".into());
+    let error = Client::connect_to(&wrong, &Identity::generate().unwrap(), "路人")
+        .err()
+        .expect("邀请码不对却连上了");
+
+    assert!(
+        matches!(
+            error,
+            ConnectError::Rejected {
+                reason: Reason::InviteRequired,
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+    assert!(error.advice().contains("管理员"), "{}", error.advice());
+    assert_eq!(server.hub.user_count(), 0);
+
+    // 正确的那条照样能进
+    let (_client, _events) = join(&server, "自己人");
+    assert_eq!(server.hub.user_count(), 1);
+}
+
+/// 指纹对不上必须连不上，而且要说清楚这可能意味着什么。
+#[test]
+fn a_wrong_fingerprint_is_explained_not_just_refused() {
+    let server = open_server();
+    let mut tampered = server.invite.clone();
+    tampered.cert = ServerCert::generate().unwrap().fingerprint();
+
+    let error = Client::connect_to(&tampered, &Identity::generate().unwrap(), "阿狸")
+        .err()
+        .expect("指纹不对却连上了");
+    assert!(
+        matches!(error, ConnectError::WrongCertificate(_)),
+        "{error:?}"
+    );
+    let advice = error.advice();
+    assert!(advice.contains("重装"), "要说清楚最常见的原因：{advice}");
+    assert!(advice.contains("别连"), "也要说什么时候该收手：{advice}");
+}
+
+/// 改过的链接在碰网络之前就该被拦下。
+#[test]
+fn a_tampered_link_never_reaches_the_network() {
+    let server = open_server();
+    let link = server.invite.to_url().unwrap();
+    let mut chars: Vec<char> = link.chars().collect();
+    let mid = chars.len() - 4;
+    chars[mid] = if chars[mid] == 'a' { 'b' } else { 'a' };
+    let tampered: String = chars.into_iter().collect();
+
+    let error = Client::connect(&tampered, &Identity::generate().unwrap(), "阿狸")
+        .err()
+        .expect("改过的链接却连上了");
+    assert!(matches!(error, ConnectError::BadInvite(_)), "{error:?}");
+    assert!(error.advice().contains("复制"), "{}", error.advice());
+    assert_eq!(server.hub.user_count(), 0);
+}
+
+/// 服务器没开的时候，别只说一句「连接被拒绝」。
+#[test]
+fn an_unreachable_server_says_what_to_check() {
+    // 绑一个端口再立刻放掉，拿到一个几乎肯定没人听的端口号
+    let spare = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = spare.local_addr().unwrap().port();
+    drop(spare);
+
+    let invite = Invite {
+        host: "127.0.0.1".into(),
+        port,
+        cert: ServerCert::generate().unwrap().fingerprint(),
+        code: None,
+    };
+    let error = Client::connect_to(&invite, &Identity::generate().unwrap(), "阿狸")
+        .err()
+        .expect("没人听的端口却连上了");
+
+    assert!(
+        matches!(error, ConnectError::Unreachable { .. }),
+        "{error:?}"
+    );
+    let advice = error.advice();
+    assert!(advice.contains("防火墙"), "{advice}");
+    assert!(advice.contains("转发"), "{advice}");
+}
+
+/// 同一个身份连第二次会顶掉第一次 —— 换机器、客户端崩了重开都会走到这儿。
+/// 旧的那条要收到 Disconnected，界面才知道该说「你在别处登录了」。
+#[test]
+fn logging_in_again_disconnects_the_old_client() {
+    let server = open_server();
+    let identity = Identity::generate().unwrap();
+    let link = server.invite.to_url().unwrap();
+
+    let (_first, first_events) = Client::connect(&link, &identity, "阿狸").unwrap();
+    let second_identity = Identity::import(&identity.export()).unwrap();
+    let (second, _second_events) = Client::connect(&link, &second_identity, "阿狸").unwrap();
+
+    wait_for(&first_events, |e| matches!(e, Event::Disconnected(_)));
+    assert_eq!(server.hub.user_count(), 1, "顶号顶成了两个人");
+    assert_eq!(second.roster().users.len(), 1);
+}
