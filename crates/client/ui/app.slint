@@ -568,6 +568,26 @@ export component App inherits Window {
 
                     Rectangle { height: 1px; background: Theme.line; }
 
+                    // 设备出的错要**在这一页就看得见**。
+                    //
+                    // 第一版只在「已连接」那个界面里渲染它，于是设置页上设备打不开时
+                    // 用户只看到一个闪一下就灭的麦克风灯，而原因明明已经拿到了。
+                    if root.voice-error != "": Rectangle {
+                        background: #2a1d1d;
+                        border-radius: Theme.radius;
+                        border-width: 1px;
+                        border-color: #4a2b28;
+                        VerticalLayout {
+                            padding: 12px;
+                            Text {
+                                text: root.voice-error;
+                                color: Theme.danger;
+                                font-size: 12px;
+                                wrap: word-wrap;
+                            }
+                        }
+                    }
+
                     Text {
                         text: "麦克风";
                         color: Theme.dim;

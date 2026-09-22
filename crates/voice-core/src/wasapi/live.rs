@@ -21,11 +21,17 @@
 //! 对一个开黑软件这基本不可接受，所以共享模式是唯一路径。M2 实测共享模式
 //! 设备延迟 30.4 ms，在预算内。
 //!
-//! # 第一版只认 48 kHz
+//! # 采样率交给 Windows 转
 //!
-//! 引擎混音格式不是 48 kHz 的话直接报错，并告诉用户去哪儿改。
-//! 重采样要引入一个滤波器和它自己的延迟，而现在的 Windows 默认基本都是
-//! 48 kHz —— 先把这条路跑通，重采样以后再说。
+//! 共享模式默认必须用引擎的混音格式，而那个格式**由用户在 Windows 声音设置里
+//! 决定**。第一版直接拒绝非 48 kHz 的设备，结果在一台真实的玩家机器上撞墙了：
+//! 默认扬声器是 SteelSeries Sonar 的虚拟设备、96000 Hz，默认麦克风里还有
+//! 44100 Hz 的 —— 那台机器**开箱就用不了**。
+//!
+//! 现在用 `AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM`，让音频引擎自己插重采样器。
+//! 代价是它那一段的延迟，但比「不支持」好太多。
+//!
+//! 采样率检查留着当保险丝：正常情况下永远不该触发，触发了说明转换没生效。
 
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -38,7 +44,7 @@ use windows::Win32::Media::Audio::{
 use windows::Win32::System::Threading::WaitForSingleObject;
 
 use crate::audio::{Capture, Render, FRAME_SAMPLES, SAMPLE_RATE};
-use crate::wasapi::stream::{describe_error, initialize, Event, Opened, ShareMode};
+use crate::wasapi::stream::{describe_error, initialize_with, Event, Opened, ShareMode};
 use crate::wasapi::{Direction, Format};
 
 /// 等设备事件最多等多久。
@@ -100,10 +106,13 @@ fn err(context: &str, e: windows::core::Error) -> io::Error {
     io::Error::other(format!("{context}：{}", describe_error(&e)))
 }
 
-/// 引擎不是 48 kHz 的时候，给一条能照着做的指路。
+/// 保险丝：开了自动转换之后还拿到非 48 kHz，说明转换没生效。
+///
+/// 正常情况下永远不该走到这里。真走到了，给用户一条能照着做的指路，
+/// 别让他对着一个「初始化失败」发呆。
 fn wrong_rate(format: &Format, which: &str) -> io::Error {
     io::Error::other(format!(
-        "{which}设备现在是 {} Hz，开麦这一版只支持 48000 Hz。\n\
+        "{which}设备现在是 {} Hz，而且自动转换没生效。\n\
          去 Windows 设置 → 系统 → 声音 → 设备属性 → 高级，把格式改成 48000 Hz，\n\
          然后重开开麦。",
         format.sample_rate
@@ -189,7 +198,7 @@ impl WasapiCapture {
                 event,
                 format,
                 ..
-            } = initialize(&device, Direction::Capture, ShareMode::Shared, 1)
+            } = initialize_with(&device, Direction::Capture, ShareMode::Shared, 1, true)
                 .map_err(|e| err("初始化录音流", e))?;
             if format.sample_rate != SAMPLE_RATE {
                 return Err(wrong_rate(&format, "录音"));
@@ -392,7 +401,7 @@ impl WasapiRender {
                 format,
                 buffer_frames,
                 ..
-            } = initialize(&device, Direction::Render, ShareMode::Shared, 2)
+            } = initialize_with(&device, Direction::Render, ShareMode::Shared, 2, true)
                 .map_err(|e| err("初始化播放流", e))?;
             if format.sample_rate != SAMPLE_RATE {
                 return Err(wrong_rate(&format, "播放"));

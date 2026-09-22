@@ -42,6 +42,27 @@ struct Shared {
     error: Mutex<Option<String>>,
 }
 
+impl Shared {
+    /// 采集那边挂了：整个试麦就没意义了，两边一起停。
+    fn capture_failed(&self, e: io::Error) {
+        *self.error.lock().expect("error poisoned") = Some(e.to_string());
+        self.stop.store(true, Ordering::Relaxed);
+    }
+
+    /// 播放那边挂了：**采集继续跑**。
+    ///
+    /// 看电平根本不需要扬声器 —— 而「我的麦克风有没有在收音」恰恰是用户
+    /// 最想知道的那件事。第一版把两个线程写成了连坐，结果默认扬声器
+    /// （96 kHz 的虚拟设备）打不开时，麦克风也跟着停，表现是
+    /// 「麦克风灯闪一下就灭」，而界面上什么都不说。
+    fn render_failed(&self, e: io::Error) {
+        *self.error.lock().expect("error poisoned") = Some(format!(
+            "听不到声音：{e}
+（麦克风电平不受影响，还能看）"
+        ));
+    }
+}
+
 /// 一次试麦。丢掉它就会把两个线程收干净、把设备还回去。
 pub struct MicCheck {
     shared: Arc<Shared>,
@@ -82,7 +103,7 @@ impl MicCheck {
                                 Ok(true) => {}
                                 Ok(false) => break,
                                 Err(e) => {
-                                    shared.fail(e);
+                                    shared.capture_failed(e);
                                     return;
                                 }
                             }
@@ -124,7 +145,8 @@ impl MicCheck {
                             // 播放线程的节拍来自设备（write 会阻塞），
                             // 不转的话打开试听时要先等设备预热，听起来像卡了一下。
                             if let Err(e) = render.write(&out) {
-                                shared.fail(e);
+                                // **不停采集。** 见 Shared::render_failed。
+                                shared.render_failed(e);
                                 return;
                             }
                         }
@@ -164,14 +186,6 @@ impl MicCheck {
     /// 设备出了什么问题，能直接显示给用户。
     pub fn error(&self) -> Option<String> {
         self.shared.error.lock().expect("error poisoned").clone()
-    }
-}
-
-impl Shared {
-    fn fail(&self, e: io::Error) {
-        *self.error.lock().expect("error poisoned") = Some(e.to_string());
-        // 一边出错另一边也没必要转下去了：它们共用一副耳机。
-        self.stop.store(true, Ordering::Relaxed);
     }
 }
 
@@ -356,9 +370,9 @@ mod tests {
         );
     }
 
-    /// 设备中途出错要能报出来，而且两个线程都要停。
+    /// 采集出错要报出来，而且整个试麦停下。
     #[test]
-    fn a_device_error_is_reported() {
+    fn a_capture_error_stops_everything() {
         struct Broken;
         impl Capture for Broken {
             fn read(&mut self, _out: &mut [f32]) -> io::Result<bool> {
@@ -375,6 +389,43 @@ mod tests {
         std::thread::sleep(Duration::from_millis(100));
         assert_eq!(check.error().as_deref(), Some("麦克风拔了"));
         assert!(!check.is_running(), "出错了还报在跑");
+    }
+
+    /// **播放出错不能把采集也停掉。**
+    ///
+    /// 看电平根本不需要扬声器，而「麦克风有没有在收音」恰恰是用户最想知道的。
+    /// 第一版两个线程连坐，结果默认扬声器打不开时麦克风也跟着停 ——
+    /// 表现是「麦克风灯闪一下就灭」，界面上还什么都不说。
+    #[test]
+    fn a_render_error_leaves_the_level_meter_working() {
+        struct BrokenSpeaker;
+        impl Render for BrokenSpeaker {
+            fn write(&mut self, _frame: &[f32]) -> io::Result<()> {
+                Err(io::Error::other("扬声器打不开"))
+            }
+        }
+
+        let check = MicCheck::start(
+            Box::new(SyntheticCapture::new(tone(200)).then_silence()),
+            Box::new(BrokenSpeaker),
+            None,
+        )
+        .unwrap();
+
+        std::thread::sleep(Duration::from_millis(400));
+        let error = check.error().expect("播放出错了却没报");
+        assert!(error.contains("听不到声音"), "{error}");
+        assert!(
+            error.contains("电平不受影响"),
+            "要告诉用户还能干什么：{error}"
+        );
+
+        assert!(check.is_running(), "播放挂了把采集也停了");
+        assert!(
+            check.input_db() > -90.0,
+            "播放挂了之后电平表也不动了：{} dB",
+            check.input_db()
+        );
     }
 }
 
@@ -521,5 +572,46 @@ mod endurance {
             println!("{}{kind}\n    {verdict}", endpoint.name);
         }
         println!();
+    }
+}
+
+#[cfg(test)]
+mod render_check {
+    use super::*;
+    use crate::audio::Render;
+
+    /// 挨个试播放设备。
+    ///
+    /// ```bash
+    /// cargo test -p voice-core --lib render_check -- --ignored --nocapture
+    /// ```
+    ///
+    /// 播放设备打不开的后果比看起来严重：试麦的两个线程是连坐的，
+    /// 播放那边一死，采集也跟着停 —— 表现就是「麦克风灯闪一下就灭」。
+    #[test]
+    #[ignore = "要真声卡，会往扬声器写静音"]
+    #[cfg(windows)]
+    fn every_speaker_can_be_opened() {
+        let endpoints =
+            crate::wasapi::list_endpoints(crate::wasapi::Direction::Render).unwrap_or_default();
+        assert!(!endpoints.is_empty(), "一个播放设备都没有");
+
+        println!();
+        for endpoint in &endpoints {
+            let mut render = crate::wasapi::WasapiRender::new(Some(endpoint.id.clone()));
+            let silence = vec![0.0f32; FRAME_SAMPLES];
+            let outcome = match render.write(&silence) {
+                Ok(()) => "能打开".to_string(),
+                Err(e) => format!("**打不开**：{}", e.to_string().lines().next().unwrap_or("")),
+            };
+            let kind = if endpoint.is_hardware {
+                ""
+            } else {
+                "（虚拟）"
+            };
+            let mark = if endpoint.is_default { "→ " } else { "  " };
+            println!("{mark}{}{kind}\n     {outcome}", endpoint.name);
+        }
+        println!("\n（→ 是系统默认的那个）");
     }
 }

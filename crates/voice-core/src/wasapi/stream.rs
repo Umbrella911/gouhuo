@@ -31,7 +31,8 @@ use windows::Win32::Media::Audio::{
     eCapture, eConsole, eRender, IAudioCaptureClient, IAudioClient, IAudioClient3,
     IAudioRenderClient, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator,
     AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY, AUDCLNT_SHAREMODE_EXCLUSIVE, AUDCLNT_SHAREMODE_SHARED,
-    AUDCLNT_STREAMFLAGS_EVENTCALLBACK, WAVEFORMATEX,
+    AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+    AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, WAVEFORMATEX,
 };
 use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_ALL};
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
@@ -219,6 +220,14 @@ pub fn open_device(id: Option<&str>, direction: Direction) -> windows::core::Res
     }
 }
 
+/// 我们想要的格式：48 kHz 16 位 PCM。
+///
+/// 16 位而不是 32 位浮点：**每一个驱动都认 PCM16**，而浮点在一些老驱动上
+/// 要 `WAVEFORMATEXTENSIBLE` 才收。48 kHz 16 位对人声是绰绰有余的。
+fn canonical_format(channels: u16) -> WAVEFORMATEX {
+    exclusive_format(channels)
+}
+
 /// 独占模式用的格式：48 kHz 16 位。声道数由调用方给 —— 设备清单里已经探过支持哪个。
 fn exclusive_format(channels: u16) -> WAVEFORMATEX {
     let block_align = channels * 2;
@@ -262,6 +271,31 @@ pub(crate) fn initialize(
     share_mode: ShareMode,
     channels: u16,
 ) -> windows::core::Result<Opened> {
+    initialize_with(device, direction, share_mode, channels, false)
+}
+
+/// 同上，但可以要求音频引擎帮我们做格式转换。
+///
+/// # 为什么需要
+///
+/// 共享模式默认必须用引擎的混音格式，那个格式**由用户在 Windows 声音设置里
+/// 决定**，我们说了不算。实测一台玩家机器上：默认扬声器是 SteelSeries Sonar
+/// 的虚拟设备，96000 Hz；另一个麦克风是 44100 Hz。直接拒绝的话，这台机器
+/// **开箱就是用不了的**。
+///
+/// `AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM` 就是为这件事准备的：传一个跟混音格式
+/// 不一样的 PCM 格式，音频引擎自己插一个重采样器。代价是它那一段的延迟，
+/// 但比「不支持」好太多了。
+///
+/// **探针不开这个**（M1/M2 量设备延迟的那些）：它们要量的正是设备原生的表现，
+/// 中间多一个重采样器就不是那个数了。
+pub(crate) fn initialize_with(
+    device: &IMMDevice,
+    direction: Direction,
+    share_mode: ShareMode,
+    channels: u16,
+    convert: bool,
+) -> windows::core::Result<Opened> {
     let client: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None)? };
     let (mut default_period, mut min_period) = (0i64, 0i64);
     unsafe { client.GetDevicePeriod(Some(&mut default_period), Some(&mut min_period))? };
@@ -279,8 +313,13 @@ pub(crate) fn initialize(
         Option<*mut WAVEFORMATEX>,
         *const WAVEFORMATEX,
     ) = match share_mode {
+        ShareMode::Shared if convert => {
+            // 要引擎帮忙转格式：传我们想要的，标志位让它自己插重采样器。
+            let fmt = Box::into_raw(Box::new(canonical_format(channels)));
+            (AUDCLNT_SHAREMODE_SHARED, 0, None, fmt as *const _)
+        }
         ShareMode::Shared => {
-            // 共享模式必须用引擎的混音格式，别的格式会被拒或者被偷偷重采样。
+            // 共享模式默认必须用引擎的混音格式，别的格式会被拒。
             let mix = unsafe { client.GetMixFormat()? };
             (AUDCLNT_SHAREMODE_SHARED, 0, Some(mix), mix as *const _)
         }
@@ -300,7 +339,7 @@ pub(crate) fn initialize(
     let mut result = unsafe {
         client.Initialize(
             share,
-            AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+            stream_flags(convert),
             buffer_duration,
             period,
             wfx_ptr,
@@ -320,7 +359,7 @@ pub(crate) fn initialize(
             result = unsafe {
                 client2.Initialize(
                     share,
-                    AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                    stream_flags(convert),
                     buffer_duration,
                     buffer_duration,
                     wfx_ptr,
@@ -366,21 +405,36 @@ pub(crate) fn initialize(
     })
 }
 
+fn stream_flags(convert: bool) -> u32 {
+    if convert {
+        AUDCLNT_STREAMFLAGS_EVENTCALLBACK
+            | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
+            | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY
+    } else {
+        AUDCLNT_STREAMFLAGS_EVENTCALLBACK
+    }
+}
+
 fn period_to_frames(reftime: i64, rate: u32) -> u32 {
     ((reftime as f64 / 10_000_000.0) * rate as f64)
         .round()
         .max(1.0) as u32
 }
 
+/// 释放格式结构。
+///
+/// 两种来源要分开：`GetMixFormat` 给的是 COM 分配的，要 `CoTaskMemFree`；
+/// 我们自己造的是 `Box`，要 `Box::from_raw`。`owned_mix` 是 `Some` 就说明
+/// 是前者 —— 判据放在这里，别再去看 share_mode，那样加一种模式就会漏。
 fn cleanup_format(
     owned_mix: Option<*mut WAVEFORMATEX>,
     wfx_ptr: *const WAVEFORMATEX,
-    share_mode: ShareMode,
+    _share_mode: ShareMode,
 ) {
     match owned_mix {
         Some(mix) => unsafe { CoTaskMemFree(Some(mix as *const _)) },
         None => {
-            if share_mode == ShareMode::Exclusive && !wfx_ptr.is_null() {
+            if !wfx_ptr.is_null() {
                 drop(unsafe { Box::from_raw(wfx_ptr as *mut WAVEFORMATEX) });
             }
         }
