@@ -77,6 +77,36 @@ impl Roster {
             .unwrap_or(Role::Unspecified)
     }
 
+    /// 我能不能建频道。界面拿它决定显不显示「新建频道」。
+    ///
+    /// **这只是画界面用的，不是权限检查。** 真正说了算的是服务端 ——
+    /// 这里判断错了最多是显示一个点了没反应的按钮，不会有安全问题。
+    pub fn can_create_channel(&self) -> bool {
+        (self.my_role() as i32) >= (Role::Member as i32)
+    }
+
+    /// 我能不能删这个频道。同上，只是画界面用的。
+    ///
+    /// 规则跟服务端对齐：**根频道谁都删不掉**；除此之外，要么是我建的，
+    /// 要么我是频道管理及以上。「是不是我建的」靠比公钥 —— 不比 session id，
+    /// 那个一断线就变了，而「我建的频道」应该在重连之后还成立。
+    pub fn can_delete_channel(&self, channel_id: u32) -> bool {
+        let Some(channel) = self.channels.get(&channel_id) else {
+            return false;
+        };
+        if channel.parent_id == channel.id {
+            return false;
+        }
+        if (self.my_role() as i32) >= (Role::ChannelAdmin as i32) {
+            return true;
+        }
+        match self.my_user() {
+            // created_by 为空 = 服务器自带的频道，不是任何人建的。
+            Some(me) if !channel.created_by.is_empty() => channel.created_by == me.public_key,
+            _ => false,
+        }
+    }
+
     pub fn name_of(&self, session: u32) -> String {
         self.users
             .get(&session)
@@ -198,6 +228,15 @@ mod tests {
             description: String::new(),
             max_users: 0,
             min_role: Role::Guest as i32,
+            created_by: Vec::new(),
+        }
+    }
+
+    /// 带「谁建的」的频道。公钥跟 [`user`] 里的规则一致：session 号重复 32 次。
+    fn channel_made_by(id: u32, parent: u32, name: &str, creator_session: u32) -> Channel {
+        Channel {
+            created_by: vec![creator_session as u8; 32],
+            ..channel(id, parent, name)
         }
     }
 
@@ -356,5 +395,96 @@ mod tests {
         assert_eq!(roster.my_channel(), 1);
         assert_eq!(roster.my_role(), Role::Member);
         assert_eq!(roster.name_of(3), "阿狸");
+    }
+
+    // ======================================================================
+    // 能不能建 / 能不能删
+    //
+    // 这两个只决定界面画什么，**不是权限检查** —— 真正说了算的是服务端。
+    // 但画错了用户会看到一个点了没反应的按钮，那种 bug 最伤信任。
+    // ======================================================================
+
+    /// 带上「我是谁、我什么角色」的名单。
+    fn roster_as(me: u32, my_role: Role, channels: Vec<Channel>) -> Roster {
+        let mut roster = Roster {
+            me,
+            ..Default::default()
+        };
+        for c in channels {
+            roster.channels.insert(c.id, c);
+        }
+        let mut u = user(me, 1, "我");
+        u.role = my_role as i32;
+        roster.users.insert(me, u);
+        roster
+    }
+
+    #[test]
+    fn a_guest_is_not_offered_the_new_channel_button() {
+        let roster = roster_as(1, Role::Guest, vec![channel(1, 1, "大厅")]);
+        assert!(!roster.can_create_channel());
+    }
+
+    #[test]
+    fn a_member_is_offered_the_new_channel_button() {
+        let roster = roster_as(1, Role::Member, vec![channel(1, 1, "大厅")]);
+        assert!(roster.can_create_channel());
+    }
+
+    #[test]
+    fn nobody_is_offered_delete_on_the_root_channel() {
+        // 连管理员也不行 —— 根频道是结构性的，不是权限问题。
+        for role in [Role::Member, Role::ChannelAdmin, Role::Admin] {
+            let roster = roster_as(1, role, vec![channel(1, 1, "大厅")]);
+            assert!(!roster.can_delete_channel(1), "{role:?} 不该能删根频道");
+        }
+    }
+
+    #[test]
+    fn i_can_delete_the_channel_i_made() {
+        let roster = roster_as(
+            7,
+            Role::Member,
+            vec![channel(1, 1, "大厅"), channel_made_by(2, 1, "打本", 7)],
+        );
+        assert!(roster.can_delete_channel(2));
+    }
+
+    #[test]
+    fn a_member_cannot_delete_someone_elses_channel() {
+        let roster = roster_as(
+            7,
+            Role::Member,
+            vec![channel(1, 1, "大厅"), channel_made_by(2, 1, "打本", 9)],
+        );
+        assert!(!roster.can_delete_channel(2));
+    }
+
+    #[test]
+    fn a_channel_admin_can_delete_anyones_channel() {
+        let roster = roster_as(
+            7,
+            Role::ChannelAdmin,
+            vec![channel(1, 1, "大厅"), channel_made_by(2, 1, "打本", 9)],
+        );
+        assert!(roster.can_delete_channel(2));
+    }
+
+    /// 服务器自带的频道（`created_by` 是空的）不该被当成"我建的"。
+    ///
+    /// 会踩到这里是因为空 Vec 跟空 Vec 是相等的 —— 如果我的公钥也碰巧
+    /// 读不出来，两边都是空就会判成"我建的"。
+    #[test]
+    fn a_built_in_channel_is_not_mine_even_if_my_key_is_missing() {
+        let mut roster = roster_as(7, Role::Member, vec![channel(1, 1, "大厅")]);
+        roster.channels.insert(2, channel(2, 1, "服务器自带的"));
+        roster.users.clear(); // 我的 User 还没到
+        assert!(!roster.can_delete_channel(2));
+    }
+
+    #[test]
+    fn an_unknown_channel_is_not_deletable() {
+        let roster = roster_as(1, Role::Admin, vec![channel(1, 1, "大厅")]);
+        assert!(!roster.can_delete_channel(9999));
     }
 }

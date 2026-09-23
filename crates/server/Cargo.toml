@@ -20,8 +20,8 @@ path = "src/main.rs"
 [dependencies]
 protocol.workspace = true
 transport.workspace = true
-# 只用它的身份（Ed25519）。**不要 APM** —— 服务端不碰音频采样，
-# 带上它等于要求自部署的人装 meson 和 ninja。
+# 只用它的身份（Ed25519）。**显式关掉默认 feature** —— 服务端从头到尾
+# 不碰音频采样，带上 APM 和 Opus 只是白白多编十几个 crate、多占体积。
 voice-core = { workspace = true, default-features = false }
 rustls.workspace = true
 getrandom.workspace = true

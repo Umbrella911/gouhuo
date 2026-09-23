@@ -338,3 +338,152 @@ fn logging_in_again_disconnects_the_old_client() {
     assert_eq!(server.hub.user_count(), 1, "顶号顶成了两个人");
     assert_eq!(second.roster().users.len(), 1);
 }
+
+// ==========================================================================
+// 多频道
+//
+// 状态机那层的规则在 server::state 的单元测试里盖满了。这里只管一件事：
+// **一个人建的频道，另一个人真的能看见、能进去** —— 那要求协议、广播、
+// 名单三段都对得上，单元测试一段都碰不到。
+// ==========================================================================
+
+/// 等到名单里出现一个叫这个名字的频道，返回它的 id。
+fn wait_for_channel(client: &Client, events: &Receiver<Event>, name: &str) -> u32 {
+    let deadline = std::time::Instant::now() + WAIT;
+    loop {
+        if let Some(id) = client
+            .roster()
+            .channels
+            .values()
+            .find(|c| c.name == name)
+            .map(|c| c.id)
+        {
+            return id;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("等「{name}」这个频道一直没等到");
+        }
+        let _ = events.recv_timeout(Duration::from_millis(100));
+    }
+}
+
+#[test]
+fn a_channel_one_person_makes_shows_up_for_everyone() {
+    let server = open_server();
+    let (maker, maker_events) = join(&server, "阿强");
+    let (watcher, watcher_events) = join(&server, "阿伟");
+    // 在先到的那个身上等 —— 自己刚连上不会给自己发事件，名单是从 Welcome 建的。
+    wait_for(&maker_events, |e| matches!(e, Event::Joined { .. }));
+
+    maker.create_channel("打本", 0);
+
+    // 建的人自己也是从服务端的广播里知道的 —— 不本地先插。
+    let mine = wait_for_channel(&maker, &maker_events, "打本");
+    let theirs = wait_for_channel(&watcher, &watcher_events, "打本");
+    assert_eq!(mine, theirs, "两边看到的该是同一个频道 id");
+}
+
+#[test]
+fn you_can_actually_walk_into_a_channel_someone_else_made() {
+    let server = open_server();
+    let (maker, maker_events) = join(&server, "阿强");
+    let (walker, walker_events) = join(&server, "阿伟");
+    wait_for(&maker_events, |e| matches!(e, Event::Joined { .. }));
+
+    maker.create_channel("打本", 0);
+    let id = wait_for_channel(&walker, &walker_events, "打本");
+
+    walker.join_channel(id);
+
+    // 两边都要等。**两个客户端各有各的读线程**，一边看到了不代表另一边也看到了 ——
+    // 只等一边的话这个测试会随机红，而那种红比不测还糟。
+    let deadline = std::time::Instant::now() + WAIT;
+    loop {
+        // 别把锁攥到断言里：断言失败时 guard 还活着，会把锁毒掉，
+        // 然后读线程跟着 panic，真正的失败原因就被埋了。
+        let walker_in = walker.roster().my_channel() == id;
+        let maker_sees = maker.roster().users_in(id).iter().any(|u| u.name == "阿伟");
+        if walker_in && maker_sees {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "进频道没同步上：自己那边 {walker_in}，对面那边 {maker_sees}"
+        );
+        let _ = walker_events.recv_timeout(Duration::from_millis(50));
+        let _ = maker_events.recv_timeout(Duration::from_millis(50));
+    }
+}
+
+/// 删掉一个有人在里面的频道，**那个人要被挪回根频道**。
+///
+/// 留在一个不存在的频道里的话，他的语音会被转发到没人收的地方，
+/// 而界面上完全看不出问题 —— 这是最难查的一类。
+#[test]
+fn deleting_a_channel_does_not_strand_the_people_inside() {
+    let server = open_server();
+    let (maker, maker_events) = join(&server, "阿强");
+    let (walker, walker_events) = join(&server, "阿伟");
+    wait_for(&maker_events, |e| matches!(e, Event::Joined { .. }));
+
+    let root = walker.roster().root().expect("没有根频道");
+
+    maker.create_channel("打本", 0);
+    let id = wait_for_channel(&walker, &walker_events, "打本");
+    walker.join_channel(id);
+
+    let deadline = std::time::Instant::now() + WAIT;
+    while walker.roster().my_channel() != id {
+        assert!(std::time::Instant::now() < deadline, "没进去");
+        let _ = walker_events.recv_timeout(Duration::from_millis(100));
+    }
+
+    maker.delete_channel(id);
+
+    let deadline = std::time::Instant::now() + WAIT;
+    loop {
+        let roster = walker.roster();
+        if !roster.channels.contains_key(&id) && roster.my_channel() == root {
+            break;
+        }
+        drop(roster);
+        assert!(
+            std::time::Instant::now() < deadline,
+            "频道删了，但人没被挪回根频道"
+        );
+        let _ = walker_events.recv_timeout(Duration::from_millis(100));
+    }
+    let _ = maker_events;
+}
+
+/// 服务端拒了就是什么都不会发生 —— 客户端不该留下幽灵。
+#[test]
+fn a_refused_creation_leaves_no_ghost_channel() {
+    let server = start(Config {
+        invite_code: Some("letmein".to_string()),
+        ..Config::default()
+    });
+    // 把邀请链接里的码抹掉再连 = 访客，建不了频道。
+    let guest_invite = Invite {
+        code: None,
+        ..server.invite.clone()
+    };
+    let (guest, _events) = Client::connect(
+        &guest_invite.to_url().unwrap(),
+        &Identity::generate().unwrap(),
+        "路人",
+    )
+    .expect("连不上");
+
+    // connect 返回时名单已经从 Welcome 建好了，不用等。
+    let before = guest.roster().channels.len();
+    guest.create_channel("捣乱", 0);
+
+    // 给服务端足够的时间把它忽略掉。
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        guest.roster().channels.len(),
+        before,
+        "被拒之后不该在本地留下一个只有自己看得见的频道"
+    );
+}

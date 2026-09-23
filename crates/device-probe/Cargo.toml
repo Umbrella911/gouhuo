@@ -8,4 +8,4 @@ description = "M2：测 WASAPI 采集/渲染到底吃掉多少延迟，把 DEVIC
 
 [dependencies]
 # APM 和整条链路都要：这个 probe 既量 WASAPI 的设备延迟，也给 APM 逐块计价。
-voice-core.workspace = true
+voice-core = { workspace = true, features = ["pipeline", "apm"] }

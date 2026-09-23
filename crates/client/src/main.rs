@@ -916,6 +916,7 @@ fn refresh(app: &App, client: &Client) {
             is_me: false,
             is_current: node.channel.id == roster.my_channel(),
             count: members.len() as i32,
+            can_delete: roster.can_delete_channel(node.channel.id),
         });
         for user in members {
             rows.push(Row {
@@ -930,6 +931,8 @@ fn refresh(app: &App, client: &Client) {
                 is_me: user.session_id == roster.me,
                 is_current: false,
                 count: 0,
+                // 只对频道有意义。
+                can_delete: false,
             });
         }
     }
@@ -951,6 +954,10 @@ fn refresh(app: &App, client: &Client) {
         app.set_self_deafened(me.self_deafened);
     }
 
+    // 访客建不了频道，那一行就别显示。**这只是画界面** ——
+    // 真正说了算的是服务端，它会把访客的请求直接忽略掉。
+    app.set_can_create_channel(roster.can_create_channel());
+
     app.set_rows(ModelRc::new(VecModel::from(rows)));
     app.set_chat(ModelRc::new(VecModel::from(chat)));
 }
@@ -967,6 +974,27 @@ fn wire_actions(app: &App, state: &Arc<Mutex<State>>) {
         app.on_join_channel(move |id| {
             if let Some(client) = current(&state) {
                 client.join_channel(id as u32);
+            }
+        });
+    }
+
+    {
+        let state = Arc::clone(state);
+        app.on_create_channel(move |name| {
+            if let Some(client) = current(&state) {
+                // 不在本地先插一个再等确认：建成了服务端会广播给所有人
+                // （含自己），名单那边照常处理；被拒就什么都不会发生。
+                // 本地先插的话，被拒时界面上会留一个只有自己看得见的幽灵频道。
+                client.create_channel(&name, 0);
+            }
+        });
+    }
+
+    {
+        let state = Arc::clone(state);
+        app.on_delete_channel(move |id| {
+            if let Some(client) = current(&state) {
+                client.delete_channel(id as u32);
             }
         });
     }

@@ -152,6 +152,8 @@ envelope_from!(
     Authenticate => client_message::Payload::Authenticate,
     Ping => client_message::Payload::Ping,
     JoinChannel => client_message::Payload::JoinChannel,
+    CreateChannel => client_message::Payload::CreateChannel,
+    DeleteChannel => client_message::Payload::DeleteChannel,
     SelfState => client_message::Payload::SelfState,
 );
 

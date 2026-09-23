@@ -21,6 +21,9 @@ export struct Row {
     is-current: bool,
     // 频道里有几个人，显示在右边
     count: int,
+    // 只对频道有意义：我能不能删它。**这只决定画不画那个 ×**，
+    // 真正说了算的是服务端 —— 画错了最多是一个点了没反应的按钮。
+    can-delete: bool,
 }
 
 /// 一次麦克风检测的结果。
@@ -98,6 +101,11 @@ export component App inherits Window {
     in property <string> capture-in-use;
     /// 实际用的是不是虚拟声卡。是的话要提醒 —— 没在路由的虚拟麦是纯静音的。
     in property <bool> capture-is-virtual: false;
+    /// 我能不能建频道（访客不能）。决定显不显示列表底部那一行。
+    in property <bool> can-create-channel: false;
+    /// 「新建频道」那一行有没有展开成输入框。纯界面状态，不出这个文件。
+    property <bool> newchan-open: false;
+    property <string> newchan-name;
     /// 正在挨个试麦克风。
     in property <bool> scanning: false;
     in property <[ScanRow]> scan-results;
@@ -106,6 +114,9 @@ export component App inherits Window {
     callback join();
     callback leave();
     callback join-channel(int);
+    /// 建频道。参数是频道名，界面这边已经 trim 过并挡掉了空串。
+    callback create-channel(string);
+    callback delete-channel(int);
     callback send-text();
     callback toggle-mute();
     callback toggle-deafen();
@@ -296,11 +307,40 @@ export component App inherits Window {
                                     horizontal-stretch: 1;
                                 }
 
-                                if row.is-channel: Text {
+                                if row.is-channel && !(row.can-delete && rowtouch.has-hover): Text {
                                     text: row.count > 0 ? row.count : "";
                                     color: Theme.faint;
                                     font-size: 12px;
                                     vertical-alignment: center;
+                                }
+
+                                // 删频道。**只在鼠标移上来时才出现** ——
+                                // 常驻的话每一行都挂一个红叉，而删频道是低频且
+                                // 不可逆的操作，不该长期占着视觉位置。
+                                if row.is-channel && row.can-delete && rowtouch.has-hover: Rectangle {
+                                    width: 20px;
+                                    height: 20px;
+                                    y: (parent.height - self.height) / 2;
+                                    border-radius: 4px;
+                                    background: delhover.has-hover ? Theme.danger : transparent;
+                                    animate background { duration: 100ms; }
+
+                                    Text {
+                                        text: "×";
+                                        color: delhover.has-hover ? Theme.text : Theme.faint;
+                                        font-size: 15px;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                        width: 100%;
+                                        height: 100%;
+                                    }
+
+                                    delhover := TouchArea {
+                                        mouse-cursor: pointer;
+                                        // 别让这一下顺手把频道也切了 —— TouchArea
+                                        // 会吃掉事件，不会透到下面的 rowtouch。
+                                        clicked => { root.delete-channel(row.id); }
+                                    }
                                 }
                             }
 
@@ -308,6 +348,74 @@ export component App inherits Window {
                                 enabled: row.is-channel;
                                 mouse-cursor: row.is-channel ? pointer : default;
                                 clicked => { root.join-channel(row.id); }
+                            }
+                        }
+
+                        // ---- 新建频道 ----
+                        //
+                        // 平时只是一行浅色的「＋ 新建频道」，点了才变成输入框。
+                        // 常驻一个输入框的话，一个低频操作会一直占着列表底部，
+                        // 而这个列表的主角是频道和人。
+                        if root.can-create-channel && !newchan-open: Rectangle {
+                            height: 30px;
+                            border-radius: 6px;
+                            background: newchan-touch.has-hover ? Theme.hover : transparent;
+                            animate background { duration: 100ms; }
+
+                            HorizontalLayout {
+                                padding-left: 8px;
+                                padding-right: 10px;
+                                Text {
+                                    text: "＋ 新建频道";
+                                    color: newchan-touch.has-hover ? Theme.dim : Theme.faint;
+                                    font-size: 13px;
+                                    vertical-alignment: center;
+                                }
+                            }
+
+                            newchan-touch := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => {
+                                    newchan-open = true;
+                                    newchan-name = "";
+                                }
+                            }
+                        }
+
+                        if root.can-create-channel && newchan-open: HorizontalLayout {
+                            padding-top: 2px;
+                            spacing: 4px;
+
+                            Field {
+                                height: 30px;
+                                placeholder: "频道名";
+                                // 展开的那一刻就把光标放进去 —— 点了「＋」还要
+                                // 再点一次输入框是多余的一步。
+                                //
+                                // 聚焦写在这里而不是「＋」的 clicked 里：那两个
+                                // 分支互相看不见对方的 id（Slint 的 if 各自成域），
+                                // 而这个组件正好是在展开时才被创建的。
+                                init => { self.focus(); }
+                                text <=> newchan-name;
+                                horizontal-stretch: 1;
+                                accepted => {
+                                    // 空名字不发。服务端也会拒，但让它连发都不发
+                                    // 更干脆 —— 用户按回车没反应就知道还没填。
+                                    if (newchan-name != "") {
+                                        root.create-channel(newchan-name);
+                                        newchan-name = "";
+                                        newchan-open = false;
+                                    }
+                                }
+                            }
+                            Btn {
+                                width: 30px;
+                                height: 30px;
+                                label: "✕";
+                                clicked => {
+                                    newchan-open = false;
+                                    newchan-name = "";
+                                }
                             }
                         }
                     }

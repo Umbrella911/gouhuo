@@ -8,8 +8,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use protocol::control::{
-    server_message, Authenticate, Hello, JoinChannel, Ping, SelfState, ServerMessage, TextMessage,
-    Welcome, PROTOCOL_VERSION,
+    server_message, Authenticate, CreateChannel, DeleteChannel, Hello, JoinChannel, Ping, Role,
+    SelfState, ServerMessage, TextMessage, Welcome, PROTOCOL_VERSION,
 };
 use protocol::Invite;
 use rustls::pki_types::ServerName;
@@ -182,6 +182,36 @@ impl Client {
 
     pub fn join_channel(&self, channel_id: u32) {
         self.send(&JoinChannel { channel_id }.into());
+    }
+
+    /// 建一个频道，挂在 `parent_id` 下面（传 0 就是挂根频道下）。
+    ///
+    /// **不在本地先插一个再等确认。** 建成了服务端会广播一条 `ChannelState`
+    /// 给所有人（含自己），名单那边照常处理；没建成就什么都不会发生 ——
+    /// 本地先插的话，被拒时界面上会留一个只有自己看得见的幽灵频道。
+    ///
+    /// 能不能建由服务端按角色决定，见 [`Roster::can_create_channel`]。
+    pub fn create_channel(&self, name: &str, parent_id: u32) {
+        let name = name.trim();
+        if name.is_empty() {
+            return;
+        }
+        self.send(
+            &CreateChannel {
+                parent_id,
+                name: name.to_string(),
+                description: String::new(),
+                max_users: 0,
+                // 不指定门槛：服务端会按建的人自己的角色兜底。
+                min_role: Role::Unspecified as i32,
+            }
+            .into(),
+        );
+    }
+
+    /// 删一个频道。根频道删不掉，服务端会忽略。
+    pub fn delete_channel(&self, channel_id: u32) {
+        self.send(&DeleteChannel { channel_id }.into());
     }
 
     pub fn send_text(&self, body: &str) {

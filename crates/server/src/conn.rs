@@ -493,6 +493,14 @@ fn message_loop(
                 let mut state = hub.state.lock().expect("state poisoned");
                 state.join_channel(peer.session, join.channel_id)
             }
+            Some(client_message::Payload::CreateChannel(req)) => {
+                let mut state = hub.state.lock().expect("state poisoned");
+                state.create_channel(peer.session, req)
+            }
+            Some(client_message::Payload::DeleteChannel(req)) => {
+                let mut state = hub.state.lock().expect("state poisoned");
+                state.delete_channel(peer.session, req.channel_id)
+            }
             Some(client_message::Payload::SelfState(s)) => {
                 let mut state = hub.state.lock().expect("state poisoned");
                 state.set_self_state(peer.session, s.self_muted, s.self_deafened)

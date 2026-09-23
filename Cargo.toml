@@ -21,6 +21,18 @@ license = "GPL-3.0-or-later"
 
 [workspace.dependencies]
 protocol = { path = "crates/protocol" }
+# **工作区这条关掉默认 feature，每个成员自己显式列要什么。**
+#
+# 不是风格选择，是 cargo 的规矩：workspace.dependencies 里的 default-features
+# 说了算 —— 这里不写的话，成员写 `default-features = false` 会被**静默忽略**
+# （cargo 只给一句警告），服务端就白白背上整条音频链路。
+#
+# 代价是成员得把 feature 抄一遍，漏了就编译失败。而且
+# `cargo check --workspace` 因为 feature 统一**看不出来**漏没漏 ——
+# 只有单独 `cargo check -p client` 才炸。改这里之后记得单独 check 一遍。
+#
+# voice-core 自己的 `default` 仍然有意义：它是 MPL 的引擎，给工作区外面
+# 的人用的时候，默认就该是完整的一份。
 voice-core = { path = "crates/voice-core", default-features = false }
 opus = "0.3"
 chacha20poly1305 = "0.10"

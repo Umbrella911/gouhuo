@@ -13,8 +13,8 @@
 use std::collections::BTreeMap;
 
 use protocol::control::{
-    rejected, user_left, Channel, Rejected, Role, ServerMessage, TextMessage, User, UserLeft,
-    UserState, Welcome,
+    rejected, user_left, Channel, ChannelState, CreateChannel, Rejected, Role, ServerMessage,
+    TextMessage, User, UserLeft, UserState, Welcome,
 };
 use protocol::PublicKey;
 
@@ -29,6 +29,29 @@ pub const MAX_TEXT_BYTES: usize = 2000;
 
 /// 昵称长度上限（字节）。
 pub const MAX_NAME_BYTES: usize = 64;
+
+/// 频道名长度上限（字节）。
+pub const MAX_CHANNEL_NAME_BYTES: usize = 64;
+
+/// 频道说明长度上限（字节）。
+pub const MAX_CHANNEL_DESCRIPTION_BYTES: usize = 200;
+
+/// 一个服务器最多几个频道。
+///
+/// 成员就能建频道，所以这是个防滥用的闸 —— 没有它，一个人可以刷满内存，
+/// 而且每建一个都要给所有人广播一次。
+///
+/// 128 对「3–20 人的朋友或公会」是绰绰有余的上限，同时又小到刷不出问题。
+pub const MAX_CHANNELS: usize = 128;
+
+/// 建频道要的最低角色。
+///
+/// 访客不行 —— 没有邀请码进来的人默认就是访客，让他们能建频道等于把
+/// 防滥用的闸打开了。`Role` 的注释里写的就是「成员：能建临时频道」。
+const MIN_ROLE_TO_CREATE_CHANNEL: Role = Role::Member;
+
+/// 删别人建的频道要的最低角色。**建的人自己不受这条限制。**
+const MIN_ROLE_TO_DELETE_OTHERS_CHANNEL: Role = Role::ChannelAdmin;
 
 /// 要发给谁。
 #[derive(Debug, Clone, PartialEq)]
@@ -62,6 +85,20 @@ impl Default for Config {
             admin_keys: Vec::new(),
         }
     }
+}
+
+/// 服务端自己记的频道信息。
+///
+/// 包着线上的 [`Channel`]，外面那层是**不上线**的东西 —— 跟 [`UserInfo`]
+/// 包 [`User`] 是同一个模式。
+#[derive(Debug, Clone)]
+struct ChannelInfo {
+    wire: Channel,
+    /// 谁建的。`None` = 服务器自带的根频道，谁都删不掉。
+    ///
+    /// 记公钥不记 session：session 一断线就没了，而「我建的频道」这件事
+    /// 应该在重连之后还成立。
+    created_by: Option<PublicKey>,
 }
 
 #[derive(Debug, Clone)]
@@ -132,10 +169,12 @@ pub struct Admitted {
 
 pub struct Server {
     config: Config,
-    channels: BTreeMap<ChannelId, Channel>,
+    channels: BTreeMap<ChannelId, ChannelInfo>,
     users: BTreeMap<SessionId, UserInfo>,
     next_session: SessionId,
     root: ChannelId,
+    /// 下一个要发的频道 id。**只增不减**，见 [`Server::next_channel_id`]。
+    next_channel: ChannelId,
 }
 
 impl Server {
@@ -144,14 +183,19 @@ impl Server {
         let mut channels = BTreeMap::new();
         channels.insert(
             root,
-            Channel {
-                id: root,
-                // 根频道的 parent 指向自己 —— 这样遍历树时不需要特判 Option。
-                parent_id: root,
-                name: "大厅".to_string(),
-                description: "默认频道".to_string(),
-                max_users: 0,
-                min_role: Role::Guest as i32,
+            ChannelInfo {
+                wire: Channel {
+                    id: root,
+                    // 根频道的 parent 指向自己 —— 这样遍历树时不需要特判 Option。
+                    parent_id: root,
+                    name: "大厅".to_string(),
+                    description: "默认频道".to_string(),
+                    max_users: 0,
+                    min_role: Role::Guest as i32,
+                    // 空 = 服务器自带，谁都删不掉。
+                    created_by: Vec::new(),
+                },
+                created_by: None,
             },
         );
         Self {
@@ -160,6 +204,8 @@ impl Server {
             users: BTreeMap::new(),
             next_session: 1,
             root,
+            // root 占了 1。
+            next_channel: root + 1,
         }
     }
 
@@ -308,7 +354,7 @@ impl Server {
             role: me.map(|u| u.role as i32).unwrap_or(Role::Guest as i32),
             // 连接层填，它才知道 UDP 监听在哪个端口
             udp_port: 0,
-            channels: self.channels.values().cloned().collect(),
+            channels: self.channels.values().map(|c| c.wire.clone()).collect(),
             users: self.users.values().map(|u| u.to_wire()).collect(),
             current_channel_id: me.map(|u| u.channel_id).unwrap_or(self.root),
         }
@@ -336,7 +382,7 @@ impl Server {
     }
 
     pub fn join_channel(&mut self, session: SessionId, target: ChannelId) -> Vec<Broadcast> {
-        let Some(channel) = self.channels.get(&target) else {
+        let Some(channel) = self.channels.get(&target).map(|c| &c.wire) else {
             // 频道不存在：忽略。客户端的频道树可能刚好过时了一点，
             // 为这个断开连接太粗暴。
             return Vec::new();
@@ -362,6 +408,170 @@ impl Server {
         user.channel_id = target;
         let wire = user.to_wire();
         vec![Broadcast::Everyone(UserState { user: Some(wire) }.into())]
+    }
+
+    /// 建一个频道。
+    ///
+    /// 返回空的广播列表 = 没建成。**不给客户端回错误**，跟 [`Server::join_channel`]
+    /// 一个路子：客户端本来就该按自己的角色把界面画对（建不了就别显示那个按钮），
+    /// 走到这里还被拒说明要么是客户端有 bug、要么是有人在手搓协议 ——
+    /// 这两种都不值得为它设计一条错误消息。
+    ///
+    /// 唯一的例外是建成了：那会广播一条 `ChannelState` 给**所有人**，
+    /// 包括建的人自己。客户端因此不需要本地先插一个再等确认。
+    pub fn create_channel(&mut self, session: SessionId, req: CreateChannel) -> Vec<Broadcast> {
+        // 只抄走需要的两个值，别一路攥着 &self.users —— 下面要 &mut self。
+        let Some((creator_role, creator_key)) =
+            self.users.get(&session).map(|u| (u.role, u.public_key))
+        else {
+            return Vec::new();
+        };
+        if (creator_role as i32) < (MIN_ROLE_TO_CREATE_CHANNEL as i32) {
+            return Vec::new();
+        }
+        if self.channels.len() >= MAX_CHANNELS {
+            return Vec::new();
+        }
+
+        let name = req.name.trim();
+        if name.is_empty() || name.len() > MAX_CHANNEL_NAME_BYTES {
+            return Vec::new();
+        }
+        let description = req.description.trim();
+        if description.len() > MAX_CHANNEL_DESCRIPTION_BYTES {
+            return Vec::new();
+        }
+
+        // 不认识的父频道一律挂到根上。**不是拒绝** —— 客户端的频道树可能刚好
+        // 过时了一点（比如父频道刚被别人删了），为这个让建频道失败没道理。
+        let parent_id = if self.channels.contains_key(&req.parent_id) {
+            req.parent_id
+        } else {
+            self.root
+        };
+
+        // 建频道的人不能造出一个自己都进不去的频道 —— 那是纯粹的误操作，
+        // 而且它会立刻变成一个谁也删不掉、谁也进不去的僵尸（删要么是本人
+        // 要么是频道管理，而本人进不去就不会想起来删）。
+        let min_role = Role::try_from(req.min_role).unwrap_or(Role::Guest);
+        let min_role = if (min_role as i32) > (creator_role as i32) {
+            creator_role
+        } else {
+            min_role
+        };
+
+        let id = self.next_channel_id();
+        let wire = Channel {
+            id,
+            parent_id,
+            name: name.to_string(),
+            description: description.to_string(),
+            max_users: req.max_users,
+            min_role: min_role as i32,
+            created_by: creator_key.0.to_vec(),
+        };
+        self.channels.insert(
+            id,
+            ChannelInfo {
+                wire: wire.clone(),
+                created_by: Some(creator_key),
+            },
+        );
+
+        vec![Broadcast::Everyone(
+            ChannelState {
+                channel: Some(wire),
+                removed: false,
+            }
+            .into(),
+        )]
+    }
+
+    /// 删一个频道。
+    ///
+    /// 里面的人挪回根频道，子频道上提到根频道 —— **不能把人留在一个不存在的
+    /// 频道里**，那样他们的语音会被转发到没人收的地方，而界面上看不出问题。
+    ///
+    /// 广播顺序是先挪人和子频道、最后才是删除本身，这样客户端在任何一个
+    /// 中间状态下都不会引用到一个已经消失的频道 id。
+    pub fn delete_channel(&mut self, session: SessionId, target: ChannelId) -> Vec<Broadcast> {
+        // 根频道删不掉。它的 created_by 是 None，下面的判断本来也会拦住，
+        // 但这条写在最前面是因为理由不一样：根频道是结构性的，不是权限问题。
+        if target == self.root {
+            return Vec::new();
+        }
+        let Some(channel) = self.channels.get(&target) else {
+            return Vec::new();
+        };
+        let Some(user) = self.users.get(&session) else {
+            return Vec::new();
+        };
+
+        let mine = channel.created_by == Some(user.public_key);
+        let senior = (user.role as i32) >= (MIN_ROLE_TO_DELETE_OTHERS_CHANNEL as i32);
+        if !mine && !senior {
+            return Vec::new();
+        }
+
+        let mut out = Vec::new();
+
+        // 子频道上提到根。
+        let orphans: Vec<ChannelId> = self
+            .channels
+            .values()
+            .filter(|c| c.wire.parent_id == target && c.wire.id != target)
+            .map(|c| c.wire.id)
+            .collect();
+        for id in orphans {
+            let info = self.channels.get_mut(&id).expect("just listed");
+            info.wire.parent_id = self.root;
+            out.push(Broadcast::Everyone(
+                ChannelState {
+                    channel: Some(info.wire.clone()),
+                    removed: false,
+                }
+                .into(),
+            ));
+        }
+
+        // 里面的人挪回根频道。
+        let stranded = self.sessions_in_channel(target);
+        for id in stranded {
+            let user = self.users.get_mut(&id).expect("just listed");
+            user.channel_id = self.root;
+            out.push(Broadcast::Everyone(
+                UserState {
+                    user: Some(user.to_wire()),
+                }
+                .into(),
+            ));
+        }
+
+        let removed = self.channels.remove(&target).expect("just checked");
+        out.push(Broadcast::Everyone(
+            ChannelState {
+                channel: Some(removed.wire),
+                removed: true,
+            }
+            .into(),
+        ));
+        out
+    }
+
+    /// 下一个没被用过的频道 id。
+    ///
+    /// **不用「最大值 + 1」**：频道会被删，那样算出来的 id 在删掉最后一个之后
+    /// 会被重新发出去，而客户端手里可能还攥着旧的那个 id（比如一条刚发出去的
+    /// JoinChannel）。从 1 往上找第一个空位也有同样的问题，但配合单调递增的
+    /// `next_channel` 游标就没有 —— 游标只增不减。
+    fn next_channel_id(&mut self) -> ChannelId {
+        loop {
+            let id = self.next_channel;
+            self.next_channel = self.next_channel.wrapping_add(1).max(1);
+            if !self.channels.contains_key(&id) {
+                return id;
+            }
+        }
     }
 
     pub fn set_self_state(
@@ -455,6 +665,38 @@ mod tests {
 
     fn admit(server: &mut Server, k: u8, name: &str) -> SessionId {
         server.admit(key(k), "", name).unwrap().session_id
+    }
+
+    /// 开一个设了邀请码的服务器。给错码进来的人就是访客。
+    fn open_gated_server() -> Server {
+        Server::new(Config {
+            invite_code: Some("letmein".to_string()),
+            ..Config::default()
+        })
+    }
+
+    fn create(server: &mut Server, session: SessionId, name: &str) -> Vec<Broadcast> {
+        server.create_channel(
+            session,
+            CreateChannel {
+                name: name.to_string(),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// 从一串广播里把新建频道的 id 抠出来。
+    fn created_id(broadcasts: &[Broadcast]) -> ChannelId {
+        use protocol::control::server_message::Payload;
+        broadcasts
+            .iter()
+            .find_map(|b| match b {
+                Broadcast::Everyone(ServerMessage {
+                    payload: Some(Payload::ChannelState(cs)),
+                }) if !cs.removed => cs.channel.as_ref().map(|c| c.id),
+                _ => None,
+            })
+            .expect("广播里没有新建的频道")
     }
 
     #[test]
@@ -709,5 +951,274 @@ mod tests {
 
         server.disconnect(b);
         assert_eq!(server.sessions_in_channel(root), vec![a]);
+    }
+
+    // ======================================================================
+    // 多频道
+    // ======================================================================
+
+    #[test]
+    fn a_member_can_create_a_channel_and_everyone_hears_about_it() {
+        let mut server = open_server();
+        let me = admit(&mut server, 1, "阿强");
+
+        let out = create(&mut server, me, "打本");
+        let id = created_id(&out);
+        assert_ne!(id, server.root_channel(), "新频道不能跟根频道撞 id");
+
+        // 广播给所有人，**包括建的人自己** —— 客户端因此不用本地先插一个。
+        assert!(matches!(out.as_slice(), [Broadcast::Everyone(_)]));
+
+        let welcome = server.welcome_for(me);
+        assert_eq!(welcome.channels.len(), 2);
+        let made = welcome.channels.iter().find(|c| c.id == id).unwrap();
+        assert_eq!(made.name, "打本");
+        assert_eq!(
+            made.parent_id,
+            server.root_channel(),
+            "没指定父频道就挂根上"
+        );
+    }
+
+    #[test]
+    fn a_guest_cannot_create_a_channel() {
+        let mut server = open_gated_server();
+        // 码给错了 -> 访客
+        let guest = server.admit(key(1), "wrong", "路人").unwrap();
+        assert_eq!(guest.welcome.role, Role::Guest as i32);
+
+        assert!(
+            create(&mut server, guest.session_id, "捣乱").is_empty(),
+            "访客不该能建频道 —— 没有邀请码谁都能进，那等于把防滥用的闸打开"
+        );
+        assert_eq!(server.welcome_for(0).channels.len(), 1);
+    }
+
+    #[test]
+    fn an_empty_or_oversized_name_is_refused() {
+        let mut server = open_server();
+        let me = admit(&mut server, 1, "阿强");
+
+        assert!(create(&mut server, me, "   ").is_empty(), "空名字要拒");
+        let long = "啊".repeat(MAX_CHANNEL_NAME_BYTES);
+        assert!(create(&mut server, me, &long).is_empty(), "超长名字要拒");
+        assert_eq!(server.welcome_for(0).channels.len(), 1);
+    }
+
+    #[test]
+    fn the_name_is_trimmed() {
+        let mut server = open_server();
+        let me = admit(&mut server, 1, "阿强");
+        let id = created_id(&create(&mut server, me, "  打本  "));
+        let welcome = server.welcome_for(me);
+        let made = welcome.channels.iter().find(|c| c.id == id).unwrap();
+        assert_eq!(made.name, "打本");
+    }
+
+    #[test]
+    fn channel_count_is_capped() {
+        let mut server = open_server();
+        let me = admit(&mut server, 1, "阿强");
+        // 根频道占掉一个名额。
+        for i in 1..MAX_CHANNELS {
+            assert!(
+                !create(&mut server, me, &format!("频道{i}")).is_empty(),
+                "第 {i} 个就建不出来了，上限是 {MAX_CHANNELS}"
+            );
+        }
+        assert!(
+            create(&mut server, me, "再来一个").is_empty(),
+            "到上限了还能建 —— 成员就能建频道，没有这个闸一个人能刷满内存"
+        );
+    }
+
+    /// 建频道的人不能造出一个自己都进不去的频道。
+    #[test]
+    fn you_cannot_lock_yourself_out_of_your_own_channel() {
+        let mut server = open_server();
+        let me = admit(&mut server, 1, "阿强");
+        assert_eq!(server.welcome_for(me).role, Role::Member as i32);
+
+        let out = server.create_channel(
+            me,
+            CreateChannel {
+                name: "管理层".to_string(),
+                min_role: Role::Admin as i32,
+                ..Default::default()
+            },
+        );
+        let id = created_id(&out);
+        let welcome = server.welcome_for(me);
+        let made = welcome.channels.iter().find(|c| c.id == id).unwrap();
+        assert_eq!(
+            made.min_role,
+            Role::Member as i32,
+            "门槛该被压到建的人自己的角色 —— 否则这是个谁也进不去、本人也不会想起来删的僵尸频道"
+        );
+
+        // 而且他真的能进去。
+        assert!(!server.join_channel(me, id).is_empty());
+        assert_eq!(server.channel_of(me), Some(id));
+    }
+
+    #[test]
+    fn the_creator_can_delete_their_own_channel() {
+        let mut server = open_server();
+        let me = admit(&mut server, 1, "阿强");
+        let id = created_id(&create(&mut server, me, "打本"));
+
+        let out = server.delete_channel(me, id);
+        assert!(!out.is_empty(), "建的人该能删掉自己建的");
+        assert_eq!(server.welcome_for(me).channels.len(), 1);
+    }
+
+    #[test]
+    fn a_member_cannot_delete_someone_elses_channel() {
+        let mut server = open_server();
+        let mine = admit(&mut server, 1, "阿强");
+        let other = admit(&mut server, 2, "阿伟");
+        let id = created_id(&create(&mut server, mine, "打本"));
+
+        assert!(
+            server.delete_channel(other, id).is_empty(),
+            "普通成员不该能删别人建的频道"
+        );
+        assert_eq!(server.welcome_for(mine).channels.len(), 2);
+    }
+
+    #[test]
+    fn an_admin_can_delete_anyones_channel() {
+        let mut server = Server::new(Config {
+            admin_keys: vec![key(9)],
+            ..Config::default()
+        });
+        let member = admit(&mut server, 1, "阿强");
+        let admin = admit(&mut server, 9, "管理员");
+        assert_eq!(server.welcome_for(admin).role, Role::Admin as i32);
+
+        let id = created_id(&create(&mut server, member, "打本"));
+        assert!(!server.delete_channel(admin, id).is_empty());
+        assert_eq!(server.welcome_for(admin).channels.len(), 1);
+    }
+
+    #[test]
+    fn the_root_channel_cannot_be_deleted() {
+        let mut server = Server::new(Config {
+            admin_keys: vec![key(9)],
+            ..Config::default()
+        });
+        let admin = admit(&mut server, 9, "管理员");
+        let root = server.root_channel();
+        assert!(
+            server.delete_channel(admin, root).is_empty(),
+            "连管理员也不该能删根频道 —— 那是结构性的，不是权限问题"
+        );
+        assert_eq!(server.welcome_for(admin).channels.len(), 1);
+    }
+
+    /// **删频道不能把人留在一个不存在的频道里。**
+    ///
+    /// 留在那儿的话他的语音会被转发到没人收的地方，而界面上看不出任何问题。
+    #[test]
+    fn deleting_a_channel_moves_the_people_inside_back_to_root() {
+        let mut server = open_server();
+        let owner = admit(&mut server, 1, "阿强");
+        let other = admit(&mut server, 2, "阿伟");
+
+        let id = created_id(&create(&mut server, owner, "打本"));
+        server.join_channel(other, id);
+        assert_eq!(server.channel_of(other), Some(id));
+
+        server.delete_channel(owner, id);
+        assert_eq!(
+            server.channel_of(other),
+            Some(server.root_channel()),
+            "频道没了，里面的人要被挪回根频道"
+        );
+    }
+
+    #[test]
+    fn deleting_a_parent_lifts_its_children_to_root() {
+        let mut server = open_server();
+        let me = admit(&mut server, 1, "阿强");
+
+        let parent = created_id(&create(&mut server, me, "公会"));
+        let child = created_id(&server.create_channel(
+            me,
+            CreateChannel {
+                parent_id: parent,
+                name: "打本".to_string(),
+                ..Default::default()
+            },
+        ));
+
+        server.delete_channel(me, parent);
+        let welcome = server.welcome_for(me);
+        let kid = welcome.channels.iter().find(|c| c.id == child);
+        assert!(kid.is_some(), "子频道不该跟着父频道一起消失");
+        assert_eq!(
+            kid.unwrap().parent_id,
+            server.root_channel(),
+            "子频道要上提到根，否则它挂在一个不存在的父节点上"
+        );
+    }
+
+    /// 频道 id 不能被回收 —— 客户端手里可能还攥着刚发出去的旧 id。
+    #[test]
+    fn channel_ids_are_not_reused_after_deletion() {
+        let mut server = open_server();
+        let me = admit(&mut server, 1, "阿强");
+
+        let first = created_id(&create(&mut server, me, "第一个"));
+        server.delete_channel(me, first);
+        let second = created_id(&create(&mut server, me, "第二个"));
+        assert_ne!(second, first, "删掉之后 id 不该被重新发出去");
+    }
+
+    /// 不认识的父频道挂到根上，**不是拒绝**。
+    #[test]
+    fn an_unknown_parent_falls_back_to_root_instead_of_failing() {
+        let mut server = open_server();
+        let me = admit(&mut server, 1, "阿强");
+        let out = server.create_channel(
+            me,
+            CreateChannel {
+                parent_id: 9999,
+                name: "打本".to_string(),
+                ..Default::default()
+            },
+        );
+        let id = created_id(&out);
+        let welcome = server.welcome_for(me);
+        let made = welcome.channels.iter().find(|c| c.id == id).unwrap();
+        assert_eq!(
+            made.parent_id,
+            server.root_channel(),
+            "客户端的频道树可能刚好过时了一点，为这个让建频道失败没道理"
+        );
+    }
+
+    #[test]
+    fn min_role_still_gates_who_can_enter() {
+        let mut server = Server::new(Config {
+            invite_code: Some("letmein".to_string()),
+            admin_keys: vec![key(9)],
+            ..Config::default()
+        });
+        let admin = admit(&mut server, 9, "管理员");
+        let guest = server.admit(key(1), "wrong", "路人").unwrap().session_id;
+
+        let id = created_id(&server.create_channel(
+            admin,
+            CreateChannel {
+                name: "成员专用".to_string(),
+                min_role: Role::Member as i32,
+                ..Default::default()
+            },
+        ));
+
+        assert!(server.join_channel(guest, id).is_empty(), "访客进不去");
+        assert_eq!(server.channel_of(guest), Some(server.root_channel()));
+        assert!(!server.join_channel(admin, id).is_empty(), "管理员进得去");
     }
 }
