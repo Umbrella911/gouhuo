@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! 单独试麦：只开采集和播放，**完全不碰网络**。
 //!
