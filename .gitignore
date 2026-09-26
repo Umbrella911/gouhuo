@@ -6,10 +6,14 @@
 /.cargo/config.toml
 
 # 服务端运行时的数据目录。**里面有 TLS 私钥。**
-# 默认叫 kaimai-data，在仓库里跑一下服务端就会生成。
-/kaimai-data
+# 默认叫 gouhuo-data，在仓库里跑一下服务端就会生成。
+#
+# `/*-data` 这条通配是故意的：改过一次默认目录名（kaimai-data -> gouhuo-data），
+# 而只写死一个名字的话，改名那天这个 ignore 就悄悄失效了 —— 私钥会被提交进去。
+# 这不是假想：kaimai-data/server.key.der 真的进过一次历史，后来要重写历史才清掉。
+/gouhuo-data
 /*-data
 
-# 客户端的身份和设置（正常在 %APPDATA%，但 KAIMAI_DATA 指到别处时会落这儿）
+# 客户端的身份和设置（正常在 %APPDATA%\gouhuo，但数据目录指到别处时会落这儿）
 identity.key
 settings.txt
