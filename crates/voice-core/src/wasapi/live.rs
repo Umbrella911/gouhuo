@@ -542,8 +542,10 @@ mod tests {
         let mut out = Vec::new();
         upmix_into(&[0.5, -0.5], 2, &format(2, true), &mut out);
         let samples: Vec<f32> = out
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
             .collect();
         assert_eq!(samples, vec![0.5, 0.5, -0.5, -0.5]);
     }
@@ -555,8 +557,10 @@ mod tests {
         let mut out = Vec::new();
         upmix_into(&[2.0, -2.0], 1, &format(1, false), &mut out);
         let samples: Vec<i16> = out
-            .chunks_exact(2)
-            .map(|b| i16::from_le_bytes(b.try_into().unwrap()))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| i16::from_le_bytes(*b))
             .collect();
         assert_eq!(samples, vec![i16::MAX, -i16::MAX]);
     }
