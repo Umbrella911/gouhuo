@@ -51,7 +51,7 @@ const CHECKSUM_LEN: usize = 2;
 const HEADER_LEN: usize = 1 + 1 + Fingerprint::LEN + 2 + 1;
 
 /// 链接形式的前缀。纯文本形式（不带前缀的那串 base32）也一样能解析。
-pub const URL_PREFIX: &str = "kaimai://j/";
+pub const URL_PREFIX: &str = "gouhuo://j/";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Invite {
@@ -109,7 +109,7 @@ impl core::fmt::Display for InviteError {
 impl std::error::Error for InviteError {}
 
 impl Invite {
-    /// 编成可粘贴的纯文本（不带 `kaimai://j/` 前缀）。
+    /// 编成可粘贴的纯文本（不带 `gouhuo://j/` 前缀）。
     pub fn to_code(&self) -> Result<String, InviteError> {
         Ok(base32::encode(&self.to_bytes()?))
     }
@@ -119,7 +119,7 @@ impl Invite {
         Ok(format!("{URL_PREFIX}{}", self.to_code()?))
     }
 
-    /// 两种形式都吃：`kaimai://j/xxxx` 和光秃秃的 `xxxx`。
+    /// 两种形式都吃：`gouhuo://j/xxxx` 和光秃秃的 `xxxx`。
     ///
     /// 前后的空白、中间的连字符和换行都会被忽略 —— 从聊天记录里复制什么样的都有。
     pub fn parse(text: &str) -> Result<Self, InviteError> {
@@ -297,7 +297,7 @@ mod tests {
             format!("{}\n{}", &code[..10], &code[10..]), // 折行
             code.to_uppercase(),                         // 自动首字母大写之类
             format!("{}-{}", &code[..8], &code[8..]),    // 用户自己加分隔符
-            format!("KAIMAI://J/{code}"),                // 前缀被大写
+            format!("GOUHUO://J/{code}"),                // 前缀被大写
         ] {
             assert_eq!(
                 Invite::parse(&mangled).unwrap(),
@@ -360,7 +360,7 @@ mod tests {
             "随便一串东西",
             "你发我的那个码呢？",
             "🎮开黑",
-            "kaimai://j/中文",
+            "gouhuo://j/中文",
         ] {
             assert!(
                 Invite::parse(text).is_err(),

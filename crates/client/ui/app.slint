@@ -48,7 +48,7 @@ export struct ChatRow {
 }
 
 export component App inherits Window {
-    title: "开麦";
+    title: "篝火";
     background: Theme.bg;
     default-font-family: Theme.font;
     min-width: 720px;
@@ -64,7 +64,7 @@ export component App inherits Window {
     in property <string> error-headline;
     in property <string> error-advice;
 
-    in property <string> server-name: "开麦";
+    in property <string> server-name: "篝火";
     in property <string> my-fingerprint;
     in property <[Row]> rows;
     in property <[ChatRow]> chat;
@@ -144,7 +144,7 @@ export component App inherits Window {
             alignment: center;
 
             Text {
-                text: "开麦";
+                text: "篝火";
                 color: Theme.text;
                 font-size: 30px;
                 font-weight: 600;
@@ -160,7 +160,7 @@ export component App inherits Window {
             VerticalLayout {
                 spacing: 10px;
                 link := Field {
-                    placeholder: "kaimai://j/…";
+                    placeholder: "gouhuo://j/…";
                     text <=> root.invite-link;
                     accepted => { root.join(); }
                 }

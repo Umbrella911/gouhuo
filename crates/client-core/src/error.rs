@@ -29,8 +29,8 @@ pub enum ConnectError {
         reason: protocol::control::rejected::Reason,
         detail: String,
     },
-    /// 连上了，但对面说的话我们听不懂 —— 大概率不是开麦服务端。
-    NotAKaimaiServer,
+    /// 连上了，但对面说的话我们听不懂 —— 大概率不是篝火服务端。
+    NotAGouhuoServer,
     /// 连接中途断了。
     Io(std::io::Error),
 }
@@ -56,7 +56,7 @@ impl ConnectError {
                 _ if !detail.is_empty() => detail.clone(),
                 _ => "服务器拒绝了这次连接".into(),
             },
-            ConnectError::NotAKaimaiServer => "对面不是开麦服务器".into(),
+            ConnectError::NotAGouhuoServer => "对面不是篝火服务器".into(),
             ConnectError::Io(_) => "连接断了".into(),
         }
     }
@@ -83,7 +83,7 @@ impl ConnectError {
                 )
             }
             ConnectError::Tls(detail) => {
-                format!("{detail}\n对面可能不是开麦服务器，或者版本差太远。")
+                format!("{detail}\n对面可能不是篝火服务器，或者版本差太远。")
             }
             ConnectError::Rejected { reason, detail } => match reason {
                 Reason::InviteRequired => {
@@ -98,7 +98,7 @@ impl ConnectError {
                     .into(),
                 _ => detail.clone(),
             },
-            ConnectError::NotAKaimaiServer => {
+            ConnectError::NotAGouhuoServer => {
                 "这个地址和端口上跑的是别的东西。确认一下链接有没有搞错。".into()
             }
             ConnectError::Io(_) => "网络断了或者服务器关了。过一会儿重连试试。".into(),
@@ -139,7 +139,7 @@ mod tests {
             },
             ConnectError::WrongCertificate("指纹对不上".into()),
             ConnectError::Tls("握手失败".into()),
-            ConnectError::NotAKaimaiServer,
+            ConnectError::NotAGouhuoServer,
             ConnectError::Io(std::io::Error::other("x")),
         ];
         let rejections = [

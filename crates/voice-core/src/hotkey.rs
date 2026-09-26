@@ -111,7 +111,7 @@ impl Hotkeys {
         let (ready_tx, ready_rx) = mpsc::channel();
         let thread_shared = Arc::clone(&shared);
         let thread = std::thread::Builder::new()
-            .name("kaimai-hotkeys".into())
+            .name("gouhuo-hotkeys".into())
             .spawn(move || platform::run(thread_shared, ready_tx))?;
 
         // 等线程真的把窗口建起来 —— 建不起来要在这里就报错，
@@ -323,7 +323,7 @@ mod platform {
     }
 
     fn create_window() -> std::io::Result<HWND> {
-        let class_name: Vec<u16> = "kaimai_hotkeys\0".encode_utf16().collect();
+        let class_name: Vec<u16> = "gouhuo_hotkeys\0".encode_utf16().collect();
         let instance = unsafe { GetModuleHandleW(None) }
             .map_err(|e| std::io::Error::other(format!("拿不到模块句柄：{e}")))?;
 

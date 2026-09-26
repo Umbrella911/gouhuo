@@ -1,7 +1,7 @@
 # `webrtc-audio-processing` 在 Windows/MSVC 上编不过：诊断与补丁
 
 > **状态：已解决。** `third_party/webrtc-audio-processing-sys/` 是打过补丁的副本，
-> 七处补丁全部用 `kaimai patch:` 标出来了。环境准备用
+> 七处补丁全部用 `gouhuo patch:` 标出来了。环境准备用
 > [`scripts/win-buildenv.ps1`](../scripts/win-buildenv.ps1)。
 > 下面是完整诊断 —— 留着是为了把补丁提给上游时有据可依，
 > 以及以后有人问"为什么仓库里躺着 5 MB 第三方 C++ 源码"时能有个答案。
@@ -115,7 +115,7 @@ crate 的 out 目录本身就吃掉 ~100 字符
 而从 PowerShell 跑 cargo 时通常不在。
 
 （**缺口是六个，补丁是七处** —— 这一个缺口花了两处修改：`cp -a` 换成了
-`build.rs` 里自己写的递归拷贝，见 `kaimai patch: 7`。装了 Git 的机器上
+`build.rs` 里自己写的递归拷贝，见 `gouhuo patch: 7`。装了 Git 的机器上
 碰巧有 `cp`，但那是个不该依赖的巧合：它在不在 PATH 上取决于用户装 Git
 时选了哪个选项。）
 

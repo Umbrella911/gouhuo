@@ -34,7 +34,7 @@ use protocol::Fingerprint;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
 /// 证书里写的名字。客户端根本不看它（固定的是指纹），但 TLS 要求有。
-const SUBJECT_NAME: &str = "kaimai";
+const SUBJECT_NAME: &str = "gouhuo";
 
 /// 有效期。见模块文档：长是刻意的。
 const VALID_YEARS: i32 = 50;
@@ -125,7 +125,7 @@ mod tests {
 
     fn temp_dir(name: &str) -> std::path::PathBuf {
         let mut p = std::env::temp_dir();
-        p.push(format!("kaimai-cert-{name}-{}", std::process::id()));
+        p.push(format!("gouhuo-cert-{name}-{}", std::process::id()));
         p
     }
 

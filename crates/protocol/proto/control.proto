@@ -15,7 +15,7 @@
 
 syntax = "proto3";
 
-package kaimai.control.v1;
+package gouhuo.control.v1;
 
 // ===========================================================================
 // 角色
@@ -47,7 +47,7 @@ enum Role {
 message Hello {
   // 控制面协议版本。跟客户端版本号是两回事 —— 这个只在协议格式变了才动。
   uint32 protocol_version = 1;
-  // 给人看的客户端版本，比如 "kaimai 0.1.0"。只用来排查问题，不参与任何判断。
+  // 给人看的客户端版本，比如 "gouhuo 0.1.0"。只用来排查问题，不参与任何判断。
   string client_version = 2;
   // Ed25519 公钥，32 字节。这就是用户身份，没有账号密码。
   bytes public_key = 3;

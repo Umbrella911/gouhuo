@@ -33,5 +33,5 @@ pub use roster::{ChannelNode, ChatLine, Roster, MAX_CHAT_LINES};
 
 /// 报给服务端的客户端版本。只用来排查问题，不参与任何判断。
 pub fn client_version() -> String {
-    format!("kaimai {}", env!("CARGO_PKG_VERSION"))
+    format!("gouhuo {}", env!("CARGO_PKG_VERSION"))
 }

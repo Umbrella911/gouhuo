@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! 开麦服务端。
+//! 篝火服务端。
 //!
 //! 分成两层，分界线是「有没有 IO」：
 //!
@@ -43,7 +43,7 @@ pub fn accept_loop(
         let tls_config = Arc::clone(&tls_config);
         let hub = Arc::clone(&hub);
         let spawned = std::thread::Builder::new()
-            .name("kaimai-conn".into())
+            .name("gouhuo-conn".into())
             .spawn(move || {
                 if let Err(e) = conn::serve_connection(sock, tls_config, hub) {
                     // 连接出错是日常（网线拔了、客户端崩了），记一行就行。
@@ -61,7 +61,7 @@ pub fn accept_loop(
 /// 起看门狗线程。见 [`conn`] 的模块文档：超时不靠读超时，靠这个。
 pub fn spawn_watchdog(hub: Arc<conn::Hub>, interval: std::time::Duration) -> io::Result<()> {
     std::thread::Builder::new()
-        .name("kaimai-sweep".into())
+        .name("gouhuo-sweep".into())
         .spawn(move || loop {
             std::thread::sleep(interval);
             hub.sweep_idle();

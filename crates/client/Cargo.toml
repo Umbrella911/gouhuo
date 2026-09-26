@@ -4,10 +4,10 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "开麦客户端。"
+description = "篝火客户端。"
 
 [[bin]]
-name = "kaimai"
+name = "gouhuo"
 path = "src/main.rs"
 
 [dependencies]

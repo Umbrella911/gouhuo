@@ -101,7 +101,7 @@ impl Client {
             Arc::new(client_config(invite.cert).map_err(|e| ConnectError::Tls(e.to_string()))?);
         // 服务端证书是自签的，主机名不参与判断（我们固定的是证书本身），
         // 所以这里放什么都行。放一个固定的常量，免得给人「换个名字就能绕过」的错觉。
-        let name = ServerName::try_from("kaimai").expect("常量，不会失败");
+        let name = ServerName::try_from("gouhuo").expect("常量，不会失败");
         let mut conn = rustls::ClientConnection::new(config, name)
             .map_err(|e| ConnectError::Tls(e.to_string()))?;
 
@@ -259,7 +259,7 @@ impl Client {
     fn spawn_reader(&self, mut reader: Reader, tx: Sender<Event>) {
         let roster = Arc::clone(&self.roster);
         std::thread::Builder::new()
-            .name("kaimai-client-read".into())
+            .name("gouhuo-client-read".into())
             .spawn(move || {
                 let reason = loop {
                     match reader.next::<ServerMessage>() {
@@ -283,7 +283,7 @@ impl Client {
     fn spawn_heartbeat(&self) {
         let client = self.clone();
         std::thread::Builder::new()
-            .name("kaimai-client-ping".into())
+            .name("gouhuo-client-ping".into())
             .spawn(move || loop {
                 std::thread::sleep(HEARTBEAT);
                 // 连接断了之后 send 是空操作，这个线程会自己空转到进程结束。
@@ -410,8 +410,8 @@ fn authenticate(
     let nonce = match reader.next::<ServerMessage>()?.and_then(|m| m.payload) {
         Some(server_message::Payload::Challenge(c)) => c.nonce,
         Some(server_message::Payload::Rejected(r)) => return Err(rejected(r)),
-        // 对面回了个我们看不懂的东西 —— 多半根本不是开麦服务端
-        _ => return Err(ConnectError::NotAKaimaiServer),
+        // 对面回了个我们看不懂的东西 —— 多半根本不是篝火服务端
+        _ => return Err(ConnectError::NotAGouhuoServer),
     };
 
     {
@@ -426,7 +426,7 @@ fn authenticate(
     match reader.next::<ServerMessage>()?.and_then(|m| m.payload) {
         Some(server_message::Payload::Welcome(w)) => Ok(w),
         Some(server_message::Payload::Rejected(r)) => Err(rejected(r)),
-        _ => Err(ConnectError::NotAKaimaiServer),
+        _ => Err(ConnectError::NotAGouhuoServer),
     }
 }
 

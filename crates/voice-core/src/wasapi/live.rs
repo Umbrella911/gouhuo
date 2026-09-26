@@ -114,7 +114,7 @@ fn wrong_rate(format: &Format, which: &str) -> io::Error {
     io::Error::other(format!(
         "{which}设备现在是 {} Hz，而且自动转换没生效。\n\
          去 Windows 设置 → 系统 → 声音 → 设备属性 → 高级，把格式改成 48000 Hz，\n\
-         然后重开开麦。",
+         然后重开篝火。",
         format.sample_rate
     ))
 }

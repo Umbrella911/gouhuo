@@ -145,7 +145,7 @@ mod tests {
         let other = crate::ServerCert::generate().unwrap();
 
         let verifier = PinnedServerCert::new(cert.fingerprint(), provider);
-        let name = ServerName::try_from("kaimai").unwrap();
+        let name = ServerName::try_from("gouhuo").unwrap();
         let now = UnixTime::since_unix_epoch(std::time::Duration::from_secs(1_800_000_000));
 
         assert!(verifier
@@ -167,7 +167,7 @@ mod tests {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let cert = crate::ServerCert::generate().unwrap();
         let verifier = PinnedServerCert::new(cert.fingerprint(), provider);
-        let name = ServerName::try_from("kaimai").unwrap();
+        let name = ServerName::try_from("gouhuo").unwrap();
 
         // 一个远在证书有效期之后的时间点
         let far_future = UnixTime::since_unix_epoch(std::time::Duration::from_secs(4_000_000_000));

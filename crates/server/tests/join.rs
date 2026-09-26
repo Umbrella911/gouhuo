@@ -72,7 +72,7 @@ impl Client {
     fn connect_as(server: &TestServer, identity: Identity) -> Self {
         let config = Arc::new(client_config(server.fingerprint).unwrap());
         let mut conn =
-            ClientConnection::new(config, ServerName::try_from("kaimai").unwrap()).unwrap();
+            ClientConnection::new(config, ServerName::try_from("gouhuo").unwrap()).unwrap();
         let mut sock = TcpStream::connect(server.addr).unwrap();
         conn.complete_io(&mut sock).expect("TLS 握手失败");
         sock.set_read_timeout(Some(RECV_TIMEOUT)).unwrap();
@@ -137,7 +137,7 @@ impl Client {
     fn login(&mut self, code: &str, name: &str) -> Result<Welcome, Rejected> {
         self.send(Hello {
             protocol_version: PROTOCOL_VERSION,
-            client_version: "kaimai test".into(),
+            client_version: "gouhuo test".into(),
             public_key: self.identity.public_key().0.to_vec(),
         });
         self.finish_login(code, name, true)
@@ -265,7 +265,7 @@ fn bad_signature_is_rejected() {
     // 拿着受害者的公钥打招呼……
     attacker.send(Hello {
         protocol_version: PROTOCOL_VERSION,
-        client_version: "kaimai test".into(),
+        client_version: "gouhuo test".into(),
         public_key: victim.public_key().0.to_vec(),
     });
     // ……但签名是别的私钥签的

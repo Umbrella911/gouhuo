@@ -302,7 +302,7 @@ impl Pipeline {
             let key = cfg.upstream_key;
             let server = cfg.server;
             let mode = Arc::clone(&mode);
-            threads.push(spawn("kaimai-voice-send", move || {
+            threads.push(spawn("gouhuo-voice-send", move || {
                 send_loop(
                     &mut *capture,
                     processor,
@@ -327,7 +327,7 @@ impl Pipeline {
             let shared = Arc::clone(&shared);
             let key = cfg.downstream_key;
             let server = cfg.server;
-            threads.push(spawn("kaimai-voice-recv", move || {
+            threads.push(spawn("gouhuo-voice-recv", move || {
                 recv_loop(socket, &stop, &shared, key, server, jitter_frames);
             })?);
         }
@@ -338,7 +338,7 @@ impl Pipeline {
             let deafened = Arc::clone(&deafened);
             let shared = Arc::clone(&shared);
             let processor = processor.clone();
-            threads.push(spawn("kaimai-voice-play", move || {
+            threads.push(spawn("gouhuo-voice-play", move || {
                 play_loop(&mut *render, processor, &stop, &deafened, &shared);
             })?);
         }
@@ -351,7 +351,7 @@ impl Pipeline {
             let key = cfg.upstream_key;
             let server = cfg.server;
             let shared = Arc::clone(&shared);
-            threads.push(spawn("kaimai-voice-keepalive", move || {
+            threads.push(spawn("gouhuo-voice-keepalive", move || {
                 keepalive_loop(socket, &stop, &shared, session_id, key, server);
             })?);
         }

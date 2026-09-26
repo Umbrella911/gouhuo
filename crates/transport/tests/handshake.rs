@@ -66,7 +66,7 @@ struct ServerOutcome {
 fn client_hello() -> ClientMessage {
     Hello {
         protocol_version: PROTOCOL_VERSION,
-        client_version: "kaimai test".into(),
+        client_version: "gouhuo test".into(),
         public_key: vec![9u8; 32],
     }
     .into()
@@ -82,7 +82,7 @@ fn pinned_handshake_succeeds_and_both_sides_agree_on_the_voice_key() {
     let server = serve(listener, cert);
 
     let config = Arc::new(client_config(fingerprint).unwrap());
-    let mut conn = ClientConnection::new(config, ServerName::try_from("kaimai").unwrap()).unwrap();
+    let mut conn = ClientConnection::new(config, ServerName::try_from("gouhuo").unwrap()).unwrap();
     let mut sock = TcpStream::connect(addr).unwrap();
     conn.complete_io(&mut sock)
         .expect("指纹对得上，握手不该失败");
@@ -132,7 +132,7 @@ fn wrong_fingerprint_aborts_the_handshake() {
     // 客户端拿着另一张证书的指纹
     let wrong = ServerCert::generate().unwrap().fingerprint();
     let config = Arc::new(client_config(wrong).unwrap());
-    let mut conn = ClientConnection::new(config, ServerName::try_from("kaimai").unwrap()).unwrap();
+    let mut conn = ClientConnection::new(config, ServerName::try_from("gouhuo").unwrap()).unwrap();
     let mut sock = TcpStream::connect(addr).unwrap();
 
     let err = conn
@@ -164,7 +164,7 @@ fn different_connections_derive_different_keys() {
 
         let client = Arc::new(client_config(cert.fingerprint()).unwrap());
         let mut conn =
-            ClientConnection::new(client, ServerName::try_from("kaimai").unwrap()).unwrap();
+            ClientConnection::new(client, ServerName::try_from("gouhuo").unwrap()).unwrap();
         let mut sock = TcpStream::connect(addr).unwrap();
         conn.complete_io(&mut sock).unwrap();
         let client_key = *derive_voice_key(&conn, b"").unwrap().as_bytes();
@@ -204,7 +204,7 @@ fn invite_link_drives_the_whole_connection() {
     assert_eq!(parsed.code.as_deref(), Some("winter2026"));
 
     let config = Arc::new(client_config(parsed.cert).unwrap());
-    let mut conn = ClientConnection::new(config, ServerName::try_from("kaimai").unwrap()).unwrap();
+    let mut conn = ClientConnection::new(config, ServerName::try_from("gouhuo").unwrap()).unwrap();
     let mut sock =
         TcpStream::connect((parsed.host.as_str(), parsed.port)).expect("按链接里的地址连不上");
     conn.complete_io(&mut sock).expect("按链接里的指纹握手失败");

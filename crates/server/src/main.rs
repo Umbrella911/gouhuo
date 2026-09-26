@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! 开麦服务端。
+//! 篝火服务端。
 //!
 //! # 开箱即用
 //!
@@ -12,11 +12,11 @@
 //!
 //! | 变量 | 作用 | 默认 |
 //! |---|---|---|
-//! | `KAIMAI_PORT` | 监听端口 | `49737` |
-//! | `KAIMAI_DATA` | 数据目录（证书、邀请码） | `./kaimai-data` |
-//! | `KAIMAI_HOST` | 写进邀请链接的地址 | 自动探测的局域网地址 |
-//! | `KAIMAI_INVITE` | 邀请码；设成空串表示不要邀请码 | 首次启动随机生成 |
-//! | `KAIMAI_MAX_USERS` | 人数上限 | `20` |
+//! | `GOUHUO_PORT` | 监听端口 | `49737` |
+//! | `GOUHUO_DATA` | 数据目录（证书、邀请码） | `./gouhuo-data` |
+//! | `GOUHUO_HOST` | 写进邀请链接的地址 | 自动探测的局域网地址 |
+//! | `GOUHUO_INVITE` | 邀请码；设成空串表示不要邀请码 | 首次启动随机生成 |
+//! | `GOUHUO_MAX_USERS` | 人数上限 | `20` |
 
 use std::fs;
 use std::io;
@@ -59,10 +59,10 @@ fn main() {
 }
 
 fn run() -> io::Result<()> {
-    let port = env_parse("KAIMAI_PORT", DEFAULT_PORT)?;
-    let max_users = env_parse("KAIMAI_MAX_USERS", 20usize)?;
+    let port = env_parse("GOUHUO_PORT", DEFAULT_PORT)?;
+    let max_users = env_parse("GOUHUO_MAX_USERS", 20usize)?;
     let data_dir =
-        PathBuf::from(std::env::var("KAIMAI_DATA").unwrap_or_else(|_| "./kaimai-data".to_string()));
+        PathBuf::from(std::env::var("GOUHUO_DATA").unwrap_or_else(|_| "./gouhuo-data".to_string()));
     fs::create_dir_all(&data_dir)?;
 
     let (cert, cert_is_new) = ServerCert::load_or_create(&data_dir)?;
@@ -88,7 +88,7 @@ fn run() -> io::Result<()> {
     let tls_config = Arc::new(server_config(&cert).map_err(io::Error::other)?);
     let hub = Arc::new(Hub::new(server, voice));
 
-    let host = std::env::var("KAIMAI_HOST").unwrap_or_else(|_| local_address());
+    let host = std::env::var("GOUHUO_HOST").unwrap_or_else(|_| local_address());
     let invite = Invite {
         host: host.clone(),
         port,
@@ -102,7 +102,7 @@ fn run() -> io::Result<()> {
     {
         let hub = Arc::clone(&hub);
         std::thread::Builder::new()
-            .name("kaimai-voice".into())
+            .name("gouhuo-voice".into())
             .spawn(move || hub.run_voice())?;
     }
 
@@ -112,9 +112,9 @@ fn run() -> io::Result<()> {
 
 /// 读邀请码，没有就生成一个。返回 `(码, 是不是新生成的)`。
 ///
-/// `KAIMAI_INVITE` 设成空串表示**不要邀请码**，谁都能进 —— 局域网开黑时有用。
+/// `GOUHUO_INVITE` 设成空串表示**不要邀请码**，谁都能进 —— 局域网开黑时有用。
 fn load_or_create_invite_code(dir: &Path) -> io::Result<(Option<String>, bool)> {
-    if let Ok(from_env) = std::env::var("KAIMAI_INVITE") {
+    if let Ok(from_env) = std::env::var("GOUHUO_INVITE") {
         let trimmed = from_env.trim().to_string();
         return Ok(if trimmed.is_empty() {
             (None, false)
@@ -148,7 +148,7 @@ fn print_banner(
     let link = invite.to_url().map_err(io::Error::other)?;
 
     println!();
-    println!("  开麦服务端已启动");
+    println!("  篝火服务端已启动");
     println!("  监听 {}:{}", Ipv4Addr::UNSPECIFIED, invite.port);
     println!("  数据目录 {}", data_dir.display());
     println!("  证书指纹 {}", invite.cert.to_grouped_hex());
@@ -157,7 +157,7 @@ fn print_banner(
         println!("             否则指纹会变，老邀请链接全部失效）");
     }
     println!();
-    println!("  把这一行发给朋友，他们粘进开麦就能进来：");
+    println!("  把这一行发给朋友，他们粘进篝火就能进来：");
     println!();
     println!("      {link}");
     println!();
@@ -168,13 +168,13 @@ fn print_banner(
     }
     if invite.host == "127.0.0.1" {
         println!("  ⚠ 没探测到局域网地址，链接里写的是本机回环地址。");
-        println!("    让外面的人连进来，要设 KAIMAI_HOST 成你的公网 IP 或域名。");
+        println!("    让外面的人连进来，要设 GOUHUO_HOST 成你的公网 IP 或域名。");
     } else {
         println!(
             "  链接里写的是局域网地址 {}。要给外网的朋友用的话，",
             invite.host
         );
-        println!("  设 KAIMAI_HOST 成你的公网 IP 或域名，并把端口转发过来。");
+        println!("  设 GOUHUO_HOST 成你的公网 IP 或域名，并把端口转发过来。");
     }
     println!();
     Ok(())
@@ -224,7 +224,7 @@ fn bind_error(which: &str, port: u16, e: io::Error) -> io::Error {
         }
         _ => {}
     }
-    lines.push("换一个端口：KAIMAI_PORT=别的数字".into());
+    lines.push("换一个端口：GOUHUO_PORT=别的数字".into());
     io::Error::other(lines.join(
         "
   ",

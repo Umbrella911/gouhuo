@@ -20,7 +20,7 @@
 
 /// 大小写不敏感地剥掉 ASCII 前缀。**对任意 UTF-8 输入都安全，不会 panic。**
 ///
-/// `prefix` 必须是纯 ASCII（调用方保证；本项目里都是 `kaimai://j/` 这类字面量）。
+/// `prefix` 必须是纯 ASCII（调用方保证；本项目里都是 `gouhuo://j/` 这类字面量）。
 pub fn strip_prefix_ignore_ascii_case<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
     let n = prefix.len();
     // is_char_boundary 同时挡住了「太短」和「切在字符中间」两种情况。
@@ -38,11 +38,11 @@ mod tests {
     #[test]
     fn strips_when_it_matches() {
         assert_eq!(
-            strip_prefix_ignore_ascii_case("kaimai://j/abc", "kaimai://j/"),
+            strip_prefix_ignore_ascii_case("gouhuo://j/abc", "gouhuo://j/"),
             Some("abc")
         );
         assert_eq!(
-            strip_prefix_ignore_ascii_case("KAIMAI://J/abc", "kaimai://j/"),
+            strip_prefix_ignore_ascii_case("GOUHUO://J/abc", "gouhuo://j/"),
             Some("abc")
         );
         assert_eq!(strip_prefix_ignore_ascii_case("abc", ""), Some("abc"));
@@ -51,11 +51,11 @@ mod tests {
     #[test]
     fn returns_none_when_it_does_not() {
         assert_eq!(
-            strip_prefix_ignore_ascii_case("nope://abc", "kaimai://j/"),
+            strip_prefix_ignore_ascii_case("nope://abc", "gouhuo://j/"),
             None
         );
-        assert_eq!(strip_prefix_ignore_ascii_case("short", "kaimai://j/"), None);
-        assert_eq!(strip_prefix_ignore_ascii_case("", "kaimai://j/"), None);
+        assert_eq!(strip_prefix_ignore_ascii_case("short", "gouhuo://j/"), None);
+        assert_eq!(strip_prefix_ignore_ascii_case("", "gouhuo://j/"), None);
     }
 
     /// 这条就是当初那个 panic。
@@ -66,11 +66,11 @@ mod tests {
             "你发我的那个码呢？",
             "🎮🎧",                  // emoji 是四字节
             "a中b文c",               // 混排
-            "\u{1F600}kaimai://j/x", // 前面挂一个四字节字符
+            "\u{1F600}gouhuo://j/x", // 前面挂一个四字节字符
         ] {
             // 不崩就算过；返回什么都行
-            let _ = strip_prefix_ignore_ascii_case(s, "kaimai://j/");
-            let _ = strip_prefix_ignore_ascii_case(s, "kaimai-secret-v1-");
+            let _ = strip_prefix_ignore_ascii_case(s, "gouhuo://j/");
+            let _ = strip_prefix_ignore_ascii_case(s, "gouhuo-secret-v1-");
         }
     }
 

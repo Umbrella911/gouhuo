@@ -153,7 +153,7 @@ impl Settings {
             TalkMode::VoiceActivity => "vad",
         };
         format!(
-            "# 开麦的偏好设置。可以手改，改坏了那一行会被忽略。\n\
+            "# 篝火的偏好设置。可以手改，改坏了那一行会被忽略。\n\
              nick={}\n\
              last_invite={}\n\
              talk_mode={}\n\
@@ -189,7 +189,7 @@ mod tests {
     fn sample() -> Settings {
         Settings {
             nick: "阿狸".into(),
-            last_invite: "kaimai://j/abc".into(),
+            last_invite: "gouhuo://j/abc".into(),
             talk_mode: TalkMode::PushToTalk,
             ptt_key: Some(Key::Keyboard(0x20)),
             vad_threshold_db: -38.5,

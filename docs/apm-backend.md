@@ -209,8 +209,8 @@ cargo test --release -p voice-core echo:: -- --nocapture --test-threads 1
 
 # 真声学往返。**会真的出声、真的录音**，要摆好场景：
 #   音箱开着、耳机摘了、人别说话、麦克风不能带 DSP
-set KAIMAI_AEC_RENDER=EDIFIER
-set KAIMAI_AEC_CAPTURE=Insta360
+set GOUHUO_AEC_RENDER=EDIFIER
+set GOUHUO_AEC_CAPTURE=Insta360
 cargo test --release -p voice-core acoustic -- --ignored --nocapture --test-threads 1
 
 # 哪个麦克风真的在出数据（排查用）

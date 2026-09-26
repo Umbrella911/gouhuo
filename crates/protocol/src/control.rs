@@ -28,7 +28,7 @@ use prost::Message;
 mod generated {
     // 生成的代码不归我们管格式，也不该被 clippy 挑刺。
     #![allow(clippy::all, clippy::pedantic, missing_docs)]
-    include!(concat!(env!("OUT_DIR"), "/kaimai.control.v1.rs"));
+    include!(concat!(env!("OUT_DIR"), "/gouhuo.control.v1.rs"));
 }
 
 pub use generated::*;
@@ -193,7 +193,7 @@ mod tests {
     fn sample_client() -> ClientMessage {
         Hello {
             protocol_version: PROTOCOL_VERSION,
-            client_version: "kaimai 0.0.1".into(),
+            client_version: "gouhuo 0.0.1".into(),
             public_key: vec![7u8; 32],
         }
         .into()

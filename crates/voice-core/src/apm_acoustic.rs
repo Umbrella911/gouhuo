@@ -33,8 +33,8 @@
 //! 设备默认用系统默认端点（那才是用户实际的音频路径）。要指定别的：
 //!
 //! ```bash
-//! set KAIMAI_AEC_RENDER=EDIFIER
-//! set KAIMAI_AEC_CAPTURE=Nova
+//! set GOUHUO_AEC_RENDER=EDIFIER
+//! set GOUHUO_AEC_CAPTURE=Nova
 //! ```
 //!
 //! 值是设备名的一部分，大小写不敏感。
@@ -192,8 +192,8 @@ fn listen(capture_id: Option<String>, frames: usize) -> Result<f32, String> {
 
 /// 跑一次完整的声学往返。
 fn run(seconds: f64) -> Result<Acoustic, String> {
-    let (render_id, render_name) = pick(Direction::Render, "KAIMAI_AEC_RENDER")?;
-    let (capture_id, capture_name) = pick(Direction::Capture, "KAIMAI_AEC_CAPTURE")?;
+    let (render_id, render_name) = pick(Direction::Render, "GOUHUO_AEC_RENDER")?;
+    let (capture_id, capture_name) = pick(Direction::Capture, "GOUHUO_AEC_CAPTURE")?;
 
     let total_frames = (seconds * 100.0) as usize;
     if total_frames < 200 {
@@ -227,7 +227,7 @@ fn run(seconds: f64) -> Result<Acoustic, String> {
 ",
                 "换一个不带 DSP 的麦克风：普通 USB 麦、3.5mm 麦、摄像头麦都行，
 ",
-                "游戏耳麦基本都带。用 KAIMAI_AEC_CAPTURE 指定。",
+                "游戏耳麦基本都带。用 GOUHUO_AEC_CAPTURE 指定。",
             ),
             name = capture_name,
             floor = noise_floor_db,
@@ -363,7 +363,7 @@ fn assert_measurable(a: &Acoustic) {
          这次测量不作数 —— 不是 AEC 不行，是场景没摆对：\n\
            - 戴着耳机？摘掉\n\
            - 音箱开着吗？音量够吗？\n\
-           - 麦克风选对了吗？（现在用的是「{}」，可以用 KAIMAI_AEC_CAPTURE 换）\n\
+           - 麦克风选对了吗？（现在用的是「{}」，可以用 GOUHUO_AEC_CAPTURE 换）\n\
            - Windows 或者声卡驱动自己的回声消除可能已经先把它吃掉了",
         a.echo_over_noise_db(),
         MIN_ECHO_OVER_NOISE_DB,

@@ -149,7 +149,7 @@ mod tests {
 
     #[test]
     fn decoding_is_forgiving() {
-        let data = b"kaimai";
+        let data = b"gouhuo";
         let canonical = encode(data);
         // 大写、混入连字符和空白、把 0/1 抄成 O/l —— 都该还原成同一个东西
         let mangled = canonical

@@ -95,7 +95,7 @@ impl MicCheck {
             let processor = processor.clone();
             threads.push(
                 std::thread::Builder::new()
-                    .name("kaimai-miccheck-in".into())
+                    .name("gouhuo-miccheck-in".into())
                     .spawn(move || {
                         let mut frame = vec![0.0f32; FRAME_SAMPLES];
                         while !shared.stop.load(Ordering::Relaxed) {
@@ -131,7 +131,7 @@ impl MicCheck {
             let shared = Arc::clone(&shared);
             threads.push(
                 std::thread::Builder::new()
-                    .name("kaimai-miccheck-out".into())
+                    .name("gouhuo-miccheck-out".into())
                     .spawn(move || {
                         let mut out = vec![0.0f32; FRAME_SAMPLES];
                         while !shared.stop.load(Ordering::Relaxed) {
@@ -468,7 +468,7 @@ mod verdicts {
     fn an_open_failure_keeps_its_reason() {
         let r = result(
             None,
-            Some("录音设备现在是 44100 Hz，开麦这一版只支持 48000 Hz。\n去设置改"),
+            Some("录音设备现在是 44100 Hz，篝火这一版只支持 48000 Hz。\n去设置改"),
         );
         assert!(!r.hears_something());
         assert!(r.verdict().contains("44100"));

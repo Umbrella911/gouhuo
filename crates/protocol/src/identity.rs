@@ -103,7 +103,7 @@ mod tests {
     #[test]
     fn fingerprint_matches_sha256_prefix() {
         use sha2::{Digest, Sha256};
-        let data = b"kaimai server certificate";
+        let data = b"gouhuo server certificate";
         let full = Sha256::digest(data);
         assert_eq!(Fingerprint::of(data).0[..], full[..16]);
     }

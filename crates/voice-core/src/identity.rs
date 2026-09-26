@@ -35,7 +35,7 @@ use protocol::text::strip_prefix_ignore_ascii_case;
 use protocol::{base32, PublicKey};
 
 /// 导出文本的前缀。**故意写得很吓人** —— 用户一眼就该知道这串东西不能随便发。
-pub const EXPORT_PREFIX: &str = "kaimai-secret-v1-";
+pub const EXPORT_PREFIX: &str = "gouhuo-secret-v1-";
 
 /// 磁盘文件的格式版本。换存储格式就 +1。
 const FILE_VERSION: u8 = 1;
@@ -120,7 +120,7 @@ impl Identity {
 
     /// 导出成一串可以复制走的文本。**这串东西等于你的身份，谁拿到谁就是你。**
     ///
-    /// 格式：`kaimai-secret-v1-<base32(版本 + 私钥 + 校验和)>`。
+    /// 格式：`gouhuo-secret-v1-<base32(版本 + 私钥 + 校验和)>`。
     /// 校验和是为了让「粘贴时漏了一截」当场报错，而不是导入出一个错误的身份。
     pub fn export(&self) -> String {
         let mut payload = Vec::with_capacity(1 + SECRET_LEN + CHECKSUM_LEN);
@@ -168,11 +168,11 @@ impl Identity {
         Ok(Self { signing })
     }
 
-    /// 身份文件的默认位置：`%APPDATA%\kaimai\identity.key`。
+    /// 身份文件的默认位置：`%APPDATA%\gouhuo\identity.key`。
     pub fn default_path() -> io::Result<PathBuf> {
         let base =
             std::env::var_os("APPDATA").ok_or_else(|| io::Error::other("找不到 APPDATA 目录"))?;
-        Ok(PathBuf::from(base).join("kaimai").join("identity.key"))
+        Ok(PathBuf::from(base).join("gouhuo").join("identity.key"))
     }
 
     /// 读身份；没有就新建一个存下去。
@@ -261,7 +261,7 @@ mod dpapi {
     };
 
     /// 描述串会被 DPAPI 原样存进密文里，纯粹是给人排查用的。
-    const DESCRIPTION: &str = "kaimai identity";
+    const DESCRIPTION: &str = "gouhuo identity";
 
     fn blob(data: &[u8]) -> CRYPT_INTEGER_BLOB {
         CRYPT_INTEGER_BLOB {
@@ -339,7 +339,7 @@ mod tests {
 
     fn temp_path(name: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
-        p.push(format!("kaimai-test-{name}-{}", std::process::id()));
+        p.push(format!("gouhuo-test-{name}-{}", std::process::id()));
         p.push("identity.key");
         p
     }
@@ -417,7 +417,7 @@ mod tests {
             "随便一串东西",
             "你发我的那个码呢？",
             "🎮",
-            "kaimai-secret-v1-中文",
+            "gouhuo-secret-v1-中文",
         ] {
             assert!(Identity::import(junk).is_err(), "{junk:?} 不该被接受");
         }

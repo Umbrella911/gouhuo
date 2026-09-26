@@ -76,7 +76,7 @@ impl Client {
     fn join(server: &TestServer, name: &str) -> Self {
         let config = Arc::new(client_config(server.fingerprint).unwrap());
         let mut conn =
-            ClientConnection::new(config, ServerName::try_from("kaimai").unwrap()).unwrap();
+            ClientConnection::new(config, ServerName::try_from("gouhuo").unwrap()).unwrap();
         let mut sock = TcpStream::connect(server.tcp).unwrap();
         conn.complete_io(&mut sock).expect("TLS 握手失败");
 
@@ -103,7 +103,7 @@ impl Client {
         client.send(
             Hello {
                 protocol_version: PROTOCOL_VERSION,
-                client_version: "kaimai test".into(),
+                client_version: "gouhuo test".into(),
                 public_key: identity.public_key().0.to_vec(),
             }
             .into(),

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-//! 开麦客户端。
+//! 篝火客户端。
 //!
 //! 这个文件只做一件事：把 `client-core` 的状态搬到界面上，把界面的点击搬回去。
 //! **所有规则都不在这里** —— 能不能进、谁在哪个频道、消息怎么归属，
@@ -57,7 +57,7 @@ fn main() -> Result<(), slint::PlatformError> {
         Err(e) => {
             app.set_error_headline("打不开你的身份文件".into());
             app.set_error_advice(
-                format!("{e}\n检查一下 %APPDATA%\\kaimai 这个目录是不是只读的。").into(),
+                format!("{e}\n检查一下 %APPDATA%\\gouhuo 这个目录是不是只读的。").into(),
             );
             app.run()?;
             return Ok(());
@@ -94,7 +94,7 @@ fn main() -> Result<(), slint::PlatformError> {
         hotkeys.set_ptt(stored.ptt_key);
     }
 
-    // 命令行上给了链接就填进去，盖过上次存的那条。Windows 把 `kaimai://`
+    // 命令行上给了链接就填进去，盖过上次存的那条。Windows 把 `gouhuo://`
     // 的协议处理器就是这么调起来的 —— 这一个参数同时也是「一键加入」的落点。
     if let Some(link) = link_from_args() {
         app.set_invite_link(link.into());
@@ -1074,7 +1074,7 @@ fn load_identity() -> std::io::Result<(Identity, bool)> {
 
 /// 从命令行里挑出邀请链接。
 ///
-/// 只认 `kaimai://` 开头的那个参数，别的一概不管 —— 协议处理器被调起来时，
+/// 只认 `gouhuo://` 开头的那个参数，别的一概不管 —— 协议处理器被调起来时，
 /// 参数里可能还夹着别的东西，而把任意一个参数当链接用是个很好的注入入口。
 fn link_from_args() -> Option<String> {
     std::env::args()

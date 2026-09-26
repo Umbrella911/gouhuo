@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 # 自部署层：法务白名单友好，但改动要回流，见 LICENSING.md
 license = "MPL-2.0"
-description = "开麦服务端：单二进制，自部署零依赖。"
+description = "篝火服务端：单二进制，自部署零依赖。"
 
 # 拆成 lib + bin：集成测试进不了 bin crate，而认证流程恰恰是最需要
 # 端到端测的一块。
@@ -14,7 +14,7 @@ name = "server"
 path = "src/lib.rs"
 
 [[bin]]
-name = "kaimai-server"
+name = "gouhuo-server"
 path = "src/main.rs"
 
 [dependencies]

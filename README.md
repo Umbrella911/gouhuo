@@ -1,12 +1,33 @@
-# 开麦 / kaimai
+# 篝火 / gouhuo
 
 > Mumble 的现代化重写，为中国玩家做。开源、可自部署、只做 Windows 原生客户端。
 
 场景是 3–20 人的朋友或公会，常驻一个频道，边打游戏边说话，一挂几小时。
 所有设计以「常驻几小时不打扰人」为准绳，不是以「功能齐全」为准绳。
 
-名字就是这软件干的事，不用解释。**刻意避开「开黑」**：KOOK 的前身就叫开黑啦，
-那块心智已经被占死了，蹭不到，只会被比下去。
+名字是**一群人围着坐几个小时的地方**。黑暗之魂里篝火就是歇脚、回血、
+下次从这儿开始 —— 中国玩家对这个词的第一反应正好是「常驻」，而那是这个产品的
+全部定位。（日文原作里也写作「篝火」，汉字同形。）
+
+**刻意避开「开黑」**：KOOK 的前身就叫开黑啦，那块心智已经被占死了，
+蹭不到，只会被比下去。
+
+### 为什么不叫「开麦」
+
+第一版叫开麦，理由是「名字就是这软件干的事，不用解释」。那条理由是真的，
+而且零解释是最难得的一项 —— 但它换不回三个问题：
+
+1. **它是日常黑话，跟语言本身抢搜索。** 「你开麦啊」「麦没开」满互联网都是
+2. **语法上跟自己打架。** 代码里真的出现过「然后重开开麦」这种句子
+3. **时刻对不上时长。** 「开麦」是一个瞬间动作，而这个产品的全部卖点是
+   常驻几小时。语音产品该按「地方」命名，因为你是待在里面
+
+英文标识用拼音 `gouhuo`，不用 `bonfire`：GitHub 上 bonfire 有 1.9k 个仓库
+（含一个 944 star 的活跃联邦社交网络，和一个 87 star 的 Discord 客户端重写），
+crates.io 上 `bonfire` 已经被占。更要紧的是 `bonfire://` 这个 URL scheme ——
+Windows 上协议处理器是谁后写谁赢，撞了之后用户点邀请链接可能打开别的程序，
+而那是「一键加入」的唯一入口。日语罗马化 `kagaribi` 也不行：那是日本关东
+头部的任天堂明星大乱斗赛事系列。`gouhuo` 在 GitHub 和 crates.io 上都是空的。
 
 **当前进度：M1、M2 完成，端到端实测 91.8 ms，在 120 ms 产品线内。
 M3 进行中：一键加入的密码学基础已经做完（身份 + 邀请链接）。还没有 UI。**
@@ -317,7 +338,7 @@ APM        14.9 ms   （AEC3 + 降噪 + AGC2 + 高通）
 ### 邀请链接
 
 ```
-kaimai://j/040dn3ypdknqx36hpsp8h9qhmndd9z7221v6ytb3cmq6evvecxm7at9ecdq6phg
+gouhuo://j/040dn3ypdknqx36hpsp8h9qhmndd9z7221v6ytb3cmq6evvecxm7at9ecdq6phg
 ```
 
 74 个字符，一行发得出去。自包含**连上去需要的一切**：地址、端口、
@@ -342,7 +363,7 @@ kaimai://j/040dn3ypdknqx36hpsp8h9qhmndd9z7221v6ytb3cmq6evvecxm7at9ecdq6phg
 代价很直接：**私钥丢了身份就没了。** 所以导出导入不是附加功能：
 
 ```
-kaimai-secret-v1-<base32>
+gouhuo-secret-v1-<base32>
 ```
 
 前缀故意写得吓人，用户一眼就知道这串不能随便发。
@@ -413,12 +434,12 @@ kaimai-secret-v1-<base32>
 ### 服务端：一个二进制，跑起来就能用
 
 ```
-KAIMAI_DATA=./data kaimai-server
+GOUHUO_DATA=./data gouhuo-server
 ```
 
 没有配置文件。第一次启动自己生成证书和邀请码，然后把邀请链接打在屏幕上 ——
-把那一行发给朋友就完事了。要调的东西全走环境变量（`KAIMAI_PORT` /
-`KAIMAI_DATA` / `KAIMAI_HOST` / `KAIMAI_INVITE` / `KAIMAI_MAX_USERS`）。
+把那一行发给朋友就完事了。要调的东西全走环境变量（`GOUHUO_PORT` /
+`GOUHUO_DATA` / `GOUHUO_HOST` / `GOUHUO_INVITE` / `GOUHUO_MAX_USERS`）。
 
 分两层，界线是**有没有 IO**：
 
@@ -487,7 +508,7 @@ Windows 上更糟，Hyper-V / WSL / Docker 会在那段里成片地做保留 —
 本机实测 UDP 的 49409–49908 一整片都被占了，绑上去直接 WSAEACCES。
 **Mumble 的 64738 正落在这一片里。**
 
-开麦要求 TCP 和 UDP 用同一个号（用户只记一个数，转发也只转一次），所以要挑一个在
+篝火要求 TCP 和 UDP 用同一个号（用户只记一个数，转发也只转一次），所以要挑一个在
 所有系统临时段之下的：Linux 是 32768–60999，Windows / macOS 是 49152–65535，
 取交集就是「小于 32768」。默认落在 **20800**。
 
@@ -545,7 +566,7 @@ Tauri 会好一些，但它依赖 WebView2 —— 界面行为要看用户机器
 
 ### 一键加入
 
-命令行上给一个 `kaimai://` 链接就直接连 —— Windows 的协议处理器就是这么
+命令行上给一个 `gouhuo://` 链接就直接连 —— Windows 的协议处理器就是这么
 调起来的，所以这一个参数同时也是「点链接进频道」的落点。
 
 **第一次跑的人不自动连**：那时候昵称还是 Windows 用户名，身份也是刚生成的，
@@ -796,13 +817,13 @@ cargo test --workspace
 起一个服务器，它会把邀请链接打在屏幕上：
 
 ```bash
-cargo run --release -p server --bin kaimai-server
+cargo run --release -p server --bin gouhuo-server
 ```
 
 然后把那条链接给客户端：
 
 ```bash
-cargo run --release -p client --bin kaimai -- kaimai://j/...
+cargo run --release -p client --bin gouhuo -- gouhuo://j/...
 ```
 
 ```bash
