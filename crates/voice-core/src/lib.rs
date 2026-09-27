@@ -28,6 +28,7 @@ pub mod net;
 pub mod pipeline;
 pub mod redline;
 pub mod signal;
+pub mod timescale;
 #[cfg(feature = "pipeline")]
 pub mod tts;
 
