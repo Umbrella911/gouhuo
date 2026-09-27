@@ -22,7 +22,7 @@ slint = { workspace = true, features = ["raw-window-handle-06"] }
 raw-window-handle = "0.6"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Time", "Win32_Graphics_Dwm"] }
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Time", "Win32_Graphics_Dwm", "Win32_UI_WindowsAndMessaging"] }
 
 [build-dependencies]
 slint-build.workspace = true

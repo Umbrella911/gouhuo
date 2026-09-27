@@ -50,8 +50,92 @@ use voice_core::hotkey::{Hotkeys, Key};
 
 slint::include_modules!();
 
-fn main() -> Result<(), slint::PlatformError> {
-    let app = App::new()?;
+/// 窗口起不来时，换成软件渲染重开一次用的后端名。
+const SOFTWARE_BACKEND: &str = "winit-software";
+
+/// 标在重开的那个进程上：已经是退路了，再失败就别再重开，免得无限循环。
+const FALLBACK_MARKER: &str = "GOUHUO_SOFTWARE_FALLBACK";
+
+/// 哪一步失败的。只有窗口起不来值得换渲染器重试。
+enum Failure {
+    /// 建窗口、显示窗口失败 —— 多半是 OpenGL 用不了。
+    Window(slint::PlatformError),
+    /// 窗口已经起来过了，事件循环中途出错。重开没有意义。
+    EventLoop(slint::PlatformError),
+}
+
+fn main() {
+    let error = match run() {
+        Ok(()) => return,
+        Err(Failure::EventLoop(e)) => e,
+        Err(Failure::Window(e)) => {
+            // 界面默认用 OpenGL 画（Slint 的 FemtoVG）。没装显卡驱动的虚拟机、
+            // 远程桌面、很老的核显上，OpenGL 上下文建不起来 —— 而 Slint 自己的
+            // 兜底只管「渲染器对象建不出来」，建上下文是在显示窗口那一刻，兜不住。
+            // 所以换成软件渲染，整个重开一次。慢一点，但能用。
+            if std::env::var_os(FALLBACK_MARKER).is_none() && relaunch_with_software_renderer() {
+                return;
+            }
+            e
+        }
+    };
+    // 这是个窗口程序，没有控制台：只 eprintln 的话用户看到的就是
+    // 「双击没反应」。必须弹出来。
+    show_fatal(&format!(
+        "篝火的窗口打不开：{error}\n\n\
+         多半是显卡驱动的问题。装一下显卡驱动再试；\
+         远程桌面里的话，换成在本机上打开。"
+    ));
+}
+
+/// 带着同样的参数（可能有一条邀请链接）重开自己，这次用软件渲染。
+/// 开起来了返回 `true`，这个进程就可以退了。
+fn relaunch_with_software_renderer() -> bool {
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    std::process::Command::new(exe)
+        .args(std::env::args_os().skip(1))
+        .env("SLINT_BACKEND", SOFTWARE_BACKEND)
+        .env(FALLBACK_MARKER, "1")
+        .spawn()
+        .is_ok()
+}
+
+#[cfg(windows)]
+fn show_fatal(message: &str) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+    let wide = |s: &str| s.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
+    let (text, caption) = (wide(message), wide("篝火"));
+    // SAFETY: 两个指针都指向以 0 结尾的 UTF-16，活到调用结束。
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            text.as_ptr(),
+            caption.as_ptr(),
+            MB_OK | MB_ICONERROR,
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn show_fatal(message: &str) {
+    eprintln!("{message}");
+}
+
+/// 只给测退路用：设了它，第一次建窗口就当失败处理，走跟 OpenGL 起不来一样的路。
+/// 没有这个的话，那条路只有在一台没显卡驱动的机器上才测得到。
+const SIMULATE_WINDOW_FAILURE: &str = "GOUHUO_SIMULATE_WINDOW_FAILURE";
+
+fn run() -> Result<(), Failure> {
+    if std::env::var_os(SIMULATE_WINDOW_FAILURE).is_some()
+        && std::env::var_os(FALLBACK_MARKER).is_none()
+    {
+        return Err(Failure::Window(slint::PlatformError::Other(
+            "模拟的窗口失败".into(),
+        )));
+    }
+    let app = App::new().map_err(Failure::Window)?;
 
     // 身份是本地的一对密钥，没有账号密码。第一次跑会生成一个。
     let (identity, first_run) = match load_identity() {
@@ -61,7 +145,7 @@ fn main() -> Result<(), slint::PlatformError> {
             app.set_error_advice(
                 format!("{e}\n检查一下 %APPDATA%\\gouhuo 这个目录是不是只读的。").into(),
             );
-            app.run()?;
+            app.run().map_err(Failure::Window)?;
             return Ok(());
         }
     };
@@ -120,6 +204,12 @@ fn main() -> Result<(), slint::PlatformError> {
         spawn_ptt_poll(app.as_weak(), Arc::clone(&state), hotkeys);
     }
 
+    // **先显示窗口，再自动连。** 窗口起不来的话整个进程会换软件渲染重开
+    // （见 main）；要是先连上了，重开的那个再连一次，就把这边顶下去了。
+    // 窗口要先创建出来才有句柄可以改标题栏。
+    app.show().map_err(Failure::Window)?;
+    dark_titlebar(&app);
+
     // 点链接进来的老用户直接连，这才叫一键加入。
     //
     // **第一次跑的人不自动连**：那时昵称还是 Windows 用户名，
@@ -129,10 +219,7 @@ fn main() -> Result<(), slint::PlatformError> {
         app.invoke_join();
     }
 
-    // 窗口要先创建出来才有句柄可以改。
-    app.show()?;
-    dark_titlebar(&app);
-    slint::run_event_loop()?;
+    slint::run_event_loop().map_err(Failure::EventLoop)?;
     Ok(())
 }
 
