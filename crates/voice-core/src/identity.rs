@@ -320,9 +320,9 @@ mod dpapi {
 #[cfg(windows)]
 use dpapi::{protect, unprotect};
 
-/// 非 Windows 上不加密。这个项目只做 Windows 客户端，这条分支纯粹是为了
-/// 让测试和 CI 能在别的平台上跑通 —— 真要支持别的平台，这里必须换成
-/// 对应平台的密钥库，而不是就这么明文存着。
+/// 非 Windows 上不加密。目前只有 Windows 客户端，这条分支纯粹是为了
+/// 让测试和 CI 能在别的平台上跑通 —— 客户端上别的平台之前，这里必须换成
+/// 对应平台的密钥库（Keychain / Secret Service / Keystore），而不是就这么明文存着。
 #[cfg(not(windows))]
 fn protect(plain: &[u8]) -> io::Result<Vec<u8>> {
     Ok(plain.to_vec())
