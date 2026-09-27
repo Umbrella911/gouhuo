@@ -21,9 +21,11 @@ use std::sync::{Arc, Mutex};
 
 use client_core::{Client, ConnectError, Ended, Event};
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
+use voice_core::cue::{chime, Chime};
 use voice_core::identity::Identity;
 use voice_core::miccheck::{scan_microphones, MicCheck};
 use voice_core::pipeline::{Pipeline, PipelineConfig, TransmitMode, DEFAULT_JITTER_FRAMES};
+use voice_core::tts::{speakable_name, Announcer};
 
 /// 多久去问一次语音链路的状态。
 ///
@@ -90,6 +92,9 @@ fn main() -> Result<(), slint::PlatformError> {
             .into(),
     );
     app.set_vad_level(db_to_level(stored.vad_threshold_db));
+    app.set_cue_sounds(stored.cue_sounds);
+    app.set_announce_names(stored.announce_names);
+    app.set_cue_volume(stored.cue_volume as f32 / 100.0);
     if let Some(hotkeys) = &hotkeys {
         hotkeys.set_ptt(stored.ptt_key);
     }
@@ -182,6 +187,9 @@ struct State {
     /// 下拉框里第 n 项对应哪个设备 id。第 0 项是「系统默认」，所以是 None。
     capture_ids: Vec<Option<String>>,
     render_ids: Vec<Option<String>>,
+    /// 念名字的后台线程。**第一次要念的时候才起** —— 大多数人不开这个功能，
+    /// 不该为它常驻一个线程和一个语音合成引擎。
+    announcer: Option<Announcer>,
 }
 
 thread_local! {
@@ -509,6 +517,59 @@ fn wire_scan(app: &App, state: &Arc<Mutex<State>>) {
 
 /// 设置面板：切换说话方式、绑按住说话的键、试听麦克风、选设备。
 fn wire_settings(app: &App, state: &Arc<Mutex<State>>, hotkeys: Option<Rc<Hotkeys>>) {
+    {
+        let state = Arc::clone(state);
+        let weak = app.as_weak();
+        app.on_set_cue_sounds(move |on| {
+            let mut locked = state.lock().expect("state poisoned");
+            locked.settings.cue_sounds = on;
+            let _ = locked.settings.save();
+            if let Some(app) = weak.upgrade() {
+                app.set_cue_sounds(on);
+            }
+        });
+    }
+
+    {
+        let state = Arc::clone(state);
+        let weak = app.as_weak();
+        app.on_set_announce_names(move |on| {
+            let mut locked = state.lock().expect("state poisoned");
+            locked.settings.announce_names = on;
+            let _ = locked.settings.save();
+            if let Some(app) = weak.upgrade() {
+                app.set_announce_names(on);
+            }
+        });
+    }
+
+    {
+        let state = Arc::clone(state);
+        app.on_set_cue_volume(move |level| {
+            state.lock().expect("state poisoned").settings.cue_volume =
+                (level.clamp(0.0, 1.0) * 100.0).round() as u32;
+        });
+    }
+
+    {
+        let state = Arc::clone(state);
+        app.on_save_cue_volume(move || {
+            let _ = state.lock().expect("state poisoned").settings.save();
+        });
+    }
+
+    {
+        let state = Arc::clone(state);
+        let weak = app.as_weak();
+        app.on_preview_cues(move || {
+            let nick = weak
+                .upgrade()
+                .map(|app| app.get_nick().to_string())
+                .unwrap_or_default();
+            announce(&state, Chime::CameIn, &nick, true);
+        });
+    }
+
     {
         let state = Arc::clone(state);
         let weak = app.as_weak();
@@ -939,8 +1000,9 @@ fn pump_events(
                         }
                     }
                 }
-                // 其余的都只是「画面该变了」。进出提示音和 TTS 等 M5 音频那边接上再说，
-                // 事件里已经带着名字了。
+                Event::CameIn { name, .. } => announce(&state, Chime::CameIn, &name, false),
+                Event::WentOut { name, .. } => announce(&state, Chime::WentOut, &name, false),
+                // 其余的都只是「画面该变了」。
                 _ => refresh(&app, &state, &client),
             });
             if posted.is_err() {
@@ -949,6 +1011,40 @@ fn pump_events(
             }
         }
     });
+}
+
+/// 有人进出我所在的频道：响一声，按设置再念个名字。
+///
+/// 声音塞进正在跑的那条链路的播放里（见 `voice_core::cue`）：连着服务器是
+/// 语音链路，没连的时候是设置页上的独立试麦 —— 后者只有 `preview` 会用到。
+/// 两个都没有就不响：没有地方可以放。
+fn announce(state: &Arc<Mutex<State>>, kind: Chime, name: &str, preview: bool) {
+    let mut locked = state.lock().expect("state poisoned");
+    let sink = match (&locked.voice, &locked.mic_check) {
+        (Some(voice), _) => voice.cues(),
+        (None, Some(mic)) if preview => mic.cues(),
+        _ => return,
+    };
+    let settings = &locked.settings;
+    let gain = settings.cue_volume as f32 / 100.0;
+    let (sounds, names) = (settings.cue_sounds, settings.announce_names);
+    // 试听的时候两样都响，不管开没开 —— 不然两个都关着的人点了「试听」
+    // 什么也听不到，只会以为坏了。
+    if sounds || preview {
+        sink.push(&chime(kind), gain);
+    }
+    if names || preview {
+        if locked.announcer.is_none() {
+            locked.announcer = Announcer::start().ok();
+        }
+        if let Some(announcer) = &locked.announcer {
+            let verb = match kind {
+                Chime::CameIn => "进来了",
+                Chime::WentOut => "走了",
+            };
+            announcer.say(&format!("{}{verb}", speakable_name(name)), sink, gain);
+        }
+    }
 }
 
 /// 单人音量在设置里按什么存：公钥的 base32。

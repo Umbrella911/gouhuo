@@ -52,7 +52,20 @@ pub struct Settings {
     ///
     /// 100% 的不存。只存调过的，文件里就只有「这几个人我调过」。
     pub user_volumes: BTreeMap<String, u32>,
+    /// 有人进出我所在的频道时响一声。
+    pub cue_sounds: bool,
+    /// 顺便把名字念出来（Windows 自带的语音合成）。
+    ///
+    /// **默认关**：一屋子人进进出出，每次都念一句会很吵，而且第一次听到
+    /// 电脑突然开口说话会吓一跳。想要的人自己开。
+    pub announce_names: bool,
+    /// 提示音和念名字的音量，百分比。
+    pub cue_volume: u32,
 }
+
+/// 提示音音量的默认值。提示音本身已经比人声轻了，再打个六折：
+/// 挂几个小时，每次有人进出都响，宁可轻一点。
+pub const DEFAULT_CUE_VOLUME: u32 = 60;
 
 /// 单人音量的范围，百分比。上限跟语音链路那边的 `MAX_VOLUME` 对齐。
 pub const MAX_USER_VOLUME: u32 = 400;
@@ -106,6 +119,9 @@ impl Default for Settings {
             capture_device: None,
             render_device: None,
             user_volumes: BTreeMap::new(),
+            cue_sounds: true,
+            announce_names: false,
+            cue_volume: DEFAULT_CUE_VOLUME,
         }
     }
 }
@@ -183,6 +199,15 @@ impl Settings {
                     }
                 }
                 "ptt_key" => settings.ptt_key = value.parse().ok().and_then(Key::decode),
+                "cue_sounds" => settings.cue_sounds = value != "off",
+                "announce_names" => settings.announce_names = value == "on",
+                "cue_volume" => {
+                    if let Ok(percent) = value.parse::<u32>() {
+                        if percent <= 100 {
+                            settings.cue_volume = percent;
+                        }
+                    }
+                }
                 "capture_device" => settings.capture_device = non_empty(value),
                 "render_device" => settings.render_device = non_empty(value),
                 "vad_threshold_db" => {
@@ -222,7 +247,10 @@ impl Settings {
              ptt_key={}\n\
              vad_threshold_db={:.1}\n\
              capture_device={}\n\
-             render_device={}\n",
+             render_device={}\n\
+             cue_sounds={}\n\
+             announce_names={}\n\
+             cue_volume={}\n",
             // 值里有换行的话会把文件切坏，所以过滤掉。
             // 昵称里的换行是粘贴时最容易带进来的东西。
             one_line(&self.nick),
@@ -232,6 +260,9 @@ impl Settings {
             self.vad_threshold_db,
             one_line(self.capture_device.as_deref().unwrap_or("")),
             one_line(self.render_device.as_deref().unwrap_or("")),
+            on_off(self.cue_sounds),
+            on_off(self.announce_names),
+            self.cue_volume,
         ) + &self.serialize_volumes()
     }
 
@@ -251,6 +282,14 @@ impl Settings {
             ));
         }
         out
+    }
+}
+
+fn on_off(value: bool) -> &'static str {
+    if value {
+        "on"
+    } else {
+        "off"
     }
 }
 
@@ -276,6 +315,9 @@ mod tests {
             capture_device: Some("{0.0.1.00000000}.{abc}".into()),
             render_device: None,
             user_volumes: BTreeMap::from([("AAAA".to_string(), 40), ("BBBB".to_string(), 250)]),
+            cue_sounds: false,
+            announce_names: true,
+            cue_volume: 35,
         }
     }
 
@@ -435,6 +477,19 @@ mod tests {
             settings.user_volumes,
             BTreeMap::from([("EEEE".to_string(), 60)])
         );
+    }
+
+    /// 提示音默认开、念名字默认关；写坏了也退回这两个默认。
+    #[test]
+    fn cues_default_to_a_chime_without_speech() {
+        let settings = Settings::parse("cue_volume=999\ncue_volume=-1\n");
+        assert!(settings.cue_sounds);
+        assert!(!settings.announce_names);
+        assert_eq!(settings.cue_volume, DEFAULT_CUE_VOLUME);
+
+        let garbled = Settings::parse("cue_sounds=也许\nannounce_names=也许\n");
+        assert!(garbled.cue_sounds, "认不出来的值不该把提示音关掉");
+        assert!(!garbled.announce_names, "认不出来的值不该让电脑突然开口");
     }
 
     /// 设置文件跟身份文件放在一起，搬机器的时候一起走。

@@ -120,6 +120,12 @@ export component App inherits Window {
     in property <bool> scanning: false;
     in property <[ScanRow]> scan-results;
 
+    // ---- 进出提示 ----
+    in-out property <bool> cue-sounds: true;
+    in-out property <bool> announce-names: false;
+    /// 提示音和念名字的音量，0–1。
+    in-out property <float> cue-volume: 0.6;
+
     // ---- 回调 ----
     callback join();
     callback leave();
@@ -144,6 +150,13 @@ export component App inherits Window {
     callback pick-render(int);
     callback scan-microphones();
     callback pick-capture-id(string);
+    callback set-cue-sounds(bool);
+    callback set-announce-names(bool);
+    callback set-cue-volume(float);
+    /// 音量滑条拖完了，存盘。
+    callback save-cue-volume();
+    /// 照着「阿狸进来了」的样子响一遍，调音量用。
+    callback preview-cues();
 
     // =======================================================================
     // 没连上：一个框，一个按钮
@@ -960,6 +973,42 @@ export component App inherits Window {
                                 wrap: word-wrap;
                             }
                         }
+                    }
+
+                    Text {
+                        text: "有人进出你所在的频道时";
+                        color: Theme.dim;
+                        font-size: 12px;
+                    }
+                    HorizontalLayout {
+                        spacing: 6px;
+                        Btn {
+                            label: root.cue-sounds ? "提示音：开" : "提示音：关";
+                            primary: root.cue-sounds;
+                            clicked => { root.set-cue-sounds(!root.cue-sounds); }
+                        }
+                        Btn {
+                            label: root.announce-names ? "念名字：开" : "念名字：关";
+                            primary: root.announce-names;
+                            clicked => { root.set-announce-names(!root.announce-names); }
+                        }
+                        Btn {
+                            label: "试听";
+                            clicked => { root.preview-cues(); }
+                        }
+                    }
+                    Slider {
+                        minimum: 0;
+                        maximum: 1;
+                        value <=> root.cue-volume;
+                        changed(v) => { root.set-cue-volume(v); }
+                        released(v) => { root.save-cue-volume(); }
+                    }
+                    Text {
+                        text: "提示音和念名字的音量。隔壁频道有人进出不响；关了耳朵时也不响。";
+                        color: Theme.faint;
+                        font-size: 11px;
+                        wrap: word-wrap;
                     }
 
                     // 选了按住说话却没绑键 = 一个字都发不出去。必须说出来。
