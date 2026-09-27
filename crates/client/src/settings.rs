@@ -14,6 +14,7 @@
 //! 偏好设置坏了不是 —— 认不出来的行直接跳过，缺的值用默认。
 //! 绝不能因为有人手滑多打了个字就打不开客户端。
 
+use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -43,7 +44,37 @@ pub struct Settings {
     pub capture_device: Option<String>,
     /// 用哪个扬声器/耳机。
     pub render_device: Option<String>,
+    /// 单独给某个人调的音量，百分比。键是那个人公钥的 base32。
+    ///
+    /// **按公钥存，不按会话 id，也不按昵称**：会话 id 一断线就换，昵称会改、
+    /// 会重名。只有公钥跨会话、跨服务器都认得出是同一个人 —— 在这个服务器上
+    /// 把谁调小了，在另一个服务器上碰到他也还是小的。
+    ///
+    /// 100% 的不存。只存调过的，文件里就只有「这几个人我调过」。
+    pub user_volumes: BTreeMap<String, u32>,
 }
+
+/// 单人音量的范围，百分比。上限跟语音链路那边的 `MAX_VOLUME` 对齐。
+pub const MAX_USER_VOLUME: u32 = 400;
+pub const DEFAULT_USER_VOLUME: u32 = 100;
+
+/// 滑条上的原始值 → 存下来的百分比。
+///
+/// 取到 5% 一档：没人分得出 67% 和 68%，而文件里出现 67.3829 只会让手改的人困惑。
+/// 100% 附近吸住 —— 拖过头想调回原样的时候，不该要人对准一个像素。
+pub fn snap_volume(raw: f32) -> u32 {
+    if !raw.is_finite() {
+        return DEFAULT_USER_VOLUME;
+    }
+    let clamped = raw.clamp(0.0, MAX_USER_VOLUME as f32);
+    if (clamped - DEFAULT_USER_VOLUME as f32).abs() <= 7.0 {
+        return DEFAULT_USER_VOLUME;
+    }
+    ((clamped / 5.0).round() * 5.0) as u32
+}
+
+/// 设置文件里单人音量那几行的前缀：`volume.<公钥>=<百分比>`。
+const VOLUME_PREFIX: &str = "volume.";
 
 /// 电平条和滑块用的分贝范围。
 ///
@@ -74,6 +105,7 @@ impl Default for Settings {
             vad_threshold_db: DEFAULT_VAD_THRESHOLD_DB,
             capture_device: None,
             render_device: None,
+            user_volumes: BTreeMap::new(),
         }
     }
 }
@@ -83,6 +115,23 @@ impl Default for Settings {
 pub const DEFAULT_VAD_THRESHOLD_DB: f32 = -45.0;
 
 impl Settings {
+    /// 这个人（按公钥的 base32）的音量，百分比。没调过就是 100。
+    pub fn user_volume(&self, key: &str) -> u32 {
+        self.user_volumes
+            .get(key)
+            .copied()
+            .unwrap_or(DEFAULT_USER_VOLUME)
+    }
+
+    pub fn set_user_volume(&mut self, key: &str, percent: u32) {
+        let percent = percent.min(MAX_USER_VOLUME);
+        if percent == DEFAULT_USER_VOLUME {
+            self.user_volumes.remove(key);
+        } else {
+            self.user_volumes.insert(key.to_string(), percent);
+        }
+    }
+
     pub fn path() -> io::Result<PathBuf> {
         // 跟身份文件放在一起，搬机器的时候一起走。
         let identity = voice_core::identity::Identity::default_path()?;
@@ -111,7 +160,20 @@ impl Settings {
                 continue;
             };
             let value = value.trim();
-            match key.trim() {
+            let key = key.trim();
+            if let Some(who) = key.strip_prefix(VOLUME_PREFIX) {
+                // 不认识的值跳过，不夹到范围里：手改成 4000 多半是手滑，
+                // 当成 400% 放出来会吓人一跳。
+                if !who.is_empty() && !who.contains(char::is_whitespace) {
+                    if let Ok(percent) = value.parse::<u32>() {
+                        if percent <= MAX_USER_VOLUME {
+                            settings.set_user_volume(who, percent);
+                        }
+                    }
+                }
+                continue;
+            }
+            match key {
                 "nick" => settings.nick = value.to_string(),
                 "last_invite" => settings.last_invite = value.to_string(),
                 "talk_mode" => {
@@ -170,7 +232,25 @@ impl Settings {
             self.vad_threshold_db,
             one_line(self.capture_device.as_deref().unwrap_or("")),
             one_line(self.render_device.as_deref().unwrap_or("")),
-        )
+        ) + &self.serialize_volumes()
+    }
+
+    fn serialize_volumes(&self) -> String {
+        if self.user_volumes.is_empty() {
+            return String::new();
+        }
+        let mut out = String::from(
+            "# 单独调过音量的人：volume.<公钥>=<百分比>，删掉那行就回到 100%。
+",
+        );
+        for (who, percent) in &self.user_volumes {
+            out.push_str(&format!(
+                "{VOLUME_PREFIX}{}={percent}
+",
+                one_line(who)
+            ));
+        }
+        out
     }
 }
 
@@ -195,6 +275,7 @@ mod tests {
             vad_threshold_db: -38.5,
             capture_device: Some("{0.0.1.00000000}.{abc}".into()),
             render_device: None,
+            user_volumes: BTreeMap::from([("AAAA".to_string(), 40), ("BBBB".to_string(), 250)]),
         }
     }
 
@@ -299,6 +380,61 @@ mod tests {
         // 超出范围的要夹住，不能跑出条子外面
         assert_eq!(db_to_level(-200.0), 0.0);
         assert_eq!(db_to_level(50.0), 1.0);
+    }
+
+    #[test]
+    fn user_volumes_default_to_full_and_forget_resets() {
+        let mut settings = Settings::default();
+        assert_eq!(settings.user_volume("AAAA"), 100);
+        settings.set_user_volume("AAAA", 30);
+        assert_eq!(settings.user_volume("AAAA"), 30);
+        // 调回 100 就不再记着这个人
+        settings.set_user_volume("AAAA", 100);
+        assert!(settings.user_volumes.is_empty());
+        // 超上限的夹住
+        settings.set_user_volume("BBBB", 9999);
+        assert_eq!(settings.user_volume("BBBB"), MAX_USER_VOLUME);
+    }
+
+    #[test]
+    fn the_slider_snaps_to_steps_and_to_full_volume() {
+        assert_eq!(snap_volume(0.0), 0);
+        assert_eq!(snap_volume(2.4), 0);
+        assert_eq!(snap_volume(67.3829), 65);
+        assert_eq!(snap_volume(94.0), 100);
+        assert_eq!(snap_volume(106.9), 100);
+        assert_eq!(snap_volume(250.0), 250);
+        assert_eq!(snap_volume(999.0), MAX_USER_VOLUME);
+        assert_eq!(snap_volume(-3.0), 0);
+        assert_eq!(snap_volume(f32::NAN), DEFAULT_USER_VOLUME);
+    }
+
+    /// 静音某个人（0%）也要存下来，下次进来还是静音的。
+    #[test]
+    fn a_muted_person_stays_muted() {
+        let mut settings = Settings::default();
+        settings.set_user_volume("AAAA", 0);
+        assert_eq!(
+            Settings::parse(&settings.serialize()).user_volume("AAAA"),
+            0
+        );
+    }
+
+    #[test]
+    fn absurd_volumes_are_skipped() {
+        let settings = Settings::parse(
+            "volume.AAAA=4000
+             volume.BBBB=-5
+             volume.CCCC=很大
+             volume.=50
+             volume.DD DD=50
+             volume.EEEE=60
+",
+        );
+        assert_eq!(
+            settings.user_volumes,
+            BTreeMap::from([("EEEE".to_string(), 60)])
+        );
     }
 
     /// 设置文件跟身份文件放在一起，搬机器的时候一起走。

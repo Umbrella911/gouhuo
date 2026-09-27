@@ -43,7 +43,7 @@ const PTT_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 
 mod settings;
 
-use settings::{db_to_level, level_to_db, Settings, TalkMode};
+use settings::{db_to_level, level_to_db, snap_volume, Settings, TalkMode};
 use voice_core::hotkey::{Hotkeys, Key};
 
 slint::include_modules!();
@@ -285,7 +285,7 @@ fn on_connected(
     app.set_self_deafened(false);
     app.set_voice_error("".into());
     app.set_udp_ok(false);
-    refresh(app, &client);
+    refresh(app, state, &client);
 
     start_voice(app, state, &client);
     pump_events(app.as_weak(), Arc::clone(state), client, events);
@@ -336,9 +336,13 @@ fn start_voice(app: &App, state: &Arc<Mutex<State>>, client: &Client) {
             let deafened = app.get_self_deafened();
             pipeline.set_deafened(deafened);
             pipeline.set_muted(app.get_self_muted() || deafened);
-            let mut locked = state.lock().expect("state poisoned");
-            locked.voice = Some(Arc::new(pipeline));
-            locked.capture = Some(diagnostics);
+            {
+                let mut locked = state.lock().expect("state poisoned");
+                locked.voice = Some(Arc::new(pipeline));
+                locked.capture = Some(diagnostics);
+            }
+            // 新链路里所有人都是 100%。换设备、断线重连都会走到这里。
+            apply_volumes(state, client);
         }
         Err(e) => app.set_voice_error(format!("{e}").into()),
     }
@@ -905,7 +909,7 @@ fn pump_events(
                     if !actual.is_empty() {
                         app.set_nick(actual.into());
                     }
-                    refresh(&app, &client);
+                    refresh(&app, &state, &client);
                     // 会话 id、端口、密钥全换了，语音链路只能按新的重起。
                     start_voice(&app, &state, &client);
                 }
@@ -937,7 +941,7 @@ fn pump_events(
                 }
                 // 其余的都只是「画面该变了」。进出提示音和 TTS 等 M5 音频那边接上再说，
                 // 事件里已经带着名字了。
-                _ => refresh(&app, &client),
+                _ => refresh(&app, &state, &client),
             });
             if posted.is_err() {
                 // 窗口关了
@@ -947,11 +951,45 @@ fn pump_events(
     });
 }
 
+/// 单人音量在设置里按什么存：公钥的 base32。
+fn volume_key(public_key: &[u8]) -> String {
+    protocol::base32::encode(public_key)
+}
+
+/// 把设置里存的单人音量推给语音链路。
+///
+/// 语音链路只认会话 id，而会话 id 每次连接都换，所以这件事要在
+/// 「名单变了」和「链路重起了」两个时候都做一遍。给每个人都设一次，
+/// 包括 100% 的 —— 会话 id 在服务端是会回绕复用的，不能指望新来的人
+/// 身上没有旧设置。
+fn apply_volumes(state: &Arc<Mutex<State>>, client: &Client) {
+    let (voice, settings) = {
+        let locked = state.lock().expect("state poisoned");
+        let Some(voice) = locked.voice.clone() else {
+            return;
+        };
+        (voice, locked.settings.clone())
+    };
+    let roster = client.roster();
+    for user in roster.users.values() {
+        if user.session_id == roster.me {
+            continue;
+        }
+        let percent = settings.user_volume(&volume_key(&user.public_key));
+        voice.set_volume(user.session_id, percent as f32 / 100.0);
+    }
+}
+
 /// 重画左边的树和右边的聊天。
 ///
 /// 每次事件都整个重建列表，不做增量。20 个人几十条消息，重建的代价
 /// 完全测不出来；而增量更新是「名单和实际对不上」这类 bug 的主要来源。
-fn refresh(app: &App, client: &Client) {
+fn refresh(app: &App, state: &Arc<Mutex<State>>, client: &Client) {
+    // 先把要用的设置拷出来再去拿名单的锁。**不同时持有两把** ——
+    // 别的地方有先拿名单再拿 state 的，两把一起拿迟早死锁。
+    let settings = state.lock().expect("state poisoned").settings.clone();
+    apply_volumes(state, client);
+
     let roster = client.roster();
 
     let mut rows: Vec<Row> = Vec::new();
@@ -969,6 +1007,7 @@ fn refresh(app: &App, client: &Client) {
             is_current: node.channel.id == roster.my_channel(),
             count: members.len() as i32,
             can_delete: roster.can_delete_channel(node.channel.id),
+            volume: 100,
         });
         for user in members {
             rows.push(Row {
@@ -985,6 +1024,7 @@ fn refresh(app: &App, client: &Client) {
                 count: 0,
                 // 只对频道有意义。
                 can_delete: false,
+                volume: settings.user_volume(&volume_key(&user.public_key)) as i32,
             });
         }
     }
@@ -1039,6 +1079,56 @@ fn wire_actions(app: &App, state: &Arc<Mutex<State>>) {
                 // 本地先插的话，被拒时界面上会留一个只有自己看得见的幽灵频道。
                 client.create_channel(&name, 0);
             }
+        });
+    }
+
+    {
+        let state = Arc::clone(state);
+        let weak = app.as_weak();
+        app.on_set_user_volume(move |session, raw| {
+            let (Some(app), Some(client)) = (weak.upgrade(), current(&state)) else {
+                return;
+            };
+            let session = session as u32;
+            let percent = snap_volume(raw);
+            let Some(key) = client
+                .roster()
+                .users
+                .get(&session)
+                .map(|u| volume_key(&u.public_key))
+            else {
+                return;
+            };
+            let voice = {
+                let mut locked = state.lock().expect("state poisoned");
+                locked.settings.set_user_volume(&key, percent);
+                locked.voice.clone()
+            };
+            if let Some(voice) = voice {
+                voice.set_volume(session, percent as f32 / 100.0);
+            }
+            // 只改这一行，不整个重建名单：拖动时每秒几十次，整个重建会让
+            // 正拖着的滑条被销毁重建，手里的那一下就断了。
+            let rows = app.get_rows();
+            for i in 0..rows.row_count() {
+                let Some(mut row) = rows.row_data(i) else {
+                    continue;
+                };
+                if !row.is_channel && row.id == session as i32 {
+                    if row.volume != percent as i32 {
+                        row.volume = percent as i32;
+                        rows.set_row_data(i, row);
+                    }
+                    break;
+                }
+            }
+        });
+    }
+
+    {
+        let state = Arc::clone(state);
+        app.on_save_user_volumes(move || {
+            let _ = state.lock().expect("state poisoned").settings.save();
         });
     }
 

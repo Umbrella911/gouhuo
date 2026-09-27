@@ -24,6 +24,8 @@ export struct Row {
     // 只对频道有意义：我能不能删它。**这只决定画不画那个 ×**，
     // 真正说了算的是服务端 —— 画错了最多是一个点了没反应的按钮。
     can-delete: bool,
+    // 只对人有意义：我给这个人单独调的音量，百分比。100 是原样，0 是静音。
+    volume: int,
 }
 
 /// 一次麦克风检测的结果。
@@ -112,6 +114,8 @@ export component App inherits Window {
     /// 「新建频道」那一行有没有展开成输入框。纯界面状态，不出这个文件。
     property <bool> newchan-open: false;
     property <string> newchan-name;
+    /// 展开了音量滑条的那个人的会话 id。-1 表示都收着。纯界面状态。
+    property <int> volume-open: -1;
     /// 正在挨个试麦克风。
     in property <bool> scanning: false;
     in property <[ScanRow]> scan-results;
@@ -123,6 +127,10 @@ export component App inherits Window {
     /// 建频道。参数是频道名，界面这边已经 trim 过并挡掉了空串。
     callback create-channel(string);
     callback delete-channel(int);
+    /// 单独调某个人的音量：(会话 id, 滑条上的原始值)。取整和吸附在 Rust 那边做。
+    callback set-user-volume(int, float);
+    /// 拖完了，存盘。拖动过程中不存 —— 一次拖动会触发几十次 changed。
+    callback save-user-volumes();
     callback send-text();
     callback toggle-mute();
     callback toggle-deafen();
@@ -272,7 +280,8 @@ export component App inherits Window {
                         padding: 6px;
                         spacing: 1px;
 
-                        for row[i] in root.rows: Rectangle {
+                        for row[i] in root.rows: VerticalLayout {
+                          Rectangle {
                             height: row.is-channel ? 30px : 28px;
                             border-radius: 6px;
                             background: row.is-channel && row.is-current
@@ -313,6 +322,15 @@ export component App inherits Window {
                                     horizontal-stretch: 1;
                                 }
 
+                                // 调过音量的人在右边标一下。不标的话，一个被自己调成 0
+                                // 的人说话时点在闪却听不见，用户只会以为是他麦克风坏了。
+                                if !row.is-channel && !row.is-me && row.volume != 100: Text {
+                                    text: row.volume == 0 ? "已静音" : row.volume + "%";
+                                    color: row.volume == 0 ? Theme.warn : Theme.faint;
+                                    font-size: 11px;
+                                    vertical-alignment: center;
+                                }
+
                                 if row.is-channel && !(row.can-delete && rowtouch.has-hover): Text {
                                     text: row.count > 0 ? row.count : "";
                                     color: Theme.faint;
@@ -350,11 +368,57 @@ export component App inherits Window {
                                 }
                             }
 
+                            // 点频道是进去；点别人是展开 / 收起他的音量滑条。
+                            // 点自己没有反应 —— 自己的音量在底部那两个按钮上。
                             rowtouch := TouchArea {
-                                enabled: row.is-channel;
-                                mouse-cursor: row.is-channel ? pointer : default;
-                                clicked => { root.join-channel(row.id); }
+                                enabled: row.is-channel || !row.is-me;
+                                mouse-cursor: pointer;
+                                clicked => {
+                                    if (row.is-channel) {
+                                        root.join-channel(row.id);
+                                    } else {
+                                        volume-open = volume-open == row.id ? -1 : row.id;
+                                    }
+                                }
                             }
+                          }
+
+                          if !row.is-channel && !row.is-me && root.volume-open == row.id: HorizontalLayout {
+                              height: 34px;
+                              padding-left: 8px + (row.depth * 12px) + 16px;
+                              padding-right: 10px;
+                              spacing: 8px;
+
+                              vol := Slider {
+                                  minimum: 0;
+                                  maximum: 400;
+                                  value: row.volume;
+                                  horizontal-stretch: 1;
+                                  changed(v) => { root.set-user-volume(row.id, v); }
+                                  released(v) => { root.save-user-volumes(); }
+                              }
+                              Text {
+                                  text: row.volume + "%";
+                                  color: Theme.dim;
+                                  font-size: 12px;
+                                  width: 40px;
+                                  horizontal-alignment: right;
+                                  vertical-alignment: center;
+                              }
+                              Btn {
+                                  width: 52px;
+                                  height: 26px;
+                                  y: (parent.height - self.height) / 2;
+                                  label: row.volume == 0 ? "恢复" : "静音";
+                                  clicked => {
+                                      // 滑条被拖过之后，它的 value 就不再跟着 row.volume 走了
+                                      // （Slint 里赋值会打断绑定），所以这里要亲手把它拨过去。
+                                      vol.value = row.volume == 0 ? 100 : 0;
+                                      root.set-user-volume(row.id, vol.value);
+                                      root.save-user-volumes();
+                                  }
+                              }
+                          }
                         }
 
                         // ---- 新建频道 ----
