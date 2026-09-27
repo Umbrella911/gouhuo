@@ -1,0 +1,14 @@
+# 项目自己的构建设置。**机器相关的东西不要放这儿**（比如 cmake 的路径），
+# 放到用户级的 %USERPROFILE%\.cargo\config.toml。
+
+# Windows 上把 C 运行库静态链进去。
+#
+# 不这么做的话，客户端和服务端都依赖 VCRUNTIME140.dll（VC++ 运行库）。
+# 很多机器上碰巧装着，但干净的 Windows 不保证有 —— 缺了就是双击没反应，
+# 或者弹一个普通人看不懂的错误。开黑的人不会去装运行库。
+#
+# 这一个开关就够：cmake crate（libopus）和 cc crate（ring）都认这个 target feature，
+# 自己把 C 那边换成 /MT。验证：`dumpbin /dependents target\dist\gouhuo.exe` 里
+# 不该出现 VCRUNTIME140 或 api-ms-win-crt-*。代价是每个程序大 0.2 MB 左右。
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

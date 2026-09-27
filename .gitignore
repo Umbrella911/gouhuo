@@ -2,8 +2,6 @@
 *.pdb
 /artifacts
 
-# 本机构建路径变通，见文件内注释
-/.cargo/config.toml
 
 # 服务端运行时的数据目录。**里面有 TLS 私钥。**
 # 默认叫 gouhuo-data，在仓库里跑一下服务端就会生成。
