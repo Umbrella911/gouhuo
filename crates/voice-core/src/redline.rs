@@ -150,10 +150,14 @@ pub const GATE_CPU_PCT: f64 = 4.0;
 /// 虚拟声卡、蓝牙耳机都不在里面，它们只会更高。
 pub const DEVICE_BUDGET_MS: f64 = 30.4;
 
-/// APM（AEC3 + 降噪 + AGC2 + 高通）吃掉的毫秒数。**M2 实测**。
+/// APM（AEC3 + 降噪 + AGC2 + 高通）吃掉的毫秒数。**实测**。
 ///
-/// AEC3 单独 9 ms、降噪单独 7 ms，全开 15 ms。这两块都不可选：
-/// 没有 AEC3 外放就啸叫，没有降噪机械键盘声直接糊到队友耳朵里。
+/// 逐块：AEC3 单独 8.92 ms、降噪单独 6.92 ms、高通 0.92 ms、AGC2 0 ms，
+/// 全开 14.92 ms。这里取整到 15.0 当预算 —— 预算不该追第三位小数，
+/// 而且取整的方向是保守的那一边。
+///
+/// AEC3 和降噪都不可选：没有 AEC3 外放就啸叫，没有降噪机械键盘声直接糊到
+/// 队友耳朵里。
 pub const APM_BUDGET_MS: f64 = 15.0;
 
 /// M1 实测的协议链路嘴到耳 p95，毫秒（city 档 / 10 ms 帧 / 缓冲 2 帧）。
@@ -162,8 +166,11 @@ pub const MEASURED_PROTOCOL_MS: f64 = 46.5;
 /// M1 实测的 Opus 编解码 CPU，单核占比 %（complexity 5 / 10 ms 帧 / 单路）。
 pub const MEASURED_CODEC_CPU_PCT: f64 = 2.18;
 
-/// M2 实测的 APM CPU，单核占比 %（全开配置）。
-pub const MEASURED_APM_CPU_PCT: f64 = 0.66;
+/// 实测的 APM CPU，单核占比 %（全开配置）。
+///
+/// 2026-09 把 APM 从 C++ 的 libwebrtc（M131）换成纯 Rust 的 sonora（M145）之后
+/// 从 0.66 涨到这个数，见 docs/apm-backend.md。
+pub const MEASURED_APM_CPU_PCT: f64 = 0.79;
 
 /// 当前实测的通话 CPU 合计，单核占比 %。
 pub const MEASURED_CPU_PCT: f64 = MEASURED_CODEC_CPU_PCT + MEASURED_APM_CPU_PCT;
@@ -186,21 +193,36 @@ pub const MEASURED_E2E_MS: f64 = MEASURED_PROTOCOL_MS + DEVICE_BUDGET_MS + APM_B
 /// **不含声卡**（合成设备一到节拍就交出整帧）**也不含 APM**。
 pub const MEASURED_PIPELINE_MS: f64 = 36.7;
 
-/// **实测**的回声抑制量，分贝。
+/// **实测**的回声抑制量，分贝。**合成的线性回路，不是真声学环境。**
 ///
 /// 条件：类语音的宽带回声（带限到 300–3400 Hz 的噪声 × 音节包络），
-/// 回声电平 −24 dB，声学回路延迟 30 ms。收敛之后稳定在这个数。
+/// 回声电平 −24 dB，回路延迟 30 ms。收敛之后稳定在这个数，残留 −82 dB。
 ///
-/// 残留的绝对电平是 −50 dB —— 那才是「听不听得见」的判据。
-/// AEC3 压到一个固定底噪就到头了，所以回声越响，抑制量的数字越好看；
-/// 只看比值会被这一点骗到。
-pub const MEASURED_AEC_DB: f64 = 26.0;
+/// # 这个数字不能当产品表现看
+///
+/// 测试里的回声路径是**纯线性**的 —— 延迟加衰减，没有音箱的非线性失真、
+/// 没有削波、没有两个晶振的漂移。而恰恰是这些非线性的东西才真正区分 AEC
+/// 实现的好坏。线性路径上自适应滤波器能收敛到近乎完美，所以这里量到的是
+/// 「滤波器收敛得多好」，不是「外放开黑会不会啸叫」。
+///
+/// 真声学往返的测试写了（`apm_acoustic.rs`），但**还没有可信数字**：
+/// 手上的麦克风都自带噪声门，那是非线性时变处理，而且在 APM 之前，
+/// AEC 的线性滤波器学不了它。详见 docs/apm-backend.md。
+///
+/// 另外：残留的绝对电平比抑制量更接近「听不听得见」。AEC 压到一个固定底噪
+/// 就到头了，所以回声越响抑制量的数字越好看 —— 只看比值会被这一点骗到。
+///
+/// （换 sonora 之前这个数是 26.0 dB / 残留 −50 dB。）
+pub const MEASURED_AEC_DB: f64 = 57.9;
 
 /// **实测**：没有回声时 AEC 对人声的损伤，分贝。
 ///
 /// 这条比抑制量更要紧 —— 绝大多数人戴耳机，根本没有回声。
 /// 开了 AEC 反而把他的声音削掉一截的话，这个功能就是负收益。
-pub const MEASURED_AEC_HARM_DB: f64 = 0.2;
+///
+/// 换 sonora 之后从 0.2 涨到 1.1：它的抑制器两头都更激进，多消 32 dB 回声的
+/// 同时也多削 0.9 dB 人声。离「听得出来」还很远，但方向要记住。
+pub const MEASURED_AEC_HARM_DB: f64 = 1.1;
 
 /// 实测的客户端界面进程常驻内存，MB。
 ///
@@ -216,14 +238,18 @@ pub const MEASURED_UI_COLD_START_MS: f64 = 92.0;
 
 /// 实测的客户端可执行文件大小，MB（dist profile，strip 过）。
 ///
-/// **还不是安装包**：音频那半边（Opus + libwebrtc 的 APM）还没链进去，
-/// 打包器和运行库也还没算。放在这里是为了让它在涨的时候看得见。
-pub const MEASURED_CLIENT_EXE_MB: f64 = 12.5;
+/// **还不是安装包**：打包器和运行库还没算。放在这里是为了让它在涨的时候看得见。
+///
+/// 这个数含 Opus 和 APM —— 2026-09 之前 APM 是默认关的，那时候量的 12.5 MB
+/// 不含它。
+pub const MEASURED_CLIENT_EXE_MB: f64 = 14.35;
 
 /// 实测的服务端可执行文件大小，MB（dist profile，strip 过）。
 ///
-/// 「单二进制、自部署零依赖」就是这个数。
-pub const MEASURED_SERVER_EXE_MB: f64 = 1.4;
+/// 「单二进制、自部署零依赖」就是这个数。**不含音频那半边** ——
+/// 服务端只转发 Opus 包，voice-core 是关掉默认 feature 引进来的，
+/// 所以 APM 和 Opus 都没链进去。客户端是 14.35 MB，差的就是这些。
+pub const MEASURED_SERVER_EXE_MB: f64 = 1.43;
 
 // ===========================================================================
 // 不变量：编译期就检查

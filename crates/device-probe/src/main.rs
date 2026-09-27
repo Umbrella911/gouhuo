@@ -257,8 +257,37 @@ fn apm_verdict(delay_ms: Option<f64>, cpu_pct: Option<f64>) {
                 }
             );
             println!("    注意这是单路。频道里 K 个人同时说话，解码要乘 K，APM 不用。");
+
+            // 跟 redline.rs 里记的实测值对账。
+            //
+            // **这段是补上来的。** 设备那一段一直有对账（见 budget()），APM 这段
+            // 没有 —— 于是换 APM 实现那次，redline.rs 里的 0.66% 跟 README 里的
+            // 0.79% 各说各话了好几个提交，谁都没发现。没人断言的常量一定会漂。
+            let drift = c - redline::MEASURED_APM_CPU_PCT;
+            println!(
+                "    redline::MEASURED_APM_CPU_PCT = {:.2}%，本次实测 {:.2}%，差 {:+.2}",
+                redline::MEASURED_APM_CPU_PCT,
+                c,
+                drift
+            );
+            if drift.abs() > 0.1 {
+                println!("    >>> 差得有点多，该把 MEASURED_APM_CPU_PCT 改成本次实测值了");
+            }
         }
         None => println!("  CPU：没测出来"),
+    }
+
+    if let Some(d) = delay_ms {
+        let drift = d - redline::APM_BUDGET_MS;
+        println!(
+            "  redline::APM_BUDGET_MS = {:.2} ms，本次实测 {:.2} ms，差 {:+.2} ms",
+            redline::APM_BUDGET_MS,
+            d,
+            drift
+        );
+        if drift.abs() > 1.0 {
+            println!("    >>> 差得有点多，该把 APM_BUDGET_MS 改成本次实测值了");
+        }
     }
 }
 

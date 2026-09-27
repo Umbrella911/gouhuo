@@ -1,9 +1,15 @@
 name: redline
 
 on:
-  push:
-    branches: [main]
+  # **不在 push 上跑。** public 仓库的标准 runner 是不计费的（GitHub 文档：
+  # "free ... for public repositories that use standard GitHub-hosted runners"），
+  # 所以这不是为了省钱 —— 是为了别让一个单人项目每次 push 都等 8 分钟、
+  # 烧一台 Windows VM。
+  #
+  # 想验的时候手动跑：gh workflow run redline
+  # 真正需要它的时候（准备发版、改完一个里程碑、动了跨平台的东西）跑一次就够。
   pull_request:
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -81,30 +87,14 @@ jobs:
       - name: test
         run: cargo test --workspace
 
-  # 延迟数字。**共享 runner 上不做门禁。**
+  # 延迟数字**不在这里测**。
   #
-  # 原因：这测的是实时调度精度。GitHub 托管 runner 是虚拟化的共享机器，
-  # 节拍器迟到是常态，测出来的 p95 反映的是 runner 的负载而不是我们的架构。
-  # 在那种数字上设门禁只会训练出「重跑一次就绿了」的习惯，比不测更糟。
+  # 曾经有个 latency-record job 每次跑 4m42s，把 m1.json 存成 artifact 用来看趋势。
+  # 砍掉了：它不卡任何东西，而那些 artifact 从建立到删除没有人看过一次。
+  # 「以后可能有用」不值得每次 CI 多烧五分钟。
   #
-  # 所以这里只**记录**：跑一遍，把 JSON 存成 artifact，用来看趋势。
-  # 真正的门禁要跑在专用机器上 —— 见下面的 gate job。
-  latency-record:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: 测量（仅记录，不门禁）
-        run: cargo run --release -p latency-probe -- --seconds 4 --json > m1.json
-      - name: 人类可读的报告
-        run: cargo run --release -p latency-probe -- --seconds 4 > m1.txt
-      - uses: actions/upload-artifact@v4
-        with:
-          name: m1-latency-${{ github.sha }}
-          path: |
-            m1.json
-            m1.txt
+  # 要数字就本地跑，那儿的数还更可信（见下面 gate 的注释）：
+  #   cargo run --release -p latency-probe -- --seconds 4
 
   # 真门禁。只在专用 Windows 机器上跑 —— 独占、不虚拟化、跑的时候不干别的。
   #
