@@ -94,6 +94,15 @@ fn voice_config(client: &Client, server: &TestServer, mode: TransmitMode) -> Pip
     let addr = format!("{}:{}", server.invite.host, client.udp_port())
         .parse()
         .expect("服务端给的语音地址解析不了");
+    voice_config_at(client, addr, mode)
+}
+
+/// 同上，但语音往哪儿发可以自己指定 —— 用来把 UDP 指到一个黑洞上。
+fn voice_config_at(
+    client: &Client,
+    addr: std::net::SocketAddr,
+    mode: TransmitMode,
+) -> PipelineConfig {
     PipelineConfig {
         session_id: client.session_id(),
         server: addr,
@@ -101,6 +110,9 @@ fn voice_config(client: &Client, server: &TestServer, mode: TransmitMode) -> Pip
         downstream_key: *client.voice_keys().downstream.as_bytes(),
         jitter_frames: DEFAULT_JITTER_FRAMES,
         mode,
+        // 真接上退路。UDP 通的时候应该一直待在 UDP 那条路上 ——
+        // 这同时是「接了退路不会把正常路径弄坏」的回归。
+        fallback: Some(client.voice_fallback()),
     }
 }
 
@@ -174,6 +186,68 @@ fn a_chirp_makes_it_all_the_way_through() {
     assert!(
         mid > energy * 0.5,
         "能量没集中在中段，捞到的可能不是那个啁啾"
+    );
+}
+
+/// **UDP 被整个挡掉时，语音必须从控制面过去。**
+///
+/// 模拟的正是公司网络里那种环境：控制面那条 TLS 连接是真的，语音那条 UDP
+/// 指向一个**绑上但谁也不读**的 socket —— 包发得出去，回包一个没有。
+///
+/// 覆盖的是客户端这一侧的完整判定：一次次保活没回音 → 过了 `UDP_DEAD_AFTER`
+/// 就地切成 TCP → 声音改从控制面上行，服务端再转给还在走 UDP 的人。
+///
+/// 前面那段静音不是凑数：判定本身要花 8 秒（保活每 2 秒才评估一次），
+/// 啁啾必须落在切换**之后**，否则这条测试测的还是 UDP。
+#[test]
+fn voice_survives_udp_being_blocked_entirely() {
+    let server = start_server();
+    let alice = join(&server, "阿狸");
+    let bob = join(&server, "波波");
+
+    // 绑上但从不读 = 黑洞。**故意绑一个真 socket**：指到一个没人监听的端口
+    // 会招来 ICMP port unreachable，那又是另一种故障，不是我们要测的这个。
+    let black_hole = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let dead_addr = black_hole.local_addr().unwrap();
+
+    const SILENT_FRAMES: usize = 1100; // 11 秒，留够判定 + 一次保活周期
+    let mut source = vec![0.0f32; FRAME_SAMPLES * SILENT_FRAMES];
+    source.extend_from_slice(&chirp_f32(FRAME_SAMPLES * CHIRP_FRAMES));
+    source.extend(std::iter::repeat(0.0).take(FRAME_SAMPLES * TAIL_FRAMES));
+
+    let alice_voice = Pipeline::start(
+        voice_config_at(&alice, dead_addr, TransmitMode::Always),
+        Box::new(SyntheticCapture::new(source).then_silence()),
+        Box::new(NullRender::default()),
+        None,
+    )
+    .unwrap();
+
+    let (render, played) = CollectingRender::new();
+    let silent = SyntheticCapture::new(Vec::new()).then_silence();
+    let bob_voice = Pipeline::start(
+        voice_config(&bob, &server, TransmitMode::PushToTalk),
+        Box::new(silent),
+        Box::new(render),
+        None,
+    )
+    .unwrap();
+
+    let total_frames = SILENT_FRAMES + CHIRP_FRAMES + TAIL_FRAMES;
+    std::thread::sleep(Duration::from_millis((total_frames * 10 + 2000) as u64));
+
+    // 阿狸这边的 UDP 从头到尾是死的，而且她确实发过东西。
+    let alice_stats = alice_voice.stats();
+    assert!(!alice_stats.udp_ok, "黑洞那头不该有保活回包");
+    assert!(alice_stats.packets_sent > 0, "阿狸一个包都没发出去");
+
+    // 波波那条路是好的，但他必须照样听得见 —— 声音是从控制面过来的。
+    assert!(bob_voice.stats().udp_ok, "波波那边的 UDP 该是通的");
+    let played = played.lock().unwrap().clone();
+    let energy: f32 = played.iter().map(|s| s * s).sum();
+    assert!(
+        energy > 0.0,
+        "UDP 被整个挡掉之后，波波就再也听不见了 —— 退路没接上"
     );
 }
 

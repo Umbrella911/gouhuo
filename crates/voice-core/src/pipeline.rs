@@ -157,6 +157,29 @@ impl TransmitMode {
     }
 }
 
+/// UDP 不通时语音的另一条腿：把封好的包交给控制面。
+///
+/// `voice-core` 不认识 TLS，也不该认识 —— 它只看见「一包封好的字节」和
+/// 「把它放到那条路上去」。谁实现、怎么送到对面，是 client-core 的事。
+pub trait VoiceFallback: Send + Sync {
+    /// 把这个封好的包从控制面发出去。
+    ///
+    /// **调用方是音频线程**，所以实现里不能做会阻塞的事。
+    fn send(&self, packet: &[u8]);
+
+    /// 报告「我的语音现在走哪条路」，心跳把它捎给服务端。
+    fn set_via_tcp(&self, via_tcp: bool);
+}
+
+/// 接进 [`Pipeline`] 的那条退路。
+///
+/// 两个方向是分开的：往外发走 [`VoiceFallback`]，往里收走这个 channel ——
+/// 收的那头由控制面线程推、语音线程取，不需要谁去轮询 socket。
+pub struct VoiceFallbackBridge {
+    pub sink: Arc<dyn VoiceFallback>,
+    pub incoming: std::sync::mpsc::Receiver<Vec<u8>>,
+}
+
 pub struct PipelineConfig {
     pub session_id: u32,
     pub server: SocketAddr,
@@ -164,6 +187,8 @@ pub struct PipelineConfig {
     pub downstream_key: [u8; 32],
     pub jitter_frames: usize,
     pub mode: TransmitMode,
+    /// UDP 不通时的退路。`None` = 没有退路（探针和测试里就是 `None`）。
+    pub fallback: Option<VoiceFallbackBridge>,
 }
 
 /// 界面要显示的东西。
@@ -243,6 +268,15 @@ struct Shared {
     underruns: AtomicU64,
     /// 最近一次保活回来的时刻（Instant 不能放原子里，存成毫秒差）
     last_keepalive_ms: AtomicU64,
+    /// 一共收到过多少个保活回包。
+    ///
+    /// 「UDP 活过来了没有」看的是它的**增量**，不是「距上次多久」：8 秒的死亡
+    /// 判据意味着一条陈旧的时间戳在切换之后还能装 8 秒「新鲜」，拿它当退回去
+    /// 的依据就会来回横跳。
+    keepalive_replies: AtomicU64,
+    /// 语音现在走哪条路。`true` = 控制面（TCP）。由保活线程维护 ——
+    /// 它是唯一能判断 UDP 通不通的地方。
+    via_tcp: AtomicBool,
     rtt_us: AtomicU32,
     /// 麦克风电平，存成 0.01 dB 一档的定点 —— 稳定版 Rust 没有原子浮点。
     input_centi_db: AtomicI32,
@@ -300,6 +334,8 @@ impl Pipeline {
             packets_received: AtomicU64::new(0),
             underruns: AtomicU64::new(0),
             last_keepalive_ms: AtomicU64::new(0),
+            keepalive_replies: AtomicU64::new(0),
+            via_tcp: AtomicBool::new(false),
             rtt_us: AtomicU32::new(0),
             input_centi_db: AtomicI32::new(SILENT_DB_CENTI),
             monitor: Mutex::new(VecDeque::new()),
@@ -308,6 +344,12 @@ impl Pipeline {
 
         let jitter_frames = cfg.jitter_frames.max(1);
         let processor: Option<Arc<dyn AudioProcessor>> = processor.map(Arc::from);
+        // 退路的两半分开放：往外发的那半是 `Arc`，发送和保活两个线程共用；
+        // 往里收的那半是 `Receiver`，只能给一个线程。
+        let (fallback_sink, fallback_incoming) = match cfg.fallback {
+            Some(bridge) => (Some(bridge.sink), Some(bridge.incoming)),
+            None => (None, None),
+        };
         let mut threads = Vec::new();
 
         // ---- 发送 ----
@@ -323,6 +365,7 @@ impl Pipeline {
             let key = cfg.upstream_key;
             let server = cfg.server;
             let mode = Arc::clone(&mode);
+            let fallback = fallback_sink.clone();
             threads.push(spawn("gouhuo-voice-send", move || {
                 send_loop(
                     &mut *capture,
@@ -337,6 +380,7 @@ impl Pipeline {
                     key,
                     server,
                     mode,
+                    fallback,
                 );
             })?);
         }
@@ -372,8 +416,21 @@ impl Pipeline {
             let key = cfg.upstream_key;
             let server = cfg.server;
             let shared = Arc::clone(&shared);
+            let fallback = fallback_sink.clone();
             threads.push(spawn("gouhuo-voice-keepalive", move || {
-                keepalive_loop(socket, &stop, &shared, session_id, key, server);
+                keepalive_loop(socket, &stop, &shared, session_id, key, server, fallback);
+            })?);
+        }
+
+        // ---- 退路的接收 ----
+        //
+        // 没接退路就不起这个线程 —— 探针和测试里不会白占一个。
+        if let Some(incoming) = fallback_incoming {
+            let stop = Arc::clone(&stop);
+            let shared = Arc::clone(&shared);
+            let key = cfg.downstream_key;
+            threads.push(spawn("gouhuo-voice-tcp-recv", move || {
+                tcp_recv_loop(incoming, &stop, &shared, key, jitter_frames);
             })?);
         }
 
@@ -541,6 +598,7 @@ fn send_loop(
     key: [u8; 32],
     server: SocketAddr,
     mode: Arc<AtomicU32>,
+    fallback: Option<Arc<dyn VoiceFallback>>,
 ) {
     // 音频线程要优先于游戏线程被调度，否则一次掉帧就是一次爆音。
     crate::clock::boost_current_thread();
@@ -557,6 +615,22 @@ fn send_loop(
     // 中间静默了多久，而不是以为包丢了。
     let mut timestamp: u32 = 0;
     let mut was_sending = false;
+
+    // 把这个封好的包放到**当前该走的那条路**上。走哪条由保活线程维护 ——
+    // 它是唯一能判断 UDP 通不通的地方。
+    let put = |wire: &[u8]| -> bool {
+        if !shared.via_tcp.load(Ordering::Relaxed) {
+            return socket.send_to(wire, server).is_ok();
+        }
+        match &fallback {
+            Some(sink) => {
+                sink.send(wire);
+                true
+            }
+            // 没有退路：宁可丢这一个包，也不要往一条已知不通的路上发。
+            None => false,
+        }
+    };
 
     while !stop.load(Ordering::Relaxed) {
         match capture.read(&mut frame) {
@@ -606,7 +680,7 @@ fn send_loop(
                     flags: FLAG_TERMINATOR,
                 };
                 if cipher.seal(header, &[], &mut wire).is_ok() {
-                    let _ = socket.send_to(&wire, server);
+                    let _ = put(&wire);
                 }
                 seq = seq.wrapping_add(1);
                 was_sending = false;
@@ -623,7 +697,7 @@ fn send_loop(
             timestamp,
             flags: 0,
         };
-        if cipher.seal(header, packet, &mut wire).is_ok() && socket.send_to(&wire, server).is_ok() {
+        if cipher.seal(header, packet, &mut wire).is_ok() && put(&wire) {
             shared.packets_sent.fetch_add(1, Ordering::Relaxed);
         }
         seq = seq.wrapping_add(1);
@@ -672,6 +746,8 @@ fn recv_loop(
             shared
                 .last_keepalive_ms
                 .store(shared.now_ms().max(1), Ordering::Relaxed);
+            // 保活线程靠这个计数**有没有涨**判断 UDP 是不是真活过来了。
+            shared.keepalive_replies.fetch_add(1, Ordering::Relaxed);
             // 时间戳装的是发出去那一刻的微秒数，跟 shared 同一个原点。
             // **用微秒不是毫秒**：本机回环的往返是几十微秒，按毫秒算一律是 0，
             // 界面上就永远显示 0.0 ms，看着像坏了。
@@ -680,33 +756,73 @@ fn recv_loop(
             continue;
         }
 
-        let mut speakers = shared.speakers.lock().expect("speakers poisoned");
-        let speaker = match speakers.entry(header.session) {
-            std::collections::btree_map::Entry::Occupied(e) => e.into_mut(),
-            std::collections::btree_map::Entry::Vacant(e) => {
-                let Ok(mut speaker) = Speaker::new(jitter_frames) else {
-                    continue;
-                };
-                if let Some(&volume) = shared
-                    .volumes
-                    .lock()
-                    .expect("volumes poisoned")
-                    .get(&header.session)
-                {
-                    speaker.volume = volume;
-                }
-                e.insert(speaker)
-            }
-        };
-        speaker.last_packet = Instant::now();
+        deliver_inbound(shared, jitter_frames, header, &payload);
+    }
+}
 
-        if header.is_terminator() {
-            speaker.ended = true;
+/// 把一个解开的语音包放进抖动缓冲。
+///
+/// UDP 和控制面两条路**共用这一个**：两边解出来的东西本来就一模一样，
+/// 各写一份的话，切换的那一瞬间必然出现两套行为。
+fn deliver_inbound(shared: &Shared, jitter_frames: usize, header: VoiceHeader, payload: &[u8]) {
+    let mut speakers = shared.speakers.lock().expect("speakers poisoned");
+    let speaker = match speakers.entry(header.session) {
+        std::collections::btree_map::Entry::Occupied(e) => e.into_mut(),
+        std::collections::btree_map::Entry::Vacant(e) => {
+            let Ok(mut speaker) = Speaker::new(jitter_frames) else {
+                return;
+            };
+            if let Some(&volume) = shared
+                .volumes
+                .lock()
+                .expect("volumes poisoned")
+                .get(&header.session)
+            {
+                speaker.volume = volume;
+            }
+            e.insert(speaker)
+        }
+    };
+    speaker.last_packet = Instant::now();
+
+    if header.is_terminator() {
+        speaker.ended = true;
+        return;
+    }
+    speaker.ended = false;
+    speaker.last_voice = Instant::now();
+    speaker.jitter.push(header.seq, payload.to_vec());
+}
+
+/// 控制面那条退路的接收线程。
+///
+/// 跟 UDP 那条用的是同一把下行密钥、同一个封包格式，所以投递也走同一个
+/// [`deliver_inbound`] —— 两条路最后必须汇进同一个抖动缓冲，否则切换的
+/// 那一瞬间会听出一个断层。
+fn tcp_recv_loop(
+    incoming: std::sync::mpsc::Receiver<Vec<u8>>,
+    stop: &AtomicBool,
+    shared: &Shared,
+    key: [u8; 32],
+    jitter_frames: usize,
+) {
+    let cipher = VoiceCipher::new(&key);
+    let mut payload = Vec::with_capacity(MAX_DATAGRAM);
+    while !stop.load(Ordering::Relaxed) {
+        // 带超时地等：stop 一置位就能退出来，否则 `Drop` 里的 join 会吊死在
+        // 一个永远不来的包上。
+        let Ok(wire) = incoming.recv_timeout(Duration::from_millis(200)) else {
+            continue;
+        };
+        let Ok(header) = cipher.open(&wire, &mut payload) else {
+            continue;
+        };
+        shared.packets_received.fetch_add(1, Ordering::Relaxed);
+        if header.is_keepalive() {
+            // 保活是 UDP 那条路的探针，这条路收不到也不需要它。
             continue;
         }
-        speaker.ended = false;
-        speaker.last_voice = Instant::now();
-        speaker.jitter.push(header.seq, payload.clone());
+        deliver_inbound(shared, jitter_frames, header, &payload);
     }
 }
 
@@ -808,6 +924,7 @@ fn keepalive_loop(
     session_id: u32,
     key: [u8; 32],
     server: SocketAddr,
+    fallback: Option<Arc<dyn VoiceFallback>>,
 ) {
     let cipher = VoiceCipher::new(&key);
     let mut wire = Vec::with_capacity(VOICE_HEADER_LEN + 32);
@@ -818,6 +935,16 @@ fn keepalive_loop(
     // 两秒后倒着走的保活序号已经落在窗口外，被当成重放丢掉。
     // 表现是「UDP 时通时不通」，而语音本身看着一切正常。
     let mut seq: u32 = 0;
+
+    // ---- 走哪条路的状态机 ----
+    //
+    // 保活线程是唯一既知道「我发过探测」又看得到「回包来了没有」的地方，
+    // 所以判断放在这里。见 docs/design-notes.md。
+    let dead_after_ms = UDP_DEAD_AFTER.as_millis() as u64;
+    let mut via_tcp = false;
+    let mut seen_replies = 0u64;
+    let mut good_intervals = 0u32;
+
     // 一上来立刻发一个：服务端要靠它学到我们的地址，不然只听不说的人
     // 会完全听不见声音。
     loop {
@@ -840,6 +967,38 @@ fn keepalive_loop(
                 return;
             }
             std::thread::sleep(Duration::from_millis(50));
+        }
+
+        let replies = shared.keepalive_replies.load(Ordering::Relaxed);
+        let last = shared.last_keepalive_ms.load(Ordering::Relaxed);
+        let now = shared.now_ms();
+
+        if via_tcp {
+            // 退回去要**连着两个保活周期**都收到回包。一条正好卡在边缘的链路
+            // 会在两条路之间来回横跳，每跳一次声音断一下。
+            if replies > seen_replies {
+                good_intervals += 1;
+                if good_intervals >= 2 {
+                    via_tcp = false;
+                    good_intervals = 0;
+                }
+            } else {
+                good_intervals = 0;
+            }
+        } else {
+            // 一次回包都没收到过时 `last` 是 0，`now - last` 就是「链路起来
+            // 多久了」—— 所以刚起来那两秒不会被误判成不通，白切一次。
+            let stale = now.saturating_sub(last) >= dead_after_ms;
+            if stale {
+                via_tcp = true;
+                good_intervals = 0;
+            }
+        }
+        seen_replies = replies;
+
+        shared.via_tcp.store(via_tcp, Ordering::Relaxed);
+        if let Some(sink) = &fallback {
+            sink.set_via_tcp(via_tcp);
         }
     }
 }

@@ -16,8 +16,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use protocol::control::{
-    decode_frame, encode_frame, server_message, Authenticate, ClientMessage, Hello, ServerMessage,
-    Welcome, PROTOCOL_VERSION,
+    decode_frame, encode_frame, server_message, Authenticate, ClientMessage, Hello, Ping,
+    ServerMessage, VoiceFrame, Welcome, PROTOCOL_VERSION,
 };
 use protocol::{VoiceCipher, VoiceHeader, FLAG_KEEPALIVE};
 use rustls::pki_types::ServerName;
@@ -28,6 +28,9 @@ use transport::{client_config, derive_voice_key, server_config, ServerCert, DOWN
 use voice_core::identity::Identity;
 
 const RECV_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// `report_carrier` 用的栅栏时间戳。值随便，只要求原样回来。
+const CARRIER_BARRIER_STAMP: i64 = 0x5EED;
 
 struct TestServer {
     tcp: SocketAddr,
@@ -187,6 +190,56 @@ impl Client {
         let mut payload = Vec::new();
         let header = self.open.open(&buf[..n], &mut payload).expect("解不开");
         Some((header, payload))
+    }
+
+    /// 告诉服务端「我的语音现在走哪条路」，并**等 Pong 回来当栅栏**。
+    ///
+    /// 不等的话测试会飘：Ping 和服务端转发语音分别在两条线程上，
+    /// 报告还没处理完，语音已经先发出去了。
+    fn report_carrier(&mut self, via_tcp: bool) {
+        self.send(
+            Ping {
+                timestamp: CARRIER_BARRIER_STAMP,
+                udp_packets_received: 0,
+                voice_via_tcp: via_tcp,
+            }
+            .into(),
+        );
+        loop {
+            match self.recv().payload {
+                Some(server_message::Payload::Pong(pong)) => {
+                    assert_eq!(pong.timestamp, CARRIER_BARRIER_STAMP);
+                    return;
+                }
+                Some(_) => continue,
+                None => panic!("没等到 Pong"),
+            }
+        }
+    }
+
+    /// 从**控制面**收一个语音包并解开。中间别的广播丢掉。
+    fn recv_voice_over_tcp(&mut self) -> (VoiceHeader, Vec<u8>) {
+        loop {
+            match self.recv().payload {
+                Some(server_message::Payload::VoiceFrame(frame)) => {
+                    let mut payload = Vec::new();
+                    let header = self.open.open(&frame.packet, &mut payload).expect("解不开");
+                    return (header, payload);
+                }
+                Some(_) => continue,
+                None => panic!("认不出来的控制面消息"),
+            }
+        }
+    }
+
+    /// 从控制面发一个语音包 —— UDP 上行不通时客户端走的就是这条。
+    fn speak_over_tcp(&mut self, payload: &[u8]) -> VoiceHeader {
+        let header = self.header(0);
+        self.seq += 1;
+        let mut wire = Vec::new();
+        self.seal.seal(header, payload, &mut wire).unwrap();
+        self.send(VoiceFrame { packet: wire }.into_client());
+        header
     }
 }
 
@@ -352,6 +405,7 @@ fn pong_reports_udp_packet_count() {
         Ping {
             timestamp: 1,
             udp_packets_received: 0,
+            voice_via_tcp: false,
         }
         .into(),
     );
@@ -370,6 +424,7 @@ fn pong_reports_udp_packet_count() {
         Ping {
             timestamp: 2,
             udp_packets_received: 0,
+            voice_via_tcp: false,
         }
         .into(),
     );
@@ -380,4 +435,94 @@ fn pong_reports_udp_packet_count() {
         after.udp_packets_received, 3,
         "一个保活加两个语音包，服务端该数到 3"
     );
+}
+
+/// **UDP 收不到的人，语音必须能从控制面过去。**
+///
+/// 真实场景是公司网络把 UDP 整个挡掉：客户端发现保活一直不回来，于是在
+/// Ping 里报告自己改走控制面。服务端照这个字段把别人的语音从**他那条
+/// TLS 连接**发过去，而不是继续往一个他永远收不到的 UDP 地址上发。
+#[test]
+fn voice_reaches_a_peer_that_reports_udp_is_broken() {
+    let server = start();
+    let mut alice = Client::join(&server, "阿狸");
+    let mut bob = Client::join(&server, "波波");
+
+    alice.keepalive();
+    bob.keepalive();
+
+    // 波波宣布：我的语音走控制面。
+    bob.report_carrier(true);
+
+    let payload: Vec<u8> = (0..64u8).collect();
+    let sent = alice.speak(&payload);
+
+    let (header, got) = bob.recv_voice_over_tcp();
+    assert_eq!(got, payload, "TCP 这条路上负载被改了");
+    assert_eq!(
+        header.session, alice.welcome.session_id,
+        "包里的说话者不是阿狸"
+    );
+    assert_eq!(header.seq, sent.seq, "seq 必须原样带过去");
+
+    // 而且**不该**再从 UDP 收到第二份 —— 两条路都发就是重复帧。
+    bob.udp
+        .set_read_timeout(Some(Duration::from_millis(300)))
+        .unwrap();
+    assert!(
+        bob.recv_voice().is_none(),
+        "宣布走 TCP 之后还往 UDP 发了一份"
+    );
+}
+
+/// 宣布退回 UDP 之后，语音要**立刻**回到 UDP。
+///
+/// 不测这条的话，「UDP 好了还一直挤在 TCP 上」会是一种没人发现的状态 ——
+/// 而 TCP 传语音是下策，一次丢包就把延迟顶到几百毫秒。
+#[test]
+fn voice_returns_to_udp_when_the_peer_says_so() {
+    let server = start();
+    let mut alice = Client::join(&server, "阿狸");
+    let mut bob = Client::join(&server, "波波");
+
+    alice.keepalive();
+    bob.keepalive();
+
+    bob.report_carrier(true);
+    alice.speak(&[1; 40]);
+    bob.recv_voice_over_tcp();
+
+    // 网络好了，切回来。
+    bob.report_carrier(false);
+    let sent = alice.speak(&[2; 40]);
+
+    let (header, got) = bob.recv_voice().expect("退回 UDP 之后语音没走 UDP");
+    assert_eq!(got, vec![2u8; 40]);
+    assert_eq!(header.seq, sent.seq);
+}
+
+/// 上行 UDP 不通的人**从控制面把语音发上来**，服务端照样转给同频道的人。
+///
+/// 这是另一半：只做下行的话，链路是单向的 —— 他能听见别人，
+/// 别人听不见他，比完全不通更难查。
+#[test]
+fn voice_sent_over_the_control_plane_is_forwarded() {
+    let server = start();
+    let mut alice = Client::join(&server, "阿狸");
+    let mut bob = Client::join(&server, "波波");
+
+    alice.keepalive();
+    bob.keepalive();
+
+    let payload: Vec<u8> = (0..80u8).collect();
+    // 阿狸的 UDP 上行不通，她从控制面说。
+    let sent = alice.speak_over_tcp(&payload);
+
+    let (header, got) = bob.recv_voice().expect("波波没听见阿狸说话");
+    assert_eq!(got, payload, "转发过程中负载被改了");
+    assert_eq!(
+        header.session, alice.welcome.session_id,
+        "包里的说话者不是阿狸"
+    );
+    assert_eq!(header.seq, sent.seq);
 }

@@ -320,6 +320,8 @@ fn start_voice(app: &App, state: &Arc<Mutex<State>>, client: &Client) {
         downstream_key: *client.voice_keys().downstream.as_bytes(),
         jitter_frames: DEFAULT_JITTER_FRAMES,
         mode,
+        // UDP 被挡掉的网络里，语音从这里走控制面。见 docs/design-notes.md。
+        fallback: Some(client.voice_fallback()),
     };
 
     let (capture_id, render_id) = {

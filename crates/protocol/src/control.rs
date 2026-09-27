@@ -193,6 +193,23 @@ impl TextMessage {
     }
 }
 
+// VoiceFrame 同理：两边都有，方向写在方法名上。
+impl VoiceFrame {
+    /// 包成客户端要发出去的消息。
+    pub fn into_client(self) -> ClientMessage {
+        ClientMessage {
+            payload: Some(client_message::Payload::VoiceFrame(self)),
+        }
+    }
+
+    /// 包成服务端要转发出去的消息。
+    pub fn into_server(self) -> ServerMessage {
+        ServerMessage {
+            payload: Some(server_message::Payload::VoiceFrame(self)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,6 +241,7 @@ mod tests {
         let b: ClientMessage = Ping {
             timestamp: 42,
             udp_packets_received: 7,
+            voice_via_tcp: false,
         }
         .into();
         encode_frame(&a, &mut buf).unwrap();
@@ -391,6 +409,39 @@ mod tests {
             let _ = decode_frame::<ClientMessage>(&bytes);
             let _ = decode_frame::<ServerMessage>(&bytes);
             let _ = peek_frame_len(&bytes);
+        }
+    }
+
+    /// UDP 不通时语音改走这条控制面，**搬的必须是逐字节相同的那一份**。
+    ///
+    /// 差一个字节，对面 AEAD 就验不过 —— 而且失败方式是「静音」，
+    /// 不是报错，最难查。
+    #[test]
+    fn voice_frames_survive_the_control_plane_byte_for_byte() {
+        let packet: Vec<u8> = (0..=255u8).collect();
+
+        let msg = VoiceFrame {
+            packet: packet.clone(),
+        }
+        .into_client();
+        let mut buf = Vec::new();
+        encode_frame(&msg, &mut buf).unwrap();
+        let (decoded, _) = decode_frame::<ClientMessage>(&buf).unwrap().unwrap();
+        match decoded.payload {
+            Some(client_message::Payload::VoiceFrame(f)) => assert_eq!(f.packet, packet),
+            other => panic!("客户端方向解出来的不是语音包：{other:?}"),
+        }
+
+        let msg = VoiceFrame {
+            packet: packet.clone(),
+        }
+        .into_server();
+        let mut buf = Vec::new();
+        encode_frame(&msg, &mut buf).unwrap();
+        let (decoded, _) = decode_frame::<ServerMessage>(&buf).unwrap().unwrap();
+        match decoded.payload {
+            Some(server_message::Payload::VoiceFrame(f)) => assert_eq!(f.packet, packet),
+            other => panic!("服务端方向解出来的不是语音包：{other:?}"),
         }
     }
 }

@@ -54,6 +54,13 @@ struct VoicePeer {
     /// 从收到的包里学到的源地址。`None` 表示这个人还没发过语音
     /// （刚登录、或者 UDP 不通）。
     addr: Option<SocketAddr>,
+    /// 这个人的语音现在走哪条路：`true` = 控制面（TCP），`false` = UDP。
+    ///
+    /// 由客户端在自己的 `Ping` 里报，服务端**不猜**。从现象去推（「他很久没发
+    /// 保活了」）在上行通、下行不通的人身上是错的：服务端手里的证据一切正常，
+    /// 而他在那头发呆。理由见 `protocol::control::Ping::voice_via_tcp`
+    /// 和 docs/design-notes.md。
+    via_tcp: bool,
     received: u64,
     replay: ReplayWindow,
     /// 保活包**单独一个窗口**。
@@ -70,6 +77,19 @@ pub struct VoiceRouter {
     peers: Mutex<HashMap<SessionId, VoicePeer>>,
     /// 反查：源地址 → 会话。只在验签通过之后才写。
     by_addr: Mutex<HashMap<SocketAddr, SessionId>>,
+}
+
+/// 一个包该发给谁、各走哪条路。由 [`VoiceRouter::plan`] 算出来。
+///
+/// 两边分开存，是因为「发」这件事完全不同：UDP 那一半 `VoiceRouter` 自己有
+/// socket，TCP 那一半必须经过**每条连接各自的写通道** —— 而 `VoiceRouter`
+/// 不认识连接，也不该认识。
+#[derive(Default)]
+pub struct Plan {
+    /// 走 UDP 的：地址 + 已经用收方密钥封好的字节。
+    pub udp: Vec<(SocketAddr, Vec<u8>)>,
+    /// 走控制面的：会话 id + 已经封好的字节。调用方按会话找到那条连接发出去。
+    pub tcp: Vec<(SessionId, Vec<u8>)>,
 }
 
 /// 一个验过签的入站包。
@@ -109,6 +129,7 @@ impl VoiceRouter {
                 upstream: VoiceCipher::new(upstream),
                 downstream: VoiceCipher::new(downstream),
                 addr: None,
+                via_tcp: false,
                 received: 0,
                 replay: ReplayWindow::default(),
                 keepalive_replay: ReplayWindow::default(),
@@ -214,12 +235,65 @@ impl VoiceRouter {
         }
     }
 
-    /// 把一个包封给这些人并发出去。返回真正发出去了几个。
+    /// 客户端报告自己的语音现在走哪条路。服务端照这个决定往哪条路发给他。
+    ///
+    /// 认不出来的会话直接忽略：人可能刚好在这一刻走了。
+    pub fn set_carrier(&self, session: SessionId, via_tcp: bool) {
+        if let Some(peer) = self
+            .peers
+            .lock()
+            .expect("voice peers poisoned")
+            .get_mut(&session)
+        {
+            peer.via_tcp = via_tcp;
+        }
+    }
+
+    /// 校验一个从**控制面**收到的语音包。
+    ///
+    /// 跟 [`Self::accept`] 的差别只有来源：这条 TLS 连接已经认证过，所以
+    /// 「是谁在说话」是确定的，不必像 UDP 那边先按明文头查表、再靠 tag 反推。
+    /// 但它仍然解密、仍然过防重放窗口 —— 不为同样的输入养出第二条要单独
+    /// 论证的解包路径。
+    ///
+    /// **不学地址**：这条路上没有地址可学。
+    pub fn accept_tcp(&self, session: SessionId, datagram: &[u8]) -> Option<Forward> {
+        let mut peers = self.peers.lock().expect("voice peers poisoned");
+        let peer = peers.get_mut(&session)?;
+
+        let mut payload = Vec::with_capacity(datagram.len());
+        let mut header = match peer.upstream.open(datagram, &mut payload) {
+            Ok(header) => header,
+            Err(_) => return None,
+        };
+        if !peer.replay.accept(header.seq) {
+            return None;
+        }
+        peer.received += 1;
+
+        if header.is_keepalive() {
+            // 保活的全部意义是「学地址 + 探 UDP 通不通」，两件事在 TCP 上都不存在。
+            return None;
+        }
+
+        // **头部里的 session 一律以连接为准。** 它也被 AEAD 保护着，但那是用
+        // **自己的**密钥保护的 —— 拿自己的密钥填别人的 session，在自己身上是
+        // 合法的。转发前盖掉，谣言就传不出去。
+        header.session = session;
+        Some(Forward {
+            header,
+            payload,
+            from: session,
+        })
+    }
+
+    /// 谁该收这个包、各自走哪条路。**只做决定和封包，一个字节都不发** ——
+    /// 发的时候不持锁，见模块文档。
     ///
     /// 头部原样带过去：里面的 session / seq / timestamp 是**说话者的**，
     /// 收方的抖动缓冲全靠它排序。换的只是密钥。
-    pub fn deliver(&self, forward: &Forward, targets: &[SessionId]) -> usize {
-        let mut outgoing: Vec<(SocketAddr, Vec<u8>)> = Vec::with_capacity(targets.len());
+    pub fn plan(&self, forward: &Forward, targets: &[SessionId]) -> Plan {
+        let mut plan = Plan::default();
         {
             let peers = self.peers.lock().expect("voice peers poisoned");
             for &target in targets {
@@ -229,26 +303,34 @@ impl VoiceRouter {
                 let Some(peer) = peers.get(&target) else {
                     continue;
                 };
-                // 还没发过语音的人，我们不知道往哪发。等他自己先出声。
-                let Some(addr) = peer.addr else {
-                    continue;
-                };
                 let mut wire = Vec::with_capacity(MAX_DATAGRAM);
                 if peer
                     .downstream
                     .seal(forward.header, &forward.payload, &mut wire)
-                    .is_ok()
+                    .is_err()
                 {
-                    outgoing.push((addr, wire));
+                    continue;
                 }
+                if peer.via_tcp {
+                    plan.tcp.push((target, wire));
+                } else if let Some(addr) = peer.addr {
+                    plan.udp.push((addr, wire));
+                }
+                // 既没说自己走 TCP、又还没学到 UDP 地址 —— 这条路上现在没有他。
+                // 等他发第一个保活（或者宣布改走 TCP），下一包就补上了。
             }
         }
+        plan
+    }
 
-        // 发的时候**不持锁**：一次 send_to 在发送缓冲满时会阻塞，
-        // 持着锁阻塞等于把整个语音路径停掉。
+    /// 把 UDP 那一半发出去。返回真正发出去了几个。
+    ///
+    /// 发的时候**不持锁**：一次 send_to 在发送缓冲满时会阻塞，
+    /// 持着锁阻塞等于把整个语音路径停掉。
+    pub fn send_udp(&self, datagrams: &[(SocketAddr, Vec<u8>)]) -> usize {
         let mut sent = 0;
-        for (addr, wire) in outgoing {
-            if self.socket.send_to(&wire, addr).is_ok() {
+        for (addr, wire) in datagrams {
+            if self.socket.send_to(wire, addr).is_ok() {
                 sent += 1;
             }
         }
@@ -513,5 +595,158 @@ mod tests {
             router.by_addr.lock().unwrap().is_empty(),
             "走了之后地址映射也要清掉"
         );
+    }
+
+    /// 拿**自己的**密钥、把头里的 session 填成别人 —— 这在 AEAD 层面是合法的
+    /// （tag 保护的正是自己这把钥匙）。
+    ///
+    /// 要是不盖掉，这就是一条凭密钥伪造「某人在说话」的路，而「来源由连接确定」
+    /// 恰恰是 TCP 这条路相对 UDP 的优点。
+    #[test]
+    fn a_tcp_frame_cannot_claim_another_session() {
+        let router = VoiceRouter::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+        let up = [1u8; 32];
+        router.register(7, &up, &[2u8; 32]);
+        router.register(9, &[3u8; 32], &[4u8; 32]);
+
+        let mut wire = Vec::new();
+        VoiceCipher::new(&up)
+            .seal(
+                VoiceHeader {
+                    session: 9,
+                    seq: 1,
+                    timestamp: 0,
+                    flags: 0,
+                },
+                &[9; 40],
+                &mut wire,
+            )
+            .unwrap();
+
+        let forward = router.accept_tcp(7, &wire).expect("自己的密钥该解得开");
+        assert_eq!(forward.from, 7, "来源必须是连接给的 7，不是头里自称的 9");
+        assert_eq!(forward.header.session, 7, "转发出去的头里也必须是 7");
+    }
+
+    /// 收件人报告自己走哪条路，包就往哪条路走 —— 而且**每人只走一条**。
+    /// 两条都发的话对面会收到重复帧。
+    #[test]
+    fn plan_sends_each_recipient_over_exactly_one_carrier() {
+        let router = VoiceRouter::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+        router.register(1, &[1u8; 32], &[2u8; 32]);
+        router.register(2, &[3u8; 32], &[4u8; 32]);
+        router.register(3, &[5u8; 32], &[6u8; 32]);
+
+        // 2 号发过包，服务端学到了他的地址；3 号报告自己走控制面。
+        let addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let mut wire = Vec::new();
+        VoiceCipher::new(&[3u8; 32])
+            .seal(
+                VoiceHeader {
+                    session: 2,
+                    seq: 1,
+                    timestamp: 0,
+                    flags: 0,
+                },
+                &[9; 40],
+                &mut wire,
+            )
+            .unwrap();
+        router.accept(addr, &wire).unwrap();
+        router.set_carrier(3, true);
+
+        let forward = Forward {
+            header: VoiceHeader {
+                session: 1,
+                seq: 1,
+                timestamp: 0,
+                flags: 0,
+            },
+            payload: vec![7; 40],
+            from: 1,
+        };
+        let plan = router.plan(&forward, &[1, 2, 3]);
+
+        // 1 号是说话的人自己，谁都不发给他。
+        assert_eq!(plan.udp.len(), 1, "只有 2 号该走 UDP");
+        assert_eq!(plan.udp[0].0, addr);
+        assert_eq!(plan.tcp.len(), 1, "只有 3 号该走 TCP");
+        assert_eq!(plan.tcp[0].0, 3, "走 TCP 的该是 3 号");
+    }
+
+    /// **一条地址都没有、也没说走 TCP 的人，两条路都不发给他。**
+    /// 这正是「只听不说」的人原来的处境 —— 他得先发个保活，服务端才知道往哪发。
+    #[test]
+    fn a_silent_peer_with_no_address_gets_nothing() {
+        let router = VoiceRouter::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+        router.register(1, &[1u8; 32], &[2u8; 32]);
+        router.register(2, &[3u8; 32], &[4u8; 32]);
+
+        let forward = Forward {
+            header: VoiceHeader {
+                session: 1,
+                seq: 1,
+                timestamp: 0,
+                flags: 0,
+            },
+            payload: vec![7; 40],
+            from: 1,
+        };
+        let plan = router.plan(&forward, &[1, 2]);
+        assert!(plan.udp.is_empty() && plan.tcp.is_empty());
+    }
+
+    /// TCP 不保证不重复 —— 一次重传就是一模一样的字节再来一遍。
+    /// 所以防重放窗口在这条路上同样要过，不然表现就是「偶尔一个音节重复」。
+    #[test]
+    fn a_replayed_tcp_frame_is_dropped() {
+        let router = VoiceRouter::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+        let up = [1u8; 32];
+        router.register(7, &up, &[2u8; 32]);
+
+        let mut wire = Vec::new();
+        VoiceCipher::new(&up)
+            .seal(
+                VoiceHeader {
+                    session: 7,
+                    seq: 5,
+                    timestamp: 0,
+                    flags: 0,
+                },
+                &[9; 40],
+                &mut wire,
+            )
+            .unwrap();
+
+        assert!(router.accept_tcp(7, &wire).is_some());
+        assert!(
+            router.accept_tcp(7, &wire).is_none(),
+            "同一个包第二次必须丢"
+        );
+    }
+
+    /// 保活只对 UDP 那条路有意义（学地址、探通不通）。从 TCP 上来一个，
+    /// 该当没看见 —— 转发出去的话所有人都会听到一声空响。
+    #[test]
+    fn a_keepalive_over_tcp_is_not_forwarded() {
+        let router = VoiceRouter::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+        let up = [1u8; 32];
+        router.register(7, &up, &[2u8; 32]);
+
+        let mut wire = Vec::new();
+        VoiceCipher::new(&up)
+            .seal(
+                VoiceHeader {
+                    session: 7,
+                    seq: 1,
+                    timestamp: 0,
+                    flags: FLAG_KEEPALIVE,
+                },
+                &[],
+                &mut wire,
+            )
+            .unwrap();
+
+        assert!(router.accept_tcp(7, &wire).is_none());
     }
 }

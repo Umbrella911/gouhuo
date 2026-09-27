@@ -123,6 +123,7 @@ impl Client {
         self.send(Ping {
             timestamp: stamp,
             udp_packets_received: 0,
+            voice_via_tcp: false,
         });
         for _ in 0..16 {
             if let Some(server_message::Payload::Pong(pong)) = self.recv().payload {

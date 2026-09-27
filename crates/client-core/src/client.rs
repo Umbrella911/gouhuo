@@ -218,6 +218,15 @@ struct Shared {
     /// 上一次收到服务端任何东西的时刻，相对 `epoch` 的毫秒数。
     last_heard_ms: AtomicU64,
     epoch: Instant,
+
+    /// 语音现在走哪条路。`voice-core` 的保活线程通过 [`Client::voice_fallback`]
+    /// 交出去的那个 sink 写进来，心跳读它、在 `Ping` 里捎给服务端。
+    voice_via_tcp: Arc<AtomicBool>,
+    /// 从控制面收到的语音包往这儿放，`voice-core` 那个线程取走。
+    ///
+    /// 存的是**发送端**：接收端在建语音链路时被移交给 `voice-core`，
+    /// 控制面这边只留一个发送端。
+    voice_inbox: Mutex<Option<Sender<Vec<u8>>>>,
 }
 
 impl Shared {
@@ -247,6 +256,31 @@ impl Shared {
     fn silent_for(&self) -> Duration {
         let now = self.epoch.elapsed().as_millis() as u64;
         Duration::from_millis(now.saturating_sub(self.last_heard_ms.load(Ordering::Relaxed)))
+    }
+}
+
+/// 语音链路和控制面之间的桥。
+///
+/// `voice-core` 只认 [`voice_core::pipeline::VoiceFallback`]，不认识 TLS；
+/// 这里把「一包封好的字节」变成一条 `ClientMessage::VoiceFrame` 发出去。
+struct FallbackSink {
+    shared: Arc<Shared>,
+}
+
+impl voice_core::pipeline::VoiceFallback for FallbackSink {
+    fn send(&self, packet: &[u8]) {
+        // 走 `link()` 而不是自己抓一个 `Arc<Link>`：重连会换掉整个 Link，
+        // 抓着旧的那个就会一直往一条已经关掉的连接上发。
+        self.shared.link().send(
+            &protocol::control::VoiceFrame {
+                packet: packet.to_vec(),
+            }
+            .into_client(),
+        );
+    }
+
+    fn set_via_tcp(&self, via_tcp: bool) {
+        self.shared.voice_via_tcp.store(via_tcp, Ordering::Relaxed);
     }
 }
 
@@ -305,6 +339,8 @@ impl Client {
             wake_lock: Mutex::new(()),
             last_heard_ms: AtomicU64::new(0),
             epoch: Instant::now(),
+            voice_via_tcp: Arc::new(AtomicBool::new(false)),
+            voice_inbox: Mutex::new(None),
         });
 
         let (tx, rx) = mpsc::channel();
@@ -348,6 +384,26 @@ impl Client {
     /// 当前这次连接的语音密钥。**重连之后会变。**
     pub fn voice_keys(&self) -> Arc<VoiceKeys> {
         Arc::clone(&self.shared.link().voice)
+    }
+
+    /// 给语音链路接上 UDP 不通时的那条退路。
+    ///
+    /// 界面建 `Pipeline` 的时候把它填进 `PipelineConfig::fallback`。
+    /// **每建一条语音链路调一次**：接收端只能有一个主人，调第二次会把上一条
+    /// 链路的接收端换掉（旧的那个随后因为没有发送端而自己退出）。
+    pub fn voice_fallback(&self) -> voice_core::pipeline::VoiceFallbackBridge {
+        let (tx, rx) = mpsc::channel();
+        *self
+            .shared
+            .voice_inbox
+            .lock()
+            .expect("voice inbox poisoned") = Some(tx);
+        voice_core::pipeline::VoiceFallbackBridge {
+            sink: Arc::new(FallbackSink {
+                shared: Arc::clone(&self.shared),
+            }),
+            incoming: rx,
+        }
     }
 
     /// 借出名单来画界面。**别在持有它的时候做慢事情** ——
@@ -560,6 +616,27 @@ fn read_until_end(shared: &Shared, reader: &mut Reader, tx: &Sender<Event>) -> O
                     let (headline, advice) = farewell(reason, &bye.detail);
                     return Outcome::Goodbye(Ended::Refused { headline, advice });
                 }
+                // 语音那条退路的包**不进名单** —— 它是一次状态变更之外的东西，
+                // `apply` 不认识它。直接交给语音线程。
+                if matches!(
+                    &message.payload,
+                    Some(server_message::Payload::VoiceFrame(_))
+                ) {
+                    if let Some(server_message::Payload::VoiceFrame(frame)) = message.payload {
+                        if let Some(inbox) = shared
+                            .voice_inbox
+                            .lock()
+                            .expect("voice inbox poisoned")
+                            .as_ref()
+                        {
+                            // **用 `send` 而不是阻塞等待**：队列满了宁可丢这一帧，
+                            // 也不能把控制面的读卡住 —— 那会让心跳判成掉线，
+                            // 为了一个语音包把整条连接赔进去。
+                            let _ = inbox.send(frame.packet);
+                        }
+                    }
+                    continue;
+                }
                 for event in apply(&shared.roster, message) {
                     if tx.send(event).is_err() {
                         return Outcome::Abandoned;
@@ -718,6 +795,9 @@ fn heartbeat(shared: Arc<Shared>) {
             &Ping {
                 timestamp: now_ms(),
                 udp_packets_received: 0,
+                // 语音走哪条路由语音链路判断，这里只是把它捎给服务端 ——
+                // 服务端照这个决定往哪条路发我们，见 protocol::control::Ping。
+                voice_via_tcp: shared.voice_via_tcp.load(Ordering::Relaxed),
             }
             .into(),
         );

@@ -38,14 +38,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use protocol::control::{
     client_message, decode_frame, encode_frame, goodbye, peek_frame_len, Challenge, ClientMessage,
-    Goodbye, Rejected, Role, ServerMessage, MAX_FRAME_BODY, PROTOCOL_VERSION,
+    Goodbye, Rejected, Role, ServerMessage, VoiceFrame, MAX_FRAME_BODY, PROTOCOL_VERSION,
 };
 use protocol::PublicKey;
 use voice_core::identity::Identity;
 
 use crate::state::{Broadcast, Server, SessionId};
 use crate::store::Store;
-use crate::voice::{Incoming, VoiceRouter};
+use crate::voice::{Forward, Incoming, VoiceRouter};
 
 /// 多久没收到任何东西就算掉线。客户端每隔几秒会发一次 Ping。
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -291,18 +291,38 @@ impl Hub {
             };
 
             // 只查一次状态就放开锁 —— 后面封包和发包都不持锁。
-            let targets = {
-                let state = self.state.lock().expect("state poisoned");
-                match state.channel_of(forward.from) {
-                    Some(channel) => state.sessions_in_channel(channel),
-                    None => Vec::new(),
-                }
-            };
-            if targets.len() < 2 {
-                // 频道里只有他自己。不用发给任何人。
-                continue;
+            self.forward_voice(forward);
+        }
+    }
+
+    /// 把一个验过签的语音包转发给同频道的其他人。
+    ///
+    /// UDP 通的人走 UDP；客户端报告自己走控制面的人，走他**自己那条 TLS 连接**。
+    /// 两条路由谁走是收件人自己报的，见 [`crate::voice::Plan`]。
+    fn forward_voice(&self, forward: Forward) {
+        let targets = {
+            let state = self.state.lock().expect("state poisoned");
+            match state.channel_of(forward.from) {
+                Some(channel) => state.sessions_in_channel(channel),
+                None => Vec::new(),
             }
-            self.voice.deliver(&forward, &targets);
+        };
+        if targets.len() < 2 {
+            // 频道里只有他自己。不用发给任何人。
+            return;
+        }
+
+        let plan = self.voice.plan(&forward, &targets);
+        self.voice.send_udp(&plan.udp);
+        if plan.tcp.is_empty() {
+            return;
+        }
+        // peers 只取一次快照：字节已经封好了，不需要为了找连接反复上锁。
+        let peers = self.peers.lock().expect("peers poisoned");
+        for (session, wire) in plan.tcp {
+            if let Some(peer) = peers.get(&session) {
+                peer.send(&VoiceFrame { packet: wire }.into_server());
+            }
         }
     }
 
@@ -544,6 +564,9 @@ fn message_loop(
 
         let events = match message.payload {
             Some(client_message::Payload::Ping(ping)) => {
+                // 语音现在走哪条路，**收件人自己说了算**，服务端不猜 ——
+                // 见 protocol::control::Ping::voice_via_tcp。
+                hub.voice.set_carrier(peer.session, ping.voice_via_tcp);
                 let mut w = wire.lock().expect("wire poisoned");
                 w.send(
                     &Pong {
@@ -554,6 +577,14 @@ fn message_loop(
                     }
                     .into(),
                 )?;
+                Vec::new()
+            }
+            Some(client_message::Payload::VoiceFrame(frame)) => {
+                // UDP 不通时语音从这条控制面上来。是谁在说话由这条 TLS 连接
+                // 本身确定，不必像 UDP 那边先去猜 —— 见 VoiceRouter::accept_tcp。
+                if let Some(forward) = hub.voice.accept_tcp(peer.session, &frame.packet) {
+                    hub.forward_voice(forward);
+                }
                 Vec::new()
             }
             Some(client_message::Payload::JoinChannel(join)) => {
