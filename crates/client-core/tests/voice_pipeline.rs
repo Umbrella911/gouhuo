@@ -177,6 +177,54 @@ fn a_chirp_makes_it_all_the_way_through() {
     );
 }
 
+/// 对方还没开口就把他调成 0，开口时就该听不见。
+///
+/// 回归：原来音量存在「说话人」对象身上，而那个对象收到第一个包才建 ——
+/// 开口前调的音量直接被丢掉，而且一个人安静 30 秒被清掉、再开口时也会
+/// 悄悄回到 100%。界面上的音量是按人存的，进频道时就设好，两种情况都会踩到。
+#[test]
+fn a_volume_set_before_anyone_speaks_still_applies() {
+    let server = start_server();
+    let alice = join(&server, "阿狸");
+    let bob = join(&server, "波波");
+
+    let mut source = vec![0.0f32; FRAME_SAMPLES * LEAD_FRAMES];
+    source.extend_from_slice(&chirp_f32(FRAME_SAMPLES * CHIRP_FRAMES));
+    source.extend(std::iter::repeat(0.0).take(FRAME_SAMPLES * TAIL_FRAMES));
+
+    let (render, played) = CollectingRender::new();
+    let silent = SyntheticCapture::new(Vec::new()).then_silence();
+    let bob_voice = Pipeline::start(
+        voice_config(&bob, &server, TransmitMode::PushToTalk),
+        Box::new(silent),
+        Box::new(render),
+        None,
+    )
+    .unwrap();
+    // 阿狸一个包都还没发，波波就先把她静音了
+    bob_voice.set_volume(alice.session_id(), 0.0);
+
+    let _alice_voice = Pipeline::start(
+        voice_config(&alice, &server, TransmitMode::Always),
+        Box::new(SyntheticCapture::new(source).then_silence()),
+        Box::new(NullRender::default()),
+        None,
+    )
+    .unwrap();
+
+    let total_frames = LEAD_FRAMES + CHIRP_FRAMES + TAIL_FRAMES;
+    std::thread::sleep(Duration::from_millis((total_frames * 10 + 500) as u64));
+
+    let stats = bob_voice.stats();
+    assert!(
+        stats.packets_received > 100,
+        "波波没收到包，这条测试就什么都没证明：{stats:?}"
+    );
+    let played = played.lock().unwrap().clone();
+    let energy: f32 = played.iter().map(|s| s * s).sum();
+    assert_eq!(energy, 0.0, "调成 0 的人还是听得见");
+}
+
 /// **量端到端延迟。** 见模块文档：这个数字不含声卡和 APM。
 #[test]
 fn end_to_end_latency_is_measured_not_added_up() {

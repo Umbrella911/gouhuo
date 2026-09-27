@@ -68,6 +68,12 @@ const SPEAKING_TIMEOUT: Duration = Duration::from_millis(200);
 /// 多久没收到某个人的任何包就把他的解码器扔掉。
 const SPEAKER_IDLE: Duration = Duration::from_secs(30);
 
+/// 单人音量的上限：400%。
+///
+/// 有人麦克风离得远、增益又低，100% 听不清，要能拉上去。再高就没有意义了 ——
+/// 混音那头有 tanh 软限幅，放大到这个程度原本的动态已经被压平了。
+pub const MAX_VOLUME: f32 = 4.0;
+
 /// 多久收不到保活回包就认为 UDP 不通。
 const UDP_DEAD_AFTER: Duration = Duration::from_secs(8);
 
@@ -219,6 +225,16 @@ pub struct Pipeline {
 
 struct Shared {
     speakers: Mutex<BTreeMap<u32, Speaker>>,
+    /// 每个人的音量，按会话 id。**跟 [`Speaker`] 分开存**：
+    ///
+    /// - `Speaker` 是收到第一个包才建的，而用户可能在对方开口之前就调好了
+    /// - 安静超过 [`SPEAKER_IDLE`] 的 `Speaker` 会被清掉，下次开口重建 ——
+    ///   音量要是只存在它身上，歇一会儿就悄悄回到 100% 了
+    ///
+    /// `Speaker::volume` 是这里的缓存，播放线程每帧读它就不用多拿一把锁。
+    /// 锁的顺序永远是先 `speakers` 后 `volumes`，[`Pipeline::set_volume`]
+    /// 两把分开拿、不嵌套。
+    volumes: Mutex<BTreeMap<u32, f32>>,
     packets_sent: AtomicU64,
     packets_received: AtomicU64,
     underruns: AtomicU64,
@@ -275,6 +291,7 @@ impl Pipeline {
         let monitoring = Arc::new(AtomicBool::new(false));
         let shared = Arc::new(Shared {
             speakers: Mutex::new(BTreeMap::new()),
+            volumes: Mutex::new(BTreeMap::new()),
             packets_sent: AtomicU64::new(0),
             packets_received: AtomicU64::new(0),
             underruns: AtomicU64::new(0),
@@ -416,11 +433,25 @@ impl Pipeline {
         TransmitMode::decode(self.mode.load(Ordering::Relaxed))
     }
 
-    /// 单独调某个人的音量。0.0 是静音，1.0 是原样。
+    /// 单独调某个人的音量。0.0 是静音，1.0 是原样，最大 [`MAX_VOLUME`]。
+    ///
+    /// 对方还没开口也可以先调，开口时就是这个音量；安静一阵之后再开口也还是。
     pub fn set_volume(&self, session: u32, volume: f32) {
+        let volume = if volume.is_finite() {
+            volume.clamp(0.0, MAX_VOLUME)
+        } else {
+            1.0
+        };
+        if let Ok(mut volumes) = self.shared.volumes.lock() {
+            if volume == 1.0 {
+                volumes.remove(&session);
+            } else {
+                volumes.insert(session, volume);
+            }
+        }
         if let Ok(mut speakers) = self.shared.speakers.lock() {
             if let Some(speaker) = speakers.get_mut(&session) {
-                speaker.volume = volume.clamp(0.0, 4.0);
+                speaker.volume = volume;
             }
         }
     }
@@ -644,9 +675,17 @@ fn recv_loop(
         let speaker = match speakers.entry(header.session) {
             std::collections::btree_map::Entry::Occupied(e) => e.into_mut(),
             std::collections::btree_map::Entry::Vacant(e) => {
-                let Ok(speaker) = Speaker::new(jitter_frames) else {
+                let Ok(mut speaker) = Speaker::new(jitter_frames) else {
                     continue;
                 };
+                if let Some(&volume) = shared
+                    .volumes
+                    .lock()
+                    .expect("volumes poisoned")
+                    .get(&header.session)
+                {
+                    speaker.volume = volume;
+                }
                 e.insert(speaker)
             }
         };
