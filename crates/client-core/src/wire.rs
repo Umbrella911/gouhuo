@@ -56,6 +56,12 @@ impl Reader {
         }
     }
 
+    /// 撤掉读超时。**要在读用的这个句柄上撤**：Windows 上 `try_clone`
+    /// 出来的句柄各自带着自己的读超时，在别的句柄上撤，这边照样会超时。
+    pub fn clear_read_timeout(&self) -> io::Result<()> {
+        self.sock.set_read_timeout(None)
+    }
+
     /// 取下一条消息。返回 `Ok(None)` 表示对面关了。
     pub fn next<M: Message + Default>(&mut self) -> io::Result<Option<M>> {
         loop {

@@ -13,10 +13,13 @@
 //!
 //! # 线程
 //!
-//! 一条连接两个线程：
+//! 一个 [`Client`] 两个线程，**活得比底下的 TCP 连接久**（断了会自己重连，
+//! 见 `client` 模块的文档）：
 //!
-//! - **读线程**：阻塞读 TLS，解出消息，更新 [`Roster`]，往 channel 里发 [`Event`]
-//! - **心跳线程**：定期发 Ping。服务端 30 秒不收东西就踢人
+//! - **读线程**：阻塞读 TLS，解出消息，更新 [`Roster`]，往 channel 里发 [`Event`]；
+//!   连接断了就由它按退避重连
+//! - **心跳线程**：定期发 Ping（服务端 30 秒不收东西就踢人），顺带看服务端
+//!   多久没动静了 —— 太久就掐掉连接，让读线程去重连
 //!
 //! 界面线程既不读也不写 socket，它只是 channel 的另一端。所以界面卡住了
 //! 不会导致掉线，网络卡住了也不会冻住界面 —— 这两件事在语音软件里都会发生。
@@ -27,7 +30,10 @@ pub mod roster;
 mod client;
 mod wire;
 
-pub use client::{Client, Event};
+pub use client::{
+    Client, Ended, Event, Options, CONNECT_TIMEOUT, HEARTBEAT, LIVENESS_TIMEOUT, RECONNECT_FIRST,
+    RECONNECT_MAX,
+};
 pub use error::ConnectError;
 pub use roster::{ChannelNode, ChatLine, Roster, MAX_CHAT_LINES};
 

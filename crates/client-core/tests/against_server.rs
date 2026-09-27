@@ -13,7 +13,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::Arc;
 use std::time::Duration;
 
-use client_core::{Client, ConnectError, Event};
+use client_core::{Client, ConnectError, Ended, Event};
 use protocol::control::rejected::Reason;
 use protocol::Invite;
 use server::conn::Hub;
@@ -213,8 +213,10 @@ fn leaving_is_announced_with_the_name() {
     let bob_session = bob.session_id();
 
     bob.disconnect();
-    // 断开的人自己也要收到通知，界面才知道该切回未连接状态
-    wait_for(&bob_events, |e| matches!(e, Event::Disconnected(_)));
+    // 断开的人自己也要收到通知，界面才知道该切回未连接状态。
+    // 而且要标明是自己走的 —— 不能重连，界面也不该报错。
+    let ended = wait_for(&bob_events, |e| matches!(e, Event::Disconnected(_)));
+    assert_eq!(ended, Event::Disconnected(Ended::ByUser));
 
     let event = wait_for(&alice_events, |e| matches!(e, Event::Left { .. }));
     let Event::Left { session, name } = event else {
@@ -334,7 +336,11 @@ fn logging_in_again_disconnects_the_old_client() {
     let second_identity = Identity::import(&identity.export()).unwrap();
     let (second, _second_events) = Client::connect(&link, &second_identity, "阿狸").unwrap();
 
-    wait_for(&first_events, |e| matches!(e, Event::Disconnected(_)));
+    let ended = wait_for(&first_events, |e| matches!(e, Event::Disconnected(_)));
+    let Event::Disconnected(Ended::Refused { headline, .. }) = ended else {
+        panic!("被顶号要说明原因，不能当成自己走的：{ended:?}");
+    };
+    assert!(headline.contains("别处"), "{headline}");
     assert_eq!(server.hub.user_count(), 1, "顶号顶成了两个人");
     assert_eq!(second.roster().users.len(), 1);
 }

@@ -42,6 +42,9 @@ const FILE_VERSION: u8 = 1;
 const SECRET_LEN: usize = 32;
 const CHECKSUM_LEN: usize = 2;
 
+/// 可以克隆：断线重连要在后台线程上重新签名，得有自己的一份。
+/// 克隆出来的副本跟原件一样随作用域结束清零（`SigningKey` 自己负责）。
+#[derive(Clone)]
 pub struct Identity {
     signing: SigningKey,
 }

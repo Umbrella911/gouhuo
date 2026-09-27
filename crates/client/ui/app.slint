@@ -75,6 +75,12 @@ export component App inherits Window {
     in property <bool> udp-ok: false;
     // 语音那边出的错（设备打不开、采样率不对）。要能直接显示给用户。
     in property <string> voice-error;
+    // 连接断了、正在自己重连时的说明。空表示没在重连。
+    //
+    // 重连期间**留在频道界面上**，不退回登录页：名单保持断之前的样子，
+    // 顶上一条说明加一个取消按钮。退回登录页的话，网络抖一下用户就以为
+    // 自己被踢了，而且会下意识去点「加入」—— 那恰恰是不用做的事。
+    in property <string> reconnecting;
 
     // ---- 设置 ----
     in-out property <bool> show-settings: false;
@@ -445,10 +451,12 @@ export component App inherits Window {
                                 spacing: 5px;
                                 Dot {
                                     y: 4px;
-                                    tint: root.udp-ok ? Theme.speaking : Theme.warn;
+                                    tint: root.udp-ok && root.reconnecting == "" ? Theme.speaking : Theme.warn;
                                 }
                                 Text {
-                                    text: root.voice-error != ""
+                                    text: root.reconnecting != ""
+                                        ? "正在重连…"
+                                        : root.voice-error != ""
                                         ? "语音出错"
                                         : (!root.udp-ok
                                             ? "语音连接中…"
@@ -512,9 +520,30 @@ export component App inherits Window {
                 }
                 Rectangle { height: 1px; background: Theme.line; }
 
+                if root.reconnecting != "": Rectangle {
+                    background: #2a251a;
+                    HorizontalLayout {
+                        padding: 12px;
+                        spacing: 10px;
+                        Text {
+                            text: root.reconnecting;
+                            color: Theme.warn;
+                            font-size: 12px;
+                            wrap: word-wrap;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                        }
+                        Btn {
+                            width: 64px;
+                            label: "取消";
+                            clicked => { root.leave(); }
+                        }
+                    }
+                }
+
                 // 语音出错要占住位置一起显示。麦克风没声音的时候，用户第一件
                 // 想知道的就是「为什么」，而弹窗一关就没了。
-                if root.voice-error != "": Rectangle {
+                if root.voice-error != "" && root.reconnecting == "": Rectangle {
                     background: #2a1d1d;
                     VerticalLayout {
                         padding: 12px;

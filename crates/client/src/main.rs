@@ -19,7 +19,7 @@ use std::rc::Rc;
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 
-use client_core::{Client, ConnectError, Event};
+use client_core::{Client, ConnectError, Ended, Event};
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 use voice_core::identity::Identity;
 use voice_core::miccheck::{scan_microphones, MicCheck};
@@ -331,6 +331,11 @@ fn start_voice(app: &App, state: &Arc<Mutex<State>>, client: &Client) {
         audio_processor(),
     ) {
         Ok(pipeline) => {
+            // 新链路默认开麦开耳朵。界面上闭着的要原样带过去 —— 换设备、断线重连
+            // 都会走到这里，闭着麦换了个耳机就变成开麦，是会出事的那种 bug。
+            let deafened = app.get_self_deafened();
+            pipeline.set_deafened(deafened);
+            pipeline.set_muted(app.get_self_muted() || deafened);
             let mut locked = state.lock().expect("state poisoned");
             locked.voice = Some(Arc::new(pipeline));
             locked.capture = Some(diagnostics);
@@ -872,16 +877,63 @@ fn pump_events(
             let client = client.clone();
             let state = Arc::clone(&state);
             let posted = weak.upgrade_in_event_loop(move |app| match event {
-                Event::Disconnected(reason) => {
+                Event::Reconnecting {
+                    attempt, reason, ..
+                } => {
+                    // 旧链路的会话和密钥都作废了，发出去的声音服务端只会丢掉。
+                    // 停掉它，别让用户以为自己还在被人听见 —— 麦克风指示灯也跟着灭。
+                    state.lock().expect("state poisoned").voice = None;
+                    app.set_udp_ok(false);
+                    app.set_transmitting(false);
+                    app.set_input_level(0.0);
+                    app.set_reconnecting(
+                        format!(
+                            "连接断了，正在自动重连（第 {attempt} 次）。
+{reason}"
+                        )
+                        .into(),
+                    );
+                }
+                Event::Reconnected => {
+                    app.set_reconnecting("".into());
+                    app.set_voice_error("".into());
+                    // 服务端可能又给改了名（重名加后缀），以它为准。
+                    let actual = {
+                        let roster = client.roster();
+                        roster.name_of(roster.me)
+                    };
+                    if !actual.is_empty() {
+                        app.set_nick(actual.into());
+                    }
+                    refresh(&app, &client);
+                    // 会话 id、端口、密钥全换了，语音链路只能按新的重起。
+                    start_voice(&app, &state, &client);
+                }
+                Event::Disconnected(ended) => {
                     let mut locked = state.lock().expect("state poisoned");
+                    // 旧连接的收尾可能晚到：用户点了离开、马上又连了别的服务器，
+                    // 这时候不能把新连接也一起拆了。
+                    if !locked.client.as_ref().is_some_and(|c| c.is_same(&client)) {
+                        return;
+                    }
                     locked.client = None;
                     // 丢掉链路会 join 掉所有音频线程。**必须做** ——
                     // 留着的话麦克风还开着，而用户已经不在频道里了。
                     locked.voice = None;
                     drop(locked);
                     app.set_connected(false);
-                    app.set_error_headline("连接断开".into());
-                    app.set_error_advice(reason.into());
+                    app.set_reconnecting("".into());
+                    match ended {
+                        // 自己走的不是错误，别在登录页上挂一条报错。
+                        Ended::ByUser => {
+                            app.set_error_headline("".into());
+                            app.set_error_advice("".into());
+                        }
+                        Ended::Refused { headline, advice } => {
+                            app.set_error_headline(headline.into());
+                            app.set_error_advice(advice.into());
+                        }
+                    }
                 }
                 // 其余的都只是「画面该变了」。进出提示音和 TTS 等 M5 音频那边接上再说，
                 // 事件里已经带着名字了。

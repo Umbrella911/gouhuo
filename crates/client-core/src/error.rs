@@ -106,6 +106,66 @@ impl ConnectError {
     }
 }
 
+impl ConnectError {
+    /// 断线重连时碰到这个错误，**还值不值得再试**。
+    ///
+    /// 判断标准是「过一会儿会不会自己好」：网络不通、服务器还没起来、满员，
+    /// 都会自己好；链接不对、证书变了、被封了、版本不对，再试一万次也一样，
+    /// 反复重试只会把真正的原因藏在一句「正在重连」后面。
+    pub fn is_retryable(&self) -> bool {
+        use protocol::control::rejected::Reason;
+        match self {
+            ConnectError::Unreachable { .. } | ConnectError::Io(_) => true,
+            // 握手中途被掐断（网络抖了）也会落到这里。证书不对单独有一支，不在这儿。
+            ConnectError::Tls(_) => true,
+            ConnectError::Rejected { reason, .. } => {
+                matches!(
+                    reason,
+                    Reason::Full | Reason::Internal | Reason::Unspecified
+                )
+            }
+            ConnectError::BadInvite(_)
+            | ConnectError::WrongCertificate(_)
+            | ConnectError::NotAGouhuoServer => false,
+        }
+    }
+}
+
+/// 服务端说了 `Goodbye` 之后，给用户看的两行字：`(发生了什么, 现在该做什么)`。
+///
+/// 跟 [`ConnectError`] 同一个规矩：两件事都要说到。
+pub fn farewell(reason: protocol::control::goodbye::Reason, detail: &str) -> (String, String) {
+    use protocol::control::goodbye::Reason;
+    match reason {
+        Reason::Displaced => (
+            "你在别处登录了".into(),
+            "同一个身份在另一台电脑或另一个窗口连进了这个服务器，这边就被顶下去了。             想回到这边，重新点加入就行 —— 那边会被顶下去。"
+                .into(),
+        ),
+        Reason::Kicked => (
+            "你被请出了服务器".into(),
+            if detail.is_empty() {
+                "管理员把你踢了出去。可以重新加入 —— 除非接着被封了。".into()
+            } else {
+                format!("{detail}
+可以重新加入 —— 除非接着被封了。")
+            },
+        ),
+        Reason::Banned => (
+            "你被这个服务器封了".into(),
+            "这个身份进不来了。有疑问去问管理员。".into(),
+        ),
+        Reason::Unspecified => (
+            "服务器断开了连接".into(),
+            if detail.is_empty() {
+                "服务器没说原因。可以重新加入试试。".into()
+            } else {
+                detail.to_string()
+            },
+        ),
+    }
+}
+
 impl fmt::Display for ConnectError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}\n{}", self.headline(), self.advice())
@@ -168,6 +228,64 @@ mod tests {
                 headline.chars().count() < 40,
                 "{error:?} 的标题太长了：{headline}"
             );
+        }
+    }
+
+    /// 能自己好的才重试。再试也不会变的，要立刻停下来把原因给用户看。
+    #[test]
+    fn only_transient_errors_are_retried() {
+        let transient = [
+            ConnectError::Unreachable {
+                host: "example.com".into(),
+                port: 20800,
+                source: std::io::Error::other("x"),
+            },
+            ConnectError::Io(std::io::Error::other("x")),
+            ConnectError::Rejected {
+                reason: Reason::Full,
+                detail: String::new(),
+            },
+        ];
+        for e in transient {
+            assert!(e.is_retryable(), "{e:?} 过一会儿会自己好，该重试");
+        }
+
+        let permanent = [
+            ConnectError::BadInvite(protocol::InviteError::Truncated),
+            ConnectError::WrongCertificate("指纹对不上".into()),
+            ConnectError::NotAGouhuoServer,
+            ConnectError::Rejected {
+                reason: Reason::Banned,
+                detail: String::new(),
+            },
+            ConnectError::Rejected {
+                reason: Reason::InviteRequired,
+                detail: String::new(),
+            },
+            ConnectError::Rejected {
+                reason: Reason::VersionMismatch,
+                detail: String::new(),
+            },
+            ConnectError::Rejected {
+                reason: Reason::BadSignature,
+                detail: String::new(),
+            },
+        ];
+        for e in permanent {
+            assert!(!e.is_retryable(), "{e:?} 再试也一样，不该重试");
+        }
+    }
+
+    #[test]
+    fn every_farewell_says_what_happened_and_what_to_do() {
+        use protocol::control::goodbye::Reason as Bye;
+        for reason in [Bye::Unspecified, Bye::Displaced, Bye::Kicked, Bye::Banned] {
+            for detail in ["", "服务端给的说明"] {
+                let (headline, advice) = farewell(reason, detail);
+                assert!(!headline.is_empty(), "{reason:?} 没说发生了什么");
+                assert!(!advice.is_empty(), "{reason:?} 没说该怎么办");
+                assert!(headline.chars().count() < 40, "{reason:?} 的标题太长了");
+            }
         }
     }
 
