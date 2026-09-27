@@ -34,6 +34,8 @@ struct Shared {
     input_centi_db: AtomicI32,
     monitoring: AtomicBool,
     monitor: Mutex<std::collections::VecDeque<Vec<f32>>>,
+    /// 提示音的口子。没连服务器时在设置页上「试听提示音」要用。
+    cues: Arc<crate::cue::CueQueue>,
     stop: AtomicBool,
     /// 采集那边有没有真的读到过一帧。界面上要分清「设备还没开起来」
     /// 和「开起来了但是静音」—— 这两个的下一步完全不一样。
@@ -83,6 +85,7 @@ impl MicCheck {
             input_centi_db: AtomicI32::new(SILENT_DB_CENTI),
             monitoring: AtomicBool::new(false),
             monitor: Mutex::new(std::collections::VecDeque::new()),
+            cues: Arc::new(crate::cue::CueQueue::new()),
             stop: AtomicBool::new(false),
             running: AtomicBool::new(false),
             error: Mutex::new(None),
@@ -141,6 +144,7 @@ impl MicCheck {
                             {
                                 out.copy_from_slice(&mine);
                             }
+                            shared.cues.mix_into(&mut out);
                             // **没开试听的时候也要照常播静音。**
                             // 播放线程的节拍来自设备（write 会阻塞），
                             // 不转的话打开试听时要先等设备预热，听起来像卡了一下。
@@ -172,6 +176,11 @@ impl MicCheck {
                 .expect("monitor poisoned")
                 .clear();
         }
+    }
+
+    /// 往播放里插提示音的口子，跟 `Pipeline::cues` 一样。
+    pub fn cues(&self) -> Arc<crate::cue::CueQueue> {
+        Arc::clone(&self.shared.cues)
     }
 
     pub fn is_monitoring(&self) -> bool {

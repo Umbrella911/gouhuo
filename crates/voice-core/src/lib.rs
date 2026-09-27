@@ -15,6 +15,8 @@ pub mod audio;
 pub mod clock;
 #[cfg(feature = "codec")]
 pub mod codec;
+#[cfg(feature = "pipeline")]
+pub mod cue;
 pub mod hotkey;
 pub mod identity;
 pub mod jitter;
@@ -26,6 +28,8 @@ pub mod net;
 pub mod pipeline;
 pub mod redline;
 pub mod signal;
+#[cfg(feature = "pipeline")]
+pub mod tts;
 
 #[cfg(windows)]
 pub mod sysstat;

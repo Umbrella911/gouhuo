@@ -48,6 +48,7 @@ use protocol::{
 
 use crate::audio::{Capture, Render, FRAME_MS, FRAME_SAMPLES, SAMPLE_RATE};
 use crate::codec::{VoiceDecoder, VoiceEncoder};
+use crate::cue::CueQueue;
 use crate::jitter::{JitterBuffer, JitterConfig, Playout};
 
 /// 抖动缓冲的固定深度（帧）。
@@ -235,6 +236,8 @@ struct Shared {
     /// 锁的顺序永远是先 `speakers` 后 `volumes`，[`Pipeline::set_volume`]
     /// 两把分开拿、不嵌套。
     volumes: Mutex<BTreeMap<u32, f32>>,
+    /// 提示音和念名字，播放线程每帧混一点进去。见 `cue` 模块。
+    cues: Arc<CueQueue>,
     packets_sent: AtomicU64,
     packets_received: AtomicU64,
     underruns: AtomicU64,
@@ -292,6 +295,7 @@ impl Pipeline {
         let shared = Arc::new(Shared {
             speakers: Mutex::new(BTreeMap::new()),
             volumes: Mutex::new(BTreeMap::new()),
+            cues: Arc::new(CueQueue::new()),
             packets_sent: AtomicU64::new(0),
             packets_received: AtomicU64::new(0),
             underruns: AtomicU64::new(0),
@@ -416,6 +420,11 @@ impl Pipeline {
                 .expect("monitor poisoned")
                 .clear();
         }
+    }
+
+    /// 往播放里插提示音、念名字的口子。见 `cue` 模块。
+    pub fn cues(&self) -> Arc<CueQueue> {
+        Arc::clone(&self.shared.cues)
     }
 
     pub fn is_monitoring(&self) -> bool {
@@ -760,6 +769,11 @@ fn play_loop(
                 *out += sample;
             }
         }
+
+        // 提示音跟别人的声音混在一起，**在 APM 的参考信号之前** ——
+        // 这样外放的人那边，麦克风收进去的提示音会被当成回声消掉，
+        // 不会原样发给全频道。关了耳朵的时候跟别的声音一起静掉。
+        shared.cues.mix_into(&mut mix);
 
         // 关了耳朵就播静音。
         //

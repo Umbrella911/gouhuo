@@ -61,6 +61,13 @@ windows = { workspace = true, features = [
     "Win32_System_LibraryLoader",
     # WNDCLASSW 里有 HBRUSH/HICON 这些 GDI 类型
     "Win32_Graphics_Gdi",
+    # 念名字：WinRT 的 SpeechSynthesizer，见 src/tts.rs
+    "Foundation",
+    "Foundation_Collections",
+    "Media_Core",
+    "Media_SpeechSynthesis",
+    "Storage_Streams",
+    "Win32_System_WinRT",
 ] }
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",

@@ -225,6 +225,37 @@ fn a_volume_set_before_anyone_speaks_still_applies() {
     assert_eq!(energy, 0.0, "调成 0 的人还是听得见");
 }
 
+/// 提示音从播放那一路出来 —— 跟别人的声音混在一起，这样 APM 才拿得到它
+/// 当参考信号（见 `voice_core::cue` 的文档）。
+#[test]
+fn a_cue_comes_out_of_the_speakers() {
+    use voice_core::cue::{chime, Chime};
+
+    let server = start_server();
+    let bob = join(&server, "波波");
+    let (render, played) = CollectingRender::new();
+    let bob_voice = Pipeline::start(
+        voice_config(&bob, &server, TransmitMode::PushToTalk),
+        Box::new(SyntheticCapture::new(Vec::new()).then_silence()),
+        Box::new(render),
+        None,
+    )
+    .unwrap();
+
+    let sound = chime(Chime::CameIn);
+    assert!(bob_voice.cues().push(&sound, 1.0));
+    std::thread::sleep(Duration::from_millis(600));
+
+    let played = played.lock().unwrap().clone();
+    let expected: f32 = sound.iter().map(|s| s * s).sum();
+    let energy: f32 = played.iter().map(|s| s * s).sum();
+    assert!(
+        (energy - expected).abs() < expected * 0.01,
+        "放出来的能量 {energy}，提示音本身 {expected}"
+    );
+    assert_eq!(bob_voice.cues().pending(), 0, "放完了队列该是空的");
+}
+
 /// **量端到端延迟。** 见模块文档：这个数字不含声卡和 APM。
 #[test]
 fn end_to_end_latency_is_measured_not_added_up() {
