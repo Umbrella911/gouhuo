@@ -34,8 +34,9 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use protocol::control::{
-    goodbye, server_message, Authenticate, CreateChannel, DeleteChannel, Hello, JoinChannel, Ping,
-    Role, SelfState, ServerMessage, TextMessage, Welcome, PROTOCOL_VERSION,
+    goodbye, server_message, Authenticate, BanUser, CreateChannel, DeleteChannel, EditChannel,
+    Hello, JoinChannel, KickUser, Ping, Role, SelfState, ServerMessage, SetRole, TextMessage,
+    Unban, Welcome, PROTOCOL_VERSION,
 };
 use protocol::Invite;
 use rustls::pki_types::ServerName;
@@ -387,6 +388,79 @@ impl Client {
     /// 删一个频道。根频道删不掉，服务端会忽略。
     pub fn delete_channel(&self, channel_id: u32) {
         self.send(&DeleteChannel { channel_id }.into());
+    }
+
+    /// 改一个频道：名字、说明、父频道。发的是完整的目标状态 —— 不想改的传当前值，
+    /// 见 [`Client::rename_channel`]。能不能改由服务端决定，改成了会广播给所有人。
+    pub fn edit_channel(&self, channel_id: u32, name: &str, description: &str, parent_id: u32) {
+        let name = name.trim();
+        if name.is_empty() {
+            return;
+        }
+        self.send(
+            &EditChannel {
+                channel_id,
+                name: name.to_string(),
+                description: description.trim().to_string(),
+                parent_id,
+            }
+            .into(),
+        );
+    }
+
+    /// 只改名，别的照旧。
+    pub fn rename_channel(&self, channel_id: u32, name: &str) {
+        let current = self
+            .roster()
+            .channels
+            .get(&channel_id)
+            .map(|c| (c.description.clone(), c.parent_id));
+        if let Some((description, parent_id)) = current {
+            self.edit_channel(channel_id, name, &description, parent_id);
+        }
+    }
+
+    /// 踢人。理由可以空着。能不能踢见 [`Roster::can_kick`]。
+    pub fn kick(&self, session_id: u32, reason: &str) {
+        self.send(
+            &KickUser {
+                session_id,
+                reason: reason.trim().to_string(),
+            }
+            .into(),
+        );
+    }
+
+    /// 封禁：踢出去，而且这个人以后再也进不来。只有管理员能封。
+    pub fn ban(&self, session_id: u32, reason: &str) {
+        self.send(
+            &BanUser {
+                session_id,
+                reason: reason.trim().to_string(),
+            }
+            .into(),
+        );
+    }
+
+    /// 解封。公钥从 [`Roster::bans`] 里拿。
+    pub fn unban(&self, public_key: &[u8]) {
+        self.send(
+            &Unban {
+                public_key: public_key.to_vec(),
+            }
+            .into(),
+        );
+    }
+
+    /// 改一个人的角色。只有管理员能改。
+    pub fn set_role(&self, session_id: u32, role: Role) {
+        self.send(
+            &SetRole {
+                session_id,
+                role: role as i32,
+            }
+            .into(),
+        );
     }
 
     pub fn send_text(&self, body: &str) {
@@ -805,6 +879,10 @@ fn apply(roster: &Mutex<Roster>, message: ServerMessage) -> Vec<Event> {
             };
             roster.push_chat(line.clone());
             vec![Event::Text(line)]
+        }
+        Some(server_message::Payload::BanList(list)) => {
+            roster.bans = list.entries;
+            vec![Event::RosterChanged]
         }
         // Pong 暂时不产生界面事件。接上 UDP 之后它会变成「语音通不通」的指示。
         Some(server_message::Payload::Pong(_)) => Vec::new(),

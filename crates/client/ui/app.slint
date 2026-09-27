@@ -26,6 +26,23 @@ export struct Row {
     can-delete: bool,
     // 只对人有意义：我给这个人单独调的音量，百分比。100 是原样，0 是静音。
     volume: int,
+    // 只对人有意义：角色，协议里的数值（1 访客 2 成员 3 频道管理 4 管理员）。
+    role: int,
+    // 我能对这个人做什么 / 能不能改这个频道。**只决定画不画按钮**，
+    // 说了算的是服务端。
+    can-kick: bool,
+    can-ban: bool,
+    can-set-role: bool,
+    can-edit: bool,
+}
+
+/// 封禁名单里的一条。
+export struct BanRow {
+    name: string,
+    /// 什么时候、谁封的、为什么，拼好的一行。
+    detail: string,
+    /// 公钥的 base32。解封时原样传回去。
+    key: string,
 }
 
 /// 一次麦克风检测的结果。
@@ -116,6 +133,15 @@ export component App inherits Window {
     property <string> newchan-name;
     /// 展开了音量滑条的那个人的会话 id。-1 表示都收着。纯界面状态。
     property <int> volume-open: -1;
+    /// 点了一次「封禁」、等第二次确认的那个人。-1 表示没有。
+    property <int> ban-armed: -1;
+    /// 正在改名的频道。-1 表示没有。
+    property <int> renaming: -1;
+    property <string> rename-draft;
+    /// 我是不是管理员。决定显不显示封禁名单。
+    in property <bool> is-admin: false;
+    in property <[BanRow]> bans;
+    property <bool> bans-open: false;
     /// 正在挨个试麦克风。
     in property <bool> scanning: false;
     in property <[ScanRow]> scan-results;
@@ -137,6 +163,13 @@ export component App inherits Window {
     callback set-user-volume(int, float);
     /// 拖完了，存盘。拖动过程中不存 —— 一次拖动会触发几十次 changed。
     callback save-user-volumes();
+    callback rename-channel(int, string);
+    callback kick-user(int);
+    callback ban-user(int);
+    /// (会话 id, 角色在下拉框里的序号：0 访客 1 成员 2 频道管理 3 管理员)
+    callback set-role(int, int);
+    /// 参数是公钥的 base32，见 BanRow.key。
+    callback unban(string);
     callback send-text();
     callback toggle-mute();
     callback toggle-deafen();
@@ -294,7 +327,30 @@ export component App inherits Window {
                         spacing: 1px;
 
                         for row[i] in root.rows: VerticalLayout {
-                          Rectangle {
+                          if row.is-channel && root.renaming == row.id: HorizontalLayout {
+                              padding-left: 4px + (row.depth * 12px);
+                              spacing: 4px;
+                              Field {
+                                  height: 30px;
+                                  init => { self.focus(); }
+                                  text <=> root.rename-draft;
+                                  horizontal-stretch: 1;
+                                  accepted => {
+                                      if (root.rename-draft != "") {
+                                          root.rename-channel(row.id, root.rename-draft);
+                                      }
+                                      root.renaming = -1;
+                                  }
+                              }
+                              Btn {
+                                  width: 30px;
+                                  height: 30px;
+                                  label: "✕";
+                                  clicked => { root.renaming = -1; }
+                              }
+                          }
+
+                          if !(row.is-channel && root.renaming == row.id): Rectangle {
                             height: row.is-channel ? 30px : 28px;
                             border-radius: 6px;
                             background: row.is-channel && row.is-current
@@ -335,6 +391,14 @@ export component App inherits Window {
                                     horizontal-stretch: 1;
                                 }
 
+                                // 频道管理和管理员标一下：要知道该找谁处理问题。
+                                if !row.is-channel && row.role >= 3: Text {
+                                    text: row.role >= 4 ? "管理员" : "频道管理";
+                                    color: Theme.faint;
+                                    font-size: 11px;
+                                    vertical-alignment: center;
+                                }
+
                                 // 调过音量的人在右边标一下。不标的话，一个被自己调成 0
                                 // 的人说话时点在闪却听不见，用户只会以为是他麦克风坏了。
                                 if !row.is-channel && !row.is-me && row.volume != 100: Text {
@@ -344,11 +408,38 @@ export component App inherits Window {
                                     vertical-alignment: center;
                                 }
 
-                                if row.is-channel && !(row.can-delete && rowtouch.has-hover): Text {
+                                if row.is-channel && !((row.can-delete || row.can-edit) && rowtouch.has-hover): Text {
                                     text: row.count > 0 ? row.count : "";
                                     color: Theme.faint;
                                     font-size: 12px;
                                     vertical-alignment: center;
+                                }
+
+                                // 改名。跟删除一样，只在鼠标移上来时才出现。
+                                if row.is-channel && row.can-edit && rowtouch.has-hover: Rectangle {
+                                    width: 20px;
+                                    height: 20px;
+                                    y: (parent.height - self.height) / 2;
+                                    border-radius: 4px;
+                                    background: edithover.has-hover ? Theme.hover : transparent;
+
+                                    Text {
+                                        text: "✎";
+                                        color: edithover.has-hover ? Theme.text : Theme.faint;
+                                        font-size: 13px;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                        width: 100%;
+                                        height: 100%;
+                                    }
+
+                                    edithover := TouchArea {
+                                        mouse-cursor: pointer;
+                                        clicked => {
+                                            root.rename-draft = row.name;
+                                            root.renaming = row.id;
+                                        }
+                                    }
                                 }
 
                                 // 删频道。**只在鼠标移上来时才出现** ——
@@ -432,6 +523,47 @@ export component App inherits Window {
                                   }
                               }
                           }
+
+                          // 管理操作。没有任何权限的人看不到这一行。
+                          if !row.is-channel && !row.is-me && root.volume-open == row.id
+                              && (row.can-kick || row.can-ban || row.can-set-role): HorizontalLayout {
+                              height: 34px;
+                              padding-left: 8px + (row.depth * 12px) + 16px;
+                              padding-right: 10px;
+                              spacing: 6px;
+
+                              if row.can-set-role: ComboBox {
+                                  horizontal-stretch: 1;
+                                  model: ["访客", "成员", "频道管理", "管理员"];
+                                  current-index: row.role - 1;
+                                  selected(v) => { root.set-role(row.id, self.current-index); }
+                              }
+                              if !row.can-set-role: Rectangle { horizontal-stretch: 1; }
+                              if row.can-kick: Btn {
+                                  width: 52px;
+                                  height: 26px;
+                                  y: (parent.height - self.height) / 2;
+                                  label: "踢出";
+                                  clicked => { root.kick-user(row.id); }
+                              }
+                              // 封禁要点两下：第一下只是「武装」，按钮变成红色的「确认封禁」。
+                              // 封禁虽然能解，但被封的人那边是立刻断线的，手滑的代价太大。
+                              if row.can-ban: Btn {
+                                  width: root.ban-armed == row.id ? 76px : 52px;
+                                  height: 26px;
+                                  y: (parent.height - self.height) / 2;
+                                  label: root.ban-armed == row.id ? "确认封禁" : "封禁";
+                                  primary: root.ban-armed == row.id;
+                                  clicked => {
+                                      if (root.ban-armed == row.id) {
+                                          root.ban-armed = -1;
+                                          root.ban-user(row.id);
+                                      } else {
+                                          root.ban-armed = row.id;
+                                      }
+                                  }
+                              }
+                          }
                         }
 
                         // ---- 新建频道 ----
@@ -500,6 +632,57 @@ export component App inherits Window {
                                     newchan-name = "";
                                 }
                             }
+                        }
+                    }
+                }
+
+                // ---- 封禁名单：只有管理员看得到，平时收着 ----
+                if root.is-admin && root.bans.length > 0: Rectangle {
+                    height: 30px;
+                    background: banstouch.has-hover ? Theme.hover : transparent;
+                    HorizontalLayout {
+                        padding-left: 14px;
+                        padding-right: 10px;
+                        Text {
+                            text: (root.bans-open ? "▾ " : "▸ ") + "封禁名单（" + root.bans.length + "）";
+                            color: Theme.faint;
+                            font-size: 12px;
+                            vertical-alignment: center;
+                        }
+                    }
+                    banstouch := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { root.bans-open = !root.bans-open; }
+                    }
+                }
+                if root.is-admin && root.bans-open: VerticalLayout {
+                    padding-left: 14px;
+                    padding-right: 10px;
+                    padding-bottom: 6px;
+                    spacing: 4px;
+                    for ban in root.bans: HorizontalLayout {
+                        spacing: 6px;
+                        VerticalLayout {
+                            horizontal-stretch: 1;
+                            Text {
+                                text: ban.name;
+                                color: Theme.text;
+                                font-size: 12px;
+                                overflow: elide;
+                            }
+                            Text {
+                                text: ban.detail;
+                                color: Theme.faint;
+                                font-size: 11px;
+                                overflow: elide;
+                            }
+                        }
+                        Btn {
+                            width: 52px;
+                            height: 26px;
+                            y: (parent.height - self.height) / 2;
+                            label: "解封";
+                            clicked => { root.unban(ban.key); }
                         }
                     }
                 }

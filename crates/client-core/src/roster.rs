@@ -13,7 +13,7 @@
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
 
-use protocol::control::{Channel, Role, User, Welcome};
+use protocol::control::{BannedUser, Channel, Role, User, Welcome};
 
 /// 聊天记录最多留多少条。
 ///
@@ -46,6 +46,8 @@ pub struct Roster {
     pub channels: BTreeMap<u32, Channel>,
     pub users: BTreeMap<u32, User>,
     pub chat: VecDeque<ChatLine>,
+    /// 封禁名单。**只有管理员有**：服务端只把它发给管理员，别人这里永远是空的。
+    pub bans: Vec<BannedUser>,
 }
 
 impl Roster {
@@ -83,6 +85,59 @@ impl Roster {
     /// 这里判断错了最多是显示一个点了没反应的按钮，不会有安全问题。
     pub fn can_create_channel(&self) -> bool {
         (self.my_role() as i32) >= (Role::Member as i32)
+    }
+
+    pub fn is_admin(&self) -> bool {
+        self.my_role() == Role::Admin
+    }
+
+    fn role_of(&self, session: u32) -> Option<Role> {
+        self.users
+            .get(&session)
+            .map(|u| Role::try_from(u.role).unwrap_or(Role::Unspecified))
+    }
+
+    /// 我能不能踢这个人。跟服务端一样的规则：频道管理及以上，只能踢比自己低的。
+    ///
+    /// 下面这几个 `can_*` 都**只是画界面用的**，说了算的是服务端。
+    pub fn can_kick(&self, session: u32) -> bool {
+        let Some(target) = self.role_of(session) else {
+            return false;
+        };
+        let me = self.my_role();
+        session != self.me
+            && (me as i32) >= (Role::ChannelAdmin as i32)
+            && (target as i32) < (me as i32)
+    }
+
+    /// 我能不能封这个人：只有管理员能封，只能封比自己低的。
+    pub fn can_ban(&self, session: u32) -> bool {
+        let Some(target) = self.role_of(session) else {
+            return false;
+        };
+        session != self.me && self.is_admin() && target != Role::Admin
+    }
+
+    /// 我能不能改这个人的角色：管理员改别人的，改不了自己的和别的管理员的。
+    pub fn can_set_role(&self, session: u32) -> bool {
+        self.can_ban(session)
+    }
+
+    /// 我能不能改这个频道（改名、挪）。根频道只有管理员能改。
+    pub fn can_edit_channel(&self, channel_id: u32) -> bool {
+        let Some(channel) = self.channels.get(&channel_id) else {
+            return false;
+        };
+        if channel.parent_id == channel.id {
+            return self.is_admin();
+        }
+        if (self.my_role() as i32) >= (Role::ChannelAdmin as i32) {
+            return true;
+        }
+        match self.my_user() {
+            Some(me) if !channel.created_by.is_empty() => channel.created_by == me.public_key,
+            _ => false,
+        }
     }
 
     /// 我能不能删这个频道。同上，只是画界面用的。

@@ -152,7 +152,11 @@ pub fn farewell(reason: protocol::control::goodbye::Reason, detail: &str) -> (St
         ),
         Reason::Banned => (
             "你被这个服务器封了".into(),
-            "这个身份进不来了。有疑问去问管理员。".into(),
+            if detail.is_empty() {
+                "这个身份进不来了。有疑问去问管理员。".into()
+            } else {
+                format!("{detail}\n这个身份进不来了。有疑问去问管理员。")
+            },
         ),
         Reason::Unspecified => (
             "服务器断开了连接".into(),

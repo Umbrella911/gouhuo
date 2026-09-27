@@ -1100,6 +1100,11 @@ fn refresh(app: &App, state: &Arc<Mutex<State>>, client: &Client) {
             count: members.len() as i32,
             can_delete: roster.can_delete_channel(node.channel.id),
             volume: 100,
+            role: 0,
+            can_kick: false,
+            can_ban: false,
+            can_set_role: false,
+            can_edit: roster.can_edit_channel(node.channel.id),
         });
         for user in members {
             rows.push(Row {
@@ -1117,6 +1122,11 @@ fn refresh(app: &App, state: &Arc<Mutex<State>>, client: &Client) {
                 // 只对频道有意义。
                 can_delete: false,
                 volume: settings.user_volume(&volume_key(&user.public_key)) as i32,
+                role: user.role,
+                can_kick: roster.can_kick(user.session_id),
+                can_ban: roster.can_ban(user.session_id),
+                can_set_role: roster.can_set_role(user.session_id),
+                can_edit: false,
             });
         }
     }
@@ -1141,6 +1151,26 @@ fn refresh(app: &App, state: &Arc<Mutex<State>>, client: &Client) {
     // 访客建不了频道，那一行就别显示。**这只是画界面** ——
     // 真正说了算的是服务端，它会把访客的请求直接忽略掉。
     app.set_can_create_channel(roster.can_create_channel());
+
+    // 封禁名单只有管理员手里有（服务端只发给管理员），别人这里是空的。
+    app.set_is_admin(roster.is_admin());
+    let bans: Vec<BanRow> = roster
+        .bans
+        .iter()
+        .map(|ban| {
+            let mut detail = format!("{} 被 {} 封禁", clock_date(ban.banned_at_ms), ban.banned_by);
+            if !ban.reason.is_empty() {
+                detail.push('：');
+                detail.push_str(&ban.reason);
+            }
+            BanRow {
+                name: ban.name.clone().into(),
+                detail: detail.into(),
+                key: protocol::base32::encode(&ban.public_key).into(),
+            }
+        })
+        .collect();
+    app.set_bans(ModelRc::new(VecModel::from(bans)));
 
     app.set_rows(ModelRc::new(VecModel::from(rows)));
     app.set_chat(ModelRc::new(VecModel::from(chat)));
@@ -1221,6 +1251,57 @@ fn wire_actions(app: &App, state: &Arc<Mutex<State>>) {
         let state = Arc::clone(state);
         app.on_save_user_volumes(move || {
             let _ = state.lock().expect("state poisoned").settings.save();
+        });
+    }
+
+    {
+        let state = Arc::clone(state);
+        app.on_rename_channel(move |id, name| {
+            if let Some(client) = current(&state) {
+                client.rename_channel(id as u32, &name);
+            }
+        });
+    }
+
+    {
+        let state = Arc::clone(state);
+        app.on_kick_user(move |session| {
+            if let Some(client) = current(&state) {
+                client.kick(session as u32, "");
+            }
+        });
+    }
+
+    {
+        let state = Arc::clone(state);
+        app.on_ban_user(move |session| {
+            if let Some(client) = current(&state) {
+                client.ban(session as u32, "");
+            }
+        });
+    }
+
+    {
+        let state = Arc::clone(state);
+        app.on_set_role(move |session, index| {
+            // 下拉框的序号 0..=3 对应协议里的 1..=4（0 是 Unspecified）。
+            let role = protocol::control::Role::try_from(index + 1)
+                .unwrap_or(protocol::control::Role::Unspecified);
+            if let Some(client) = current(&state) {
+                client.set_role(session as u32, role);
+            }
+        });
+    }
+
+    {
+        let state = Arc::clone(state);
+        app.on_unban(move |key| {
+            let Ok(key) = protocol::base32::decode(&key) else {
+                return;
+            };
+            if let Some(client) = current(&state) {
+                client.unban(&key);
+            }
         });
     }
 
@@ -1348,6 +1429,28 @@ fn clock_time(timestamp_ms: i64) -> String {
     )
 }
 
+/// 「9月27日」。封禁名单里用：封了多久比封在几点几分要紧。
+fn clock_date(timestamp_ms: i64) -> String {
+    let local = timestamp_ms.div_euclid(1000) + local_offset_seconds();
+    let (month, day) = month_day(local.div_euclid(86_400));
+    format!("{month}月{day}日")
+}
+
+/// 1970-01-01 起的第几天 → (月, 日)。公历，Howard Hinnant 的 civil_from_days。
+///
+/// 不为这一个格式拉进一整个日期库。
+fn month_day(days: i64) -> (u32, u32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (month, day)
+}
+
 #[cfg(windows)]
 fn local_offset_seconds() -> i64 {
     // SAFETY: GetTimeZoneInformation 只写它自己的输出结构，没有别的副作用。
@@ -1372,6 +1475,15 @@ fn local_offset_seconds() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn month_day_matches_known_dates() {
+        assert_eq!(month_day(0), (1, 1)); // 1970-01-01
+        assert_eq!(month_day(59), (3, 1)); // 1970 不是闰年
+        assert_eq!(month_day(11_016), (2, 29)); // 2000-02-29
+        assert_eq!(month_day(19_675), (11, 14)); // 2023-11-14
+        assert_eq!(month_day(-1), (12, 31)); // 1969-12-31
+    }
 
     #[test]
     fn clock_time_is_hh_mm() {
