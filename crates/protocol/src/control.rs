@@ -166,6 +166,7 @@ envelope_from!(
     UserState => server_message::Payload::UserState,
     UserLeft => server_message::Payload::UserLeft,
     ChannelState => server_message::Payload::ChannelState,
+    Goodbye => server_message::Payload::Goodbye,
 );
 
 // TextMessage 两边都有，From 会冲突（一个类型只能有一个 From<TextMessage> 目标），

@@ -37,8 +37,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use protocol::control::{
-    client_message, decode_frame, encode_frame, peek_frame_len, Challenge, ClientMessage, Rejected,
-    ServerMessage, MAX_FRAME_BODY, PROTOCOL_VERSION,
+    client_message, decode_frame, encode_frame, goodbye, peek_frame_len, Challenge, ClientMessage,
+    Goodbye, Rejected, ServerMessage, MAX_FRAME_BODY, PROTOCOL_VERSION,
 };
 use protocol::PublicKey;
 use voice_core::identity::Identity;
@@ -113,8 +113,20 @@ impl Peer {
         Duration::from_millis((now_ms() as u64).saturating_sub(last))
     }
 
-    /// 把这条连接踢掉。阻塞在 read 上的线程会立刻返回 0 然后自己收拾。
-    fn kick(&self) {
+    /// 把这条连接踢掉，并先告诉对面为什么。阻塞在 read 上的线程会立刻返回 0
+    /// 然后自己收拾。
+    ///
+    /// **原因必须先发出去再断。** 客户端靠它区分「连接没了」（该自动重连）和
+    /// 「连接被拿走了」（不该重连）—— 什么都不说就断，客户端只能当成网络问题
+    /// 去重连，顶号的两端就会互相踢个没完。
+    fn kick(&self, reason: goodbye::Reason, detail: &str) {
+        self.send(
+            &Goodbye {
+                reason: reason as i32,
+                detail: detail.to_string(),
+            }
+            .into(),
+        );
         self.close();
     }
 
@@ -425,7 +437,10 @@ fn authenticate(
     if let Some(old) = admitted.displaced {
         let old_peer = hub.peers.lock().expect("peers poisoned").remove(&old);
         if let Some(old_peer) = old_peer {
-            old_peer.kick();
+            old_peer.kick(
+                goodbye::Reason::Displaced,
+                "同一个身份从别处连进了这个服务器，这边被顶下去了",
+            );
         }
     }
 

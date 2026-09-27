@@ -12,8 +12,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use protocol::control::{
-    decode_frame, encode_frame, server_message, Authenticate, ClientMessage, Hello, JoinChannel,
-    Ping, Rejected, SelfState, ServerMessage, TextMessage, Welcome, PROTOCOL_VERSION,
+    decode_frame, encode_frame, goodbye, server_message, Authenticate, ClientMessage, Hello,
+    JoinChannel, Ping, Rejected, SelfState, ServerMessage, TextMessage, Welcome, PROTOCOL_VERSION,
 };
 use protocol::Fingerprint;
 use rustls::pki_types::ServerName;
@@ -334,7 +334,14 @@ fn same_identity_displaces_the_old_session() {
         "顶号之后该是一个新会话"
     );
 
-    // 旧连接被服务端关掉
+    // 旧连接先收到一句为什么 —— 客户端靠它知道**别自动重连**，
+    // 不然两端会互相顶个没完 ——
+    let Some(server_message::Payload::Goodbye(bye)) = first.recv().payload else {
+        panic!("被顶掉之前没说为什么");
+    };
+    assert_eq!(bye.reason, goodbye::Reason::Displaced as i32);
+
+    // —— 然后被服务端关掉
     let mut chunk = [0u8; 256];
     let n = first.stream.read(&mut chunk).unwrap_or(0);
     assert_eq!(n, 0, "旧连接没被关掉");

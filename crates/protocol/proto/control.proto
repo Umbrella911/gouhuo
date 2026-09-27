@@ -180,6 +180,24 @@ message ChannelState {
   bool removed = 2;
 }
 
+// 服务端要主动断开这条连接，先说一声为什么。发完就断开。
+//
+// 客户端据此判断**该不该自动重连**：网络断了、服务器重启了，连接是「没了」，
+// 重连就对；被顶号、被踢、被封，连接是「被拿走了」，重连只会把事情搞坏 ——
+// 顶号的两端各自重连，会互相踢个没完。没收到这条就断了的，一律当成网络问题。
+message Goodbye {
+  enum Reason {
+    REASON_UNSPECIFIED = 0;
+    // 同一个身份从别处又连了进来，这条被顶掉了。
+    REASON_DISPLACED = 1;
+    REASON_KICKED = 2;
+    REASON_BANNED = 3;
+  }
+  Reason reason = 1;
+  // 给人看的说明，可以直接显示。
+  string detail = 2;
+}
+
 // ===========================================================================
 // 操作
 // ===========================================================================
@@ -284,5 +302,6 @@ message ServerMessage {
     UserLeft user_left = 6;
     ChannelState channel_state = 7;
     TextMessage text_message = 8;
+    Goodbye goodbye = 9;
   }
 }
