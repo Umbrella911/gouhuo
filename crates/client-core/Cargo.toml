@@ -3,7 +3,7 @@ name = "client-core"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+license = "MPL-2.0"
 description = "客户端逻辑，不含界面：连接、认证、状态镜像。"
 
 [dependencies]

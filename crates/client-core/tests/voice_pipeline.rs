@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! 端到端语音：一个人说话，另一个人听见，**并且量出来花了多久**。
 //!

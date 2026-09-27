@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 //! 服务端状态在本地的镜像：频道树、谁在线、最近说了什么。
 //!
