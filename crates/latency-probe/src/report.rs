@@ -73,9 +73,14 @@ pub fn matrix_legend() {
 pub fn detail(r: &RunResult) {
     let c = &r.cfg;
     println!();
+    let buffer = if c.adaptive {
+        "自适应".to_string()
+    } else {
+        format!("{} 帧", c.target_frames)
+    };
     println!(
-        "=== 详细分解：{} / {} ms 帧 / 缓冲 {} 帧 ===",
-        c.profile, c.frame_ms, c.target_frames
+        "=== 详细分解：{} / {} ms 帧 / 缓冲 {} ===",
+        c.profile, c.frame_ms, buffer
     );
     println!(
         "  Opus: {} kbps, complexity {}, FEC {}, DTX {} | 加密 {} | 服务端转发 {}",
@@ -108,7 +113,11 @@ pub fn detail(r: &RunResult) {
     }
     budget_line(
         "抖动缓冲（目标深度）",
-        fmt(c.target_frames as f64 * c.frame_ms as f64),
+        if c.adaptive {
+            "自适应".to_string()
+        } else {
+            fmt(c.target_frames as f64 * c.frame_ms as f64)
+        },
     );
     budget_line("解码 p95", fmt(r.decode_us.p95 / 1000.0));
     budget_line("渲染侧摊开一帧", fmt(c.frame_ms as f64));
@@ -176,6 +185,9 @@ pub fn detail(r: &RunResult) {
         r.jitter.prebuffer_ticks,
         r.jitter.max_depth
     );
+    if let Some(note) = &r.adaptive_note {
+        println!("    自适应: {note}");
+    }
     if !r.lost_seqs.is_empty() {
         println!(
             "    丢掉的序号（共 {} 帧，最多列 32 个）: {:?}",
@@ -407,7 +419,7 @@ pub fn verdict(runs: &[RunResult], bw: &[BandwidthRow], cpu: &[CpuCostRow]) {
                     if quality_ok(worst) {
                         "还扛得住"
                     } else {
-                        "扛不住，这正是 M4 自适应缓冲要解决的"
+                        "固定缓冲扛不住；语音链路用的是自适应缓冲，对比见 `latency-probe sim`"
                     }
                 );
             }

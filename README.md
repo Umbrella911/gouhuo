@@ -146,6 +146,7 @@ python scripts/check-spdx.py     # 每个文件头的 SPDX 要跟所属 crate �
 
 ```bash
 cargo run --release -p latency-probe       # 协议链路，约 3 分钟
+cargo run --release -p latency-probe -- sim  # 固定 vs 自适应抖动缓冲，离线模拟一小时，几秒跑完
 cargo run --release -p device-probe        # 设备延迟 + APM 逐块计价
 ```
 
@@ -200,7 +201,7 @@ cargo run --release -p device-probe        # 设备延迟 + APM 逐块计价
 - ✅ 每个人单独调音量（0–400%、一键静音；按公钥记住，换服务器也认得）
 - ✅ 进出提示音 + 念名字（Windows 自带语音合成）：只报自己所在的频道，混进播放那一路让回声消除认得它
 
-**M5** 自适应抖动缓冲 + PLC。技术含量最高的一块，也是低延迟卖点的主战场
+**M5** ✅ 自适应抖动缓冲 + PLC：抖一小时，延迟回到起点（固定缓冲 30 → 220 ms，自适应 33 → 38 ms，[量法](docs/measurements.md#m5-结论自适应抖动缓冲)）
 **M6** 打包、安装包体积实测、游戏帧时间影响实测
 **M7** 游戏 SDK：让游戏开发者把篝火嵌进自己的游戏当语音系统 —— 不注册、不收费、服务器自己架
 

@@ -16,6 +16,7 @@ mod netem;
 mod relay;
 mod report;
 mod run;
+mod sim;
 
 use std::process::ExitCode;
 
@@ -91,6 +92,7 @@ struct Args {
     single: bool,
     json: bool,
     assert_p95_ms: Option<f64>,
+    adaptive: bool,
 }
 
 impl Default for Args {
@@ -110,11 +112,20 @@ impl Default for Args {
             single: false,
             json: false,
             assert_p95_ms: None,
+            adaptive: false,
         }
     }
 }
 
 fn main() -> ExitCode {
+    // `latency-probe sim [秒数]`：固定 vs 自适应抖动缓冲，离线跑，见 sim.rs。
+    let mut raw = std::env::args().skip(1);
+    if raw.next().as_deref() == Some("sim") {
+        let seconds = raw.next().and_then(|s| s.parse().ok());
+        sim::main(seconds);
+        return ExitCode::SUCCESS;
+    }
+
     let args = match parse_args() {
         Ok(Some(a)) => a,
         Ok(None) => return ExitCode::SUCCESS, // --help
@@ -245,6 +256,7 @@ fn single_cfg(args: &Args) -> RunCfg {
         crypto: args.crypto,
         relay: args.relay,
         target_frames: args.target,
+        adaptive: args.adaptive,
         net: NetemConfig {
             owd_ms: p.owd_ms,
             jitter_ms: p.jitter_ms,
@@ -274,6 +286,7 @@ fn matrix_cfgs(args: &Args) -> Vec<RunCfg> {
                     crypto: args.crypto,
                     relay: args.relay,
                     target_frames: target,
+                    adaptive: false,
                     net: NetemConfig {
                         owd_ms: p.owd_ms,
                         jitter_ms: p.jitter_ms,
@@ -370,6 +383,7 @@ fn parse_args() -> Result<Option<Args>, String> {
             "--no-relay" => a.relay = false,
             "--single" => a.single = true,
             "--json" => a.json = true,
+            "--adaptive" => a.adaptive = true,
             other => return Err(format!("不认识的参数 {other}")),
         }
     }
@@ -402,6 +416,9 @@ fn print_help() {
     println!("  --no-crypto           不加密（看 AEAD 的开销有多大）");
     println!("  --no-relay            客户端直连，不走服务端转发那一跳");
     println!("  --json                输出 JSON，给 CI 用");
+    println!("  --adaptive            用自适应抖动缓冲（线上那一份），配合 --single 用");
+    println!();
+    println!("  sim [秒数]            固定 vs 自适应缓冲，离线模拟一小时（或给定秒数），几秒跑完");
     println!(
         "  --assert-gate         按 redline::GATE_PROTOCOL_MS（当前 {:.0} ms）卡防回归闸，CI 用这个",
         voice_core::redline::GATE_PROTOCOL_MS

@@ -25,6 +25,7 @@ use protocol::{encode_voice, VoiceCipher, VoiceHeader, IPV4_UDP_OVERHEAD, SAMPLE
 use voice_core::clock::{boost_current_thread, Ticker};
 use voice_core::jitter::{JitterBuffer, JitterConfig, JitterStats, Playout};
 use voice_core::metrics::{Histogram, Summary};
+use voice_core::playout::{FrameDecoder, Playback};
 
 use crate::netem::{self, NetemConfig, NetemStats};
 use crate::relay;
@@ -46,6 +47,9 @@ pub struct RunCfg {
     pub crypto: bool,
     pub relay: bool,
     pub target_frames: usize,
+    /// 用自适应抖动缓冲（线上那一份播放器：缓冲 + 解码 + 加速）。
+    /// 这时 `target_frames` 不起作用。
+    pub adaptive: bool,
     pub net: NetemConfig,
 }
 
@@ -93,6 +97,8 @@ pub struct RunResult {
     /// 节拍器没能准时醒的次数。不为 0 的话这一次测量的数字都要打折扣。
     pub capture_late_ticks: u64,
     pub playout_late_ticks: u64,
+    /// 自适应模式结束时的状态：目标深度、停着等了几次、加速还回去多少。
+    pub adaptive_note: Option<String>,
 }
 
 struct PlayoutOutcome {
@@ -104,6 +110,7 @@ struct PlayoutOutcome {
     pcm: Vec<i16>,
     play_t0: Instant,
     late_ticks: u64,
+    adaptive_note: Option<String>,
 }
 
 pub fn run(cfg: &RunCfg) -> io::Result<RunResult> {
@@ -142,11 +149,26 @@ pub fn run(cfg: &RunCfg) -> io::Result<RunResult> {
     let jb = Arc::new(Mutex::new(JitterBuffer::new(JitterConfig::fixed(
         cfg.target_frames,
     ))));
+    // 自适应模式：线上那一份播放器。固定模式还是上面那个裸缓冲，逻辑一行没动 ——
+    // CI 卡的协议延迟就是用它量的。
+    let player: Arc<Mutex<Option<Playback<OpusFloat>>>> = Arc::new(Mutex::new(if cfg.adaptive {
+        let mut p = Playback::new(
+            JitterConfig::adaptive(cfg.frame_ms as f64),
+            OpusFloat::new()?,
+            n,
+        );
+        p.record_delays();
+        Some(p)
+    } else {
+        None
+    }));
     let t0 = Instant::now();
 
     // ---- 接收线程 ----
     let rx_thread = {
         let jb = Arc::clone(&jb);
+        let player = Arc::clone(&player);
+        let capture_ns = Arc::clone(&capture_ns);
         let crypto = cfg.crypto;
         std::thread::Builder::new()
             .name("rx".into())
@@ -176,9 +198,25 @@ pub fn run(cfg: &RunCfg) -> io::Result<RunResult> {
                             packets += 1;
                             // 这次 clone 是探针的偷懒；真客户端要走缓冲池，
                             // 50 包/秒 × N 人的分配是能在 profile 里看见的。
-                            jb.lock()
-                                .expect("jitter buffer poisoned")
-                                .push(hdr.seq, payload.clone());
+                            let mut player = player.lock().expect("player poisoned");
+                            if let Some(p) = player.as_mut() {
+                                // 发送时刻就用采集时刻：两边是同一个 t0，延迟直接可比。
+                                let captured = capture_ns
+                                    .get(hdr.seq as usize)
+                                    .map_or(u64::MAX, |c| c.load(Ordering::Relaxed));
+                                let sent_ms = if captured == u64::MAX {
+                                    f64::NAN
+                                } else {
+                                    captured as f64 / 1e6
+                                };
+                                let now_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                                p.push(hdr.seq, sent_ms, payload.clone(), now_ms);
+                            } else {
+                                drop(player);
+                                jb.lock()
+                                    .expect("jitter buffer poisoned")
+                                    .push(hdr.seq, payload.clone());
+                            }
                         }
                         Err(_) => rejected += 1,
                     }
@@ -191,6 +229,8 @@ pub fn run(cfg: &RunCfg) -> io::Result<RunResult> {
     // 先起播放，让它的 t0 早于采集的 t0，互相关的滞后就一定是正的。
     let play_thread = {
         let jb = Arc::clone(&jb);
+        let player = Arc::clone(&player);
+        let adaptive = cfg.adaptive;
         let capture_ns = Arc::clone(&capture_ns);
         let net = cfg.net;
         let frame_ms = cfg.frame_ms as f64;
@@ -213,9 +253,57 @@ pub fn run(cfg: &RunCfg) -> io::Result<RunResult> {
                     pcm: Vec::with_capacity((frames + drain) * n),
                     play_t0: Instant::now(),
                     late_ticks: 0,
+                    adaptive_note: None,
                 };
                 let (mut ticker, play_t0) = Ticker::start(frame_dur);
                 out.play_t0 = play_t0;
+
+                if adaptive {
+                    // 每拍从播放器取一帧。延迟的定义跟下面固定模式一样：
+                    // 这一拍的时刻 − 采集时刻（播放器把它自己 FIFO 里排着的也算上了）。
+                    let mut frame = vec![0.0f32; n];
+                    for _ in 0..max_ticks {
+                        let now = ticker.tick();
+                        let now_ms = now.duration_since(t0).as_secs_f64() * 1000.0;
+                        let mut guard = player.lock().expect("player poisoned");
+                        let p = guard.as_mut().expect("adaptive 就一定有播放器");
+                        let got = p.pull(now_ms, &mut frame);
+                        for delay in p.take_delays() {
+                            out.latency_ms.push(delay);
+                        }
+                        let stats = p.jitter().stats;
+                        drop(guard);
+                        if got {
+                            out.pcm.extend(
+                                frame
+                                    .iter()
+                                    .map(|s| (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16),
+                            );
+                        } else {
+                            out.pcm.resize(out.pcm.len() + n, 0);
+                        }
+                        if stats.played + stats.lost >= frames as u64 {
+                            break;
+                        }
+                    }
+                    let guard = player.lock().expect("player poisoned");
+                    if let Some(p) = guard.as_ref() {
+                        out.adaptive_note = Some(format!(
+                            "结束时目标 {} 帧（{:.1} ms），停着等 {} 次，加速 {} 次共还回去 {:.0} ms",
+                            p.jitter().target_frames(),
+                            p.jitter().target_ms(),
+                            p.jitter().stats.stalls,
+                            p.stats.accelerations,
+                            p.stats.removed_ms
+                        ));
+                        for &us in &p.decoder().timings_us {
+                            out.decode_us.push(us);
+                        }
+                    }
+                    drop(guard);
+                    out.late_ticks = ticker.late_ticks;
+                    return out;
+                }
 
                 let mut accounted = 0usize;
                 for _ in 0..max_ticks {
@@ -234,7 +322,9 @@ pub fn run(cfg: &RunCfg) -> io::Result<RunResult> {
                             (&[][..], None)
                         }
                         // 空输入 = 让 Opus 做丢包隐藏。
-                        Playout::Lost { .. } | Playout::Stall | Playout::Underrun => (&[][..], None),
+                        Playout::Lost { .. } | Playout::Stall | Playout::Underrun => {
+                            (&[][..], None)
+                        }
                     };
 
                     let t = Instant::now();
@@ -325,7 +415,10 @@ pub fn run(cfg: &RunCfg) -> io::Result<RunResult> {
     voice_core::net::send_wake(sink_addr)?;
     let (rx_packets, rx_rejected) = rx_thread.join().expect("rx thread panicked");
 
-    let jitter = jb.lock().expect("jitter buffer poisoned").stats;
+    let jitter = match player.lock().expect("player poisoned").as_ref() {
+        Some(p) => p.jitter().stats,
+        None => jb.lock().expect("jitter buffer poisoned").stats,
+    };
 
     // ---- 信号域延迟 ----
     let (signal_delay_ms, signal_peak) = measure_signal_delay(
@@ -372,6 +465,7 @@ pub fn run(cfg: &RunCfg) -> io::Result<RunResult> {
             .unwrap_or(0),
         capture_late_ticks,
         playout_late_ticks: playout.late_ticks,
+        adaptive_note: playout.adaptive_note.take(),
     })
 }
 
@@ -427,4 +521,34 @@ fn measure_signal_delay(
     let delay_ms =
         skew_ms + frame_dur.as_secs_f64() * 1000.0 + (est.lag as f64 - 1.0) * 1000.0 / fs;
     (Some(delay_ms), Some(est.peak))
+}
+
+/// 自适应模式下给播放器用的 Opus 解码器：出 f32，顺手记下每次解码花了多久。
+struct OpusFloat {
+    decoder: Decoder,
+    timings_us: Vec<f64>,
+}
+
+impl OpusFloat {
+    fn new() -> io::Result<Self> {
+        Ok(Self {
+            decoder: Decoder::new(SAMPLE_RATE, Channels::Mono)
+                .map_err(|e| io::Error::other(format!("opus decoder: {e}")))?,
+            timings_us: Vec::new(),
+        })
+    }
+}
+
+impl FrameDecoder for OpusFloat {
+    fn decode(&mut self, payload: &[u8], out: &mut [f32]) -> bool {
+        let t = Instant::now();
+        let ok = self.decoder.decode_float(payload, out, false).is_ok();
+        self.timings_us.push(t.elapsed().as_secs_f64() * 1e6);
+        ok
+    }
+
+    fn conceal(&mut self, out: &mut [f32]) -> bool {
+        // 空输入 = 让 Opus 做丢包隐藏。
+        self.decoder.decode_float(&[], out, false).is_ok()
+    }
 }
