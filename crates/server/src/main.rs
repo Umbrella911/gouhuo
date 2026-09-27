@@ -13,7 +13,7 @@
 //! | 变量 | 作用 | 默认 |
 //! |---|---|---|
 //! | `GOUHUO_PORT` | 监听端口 | `49737` |
-//! | `GOUHUO_DATA` | 数据目录（证书、邀请码） | `./gouhuo-data` |
+//! | `GOUHUO_DATA` | 数据目录（证书、邀请码、频道存档） | `./gouhuo-data` |
 //! | `GOUHUO_HOST` | 写进邀请链接的地址 | 自动探测的局域网地址 |
 //! | `GOUHUO_INVITE` | 邀请码；设成空串表示不要邀请码 | 首次启动随机生成 |
 //! | `GOUHUO_MAX_USERS` | 人数上限 | `20` |
@@ -28,6 +28,7 @@ use std::time::Duration;
 use protocol::Invite;
 use server::conn::Hub;
 use server::state::{Config, Server};
+use server::store::Store;
 use transport::{server_config, ServerCert};
 
 /// 默认端口。TCP 和 UDP 用同一个号 —— 用户只需要记住一个数，
@@ -47,6 +48,9 @@ use transport::{server_config, ServerCert};
 /// 取交集就是「小于 32768」。再避开 1024 以下（要 root）和常见游戏/服务端口，
 /// 落在 20800。
 const DEFAULT_PORT: u16 = 20800;
+
+/// 存档文件名，放在数据目录下。
+const STORE_FILE: &str = "gouhuo.db";
 
 /// 看门狗多久扫一次。比 `IDLE_TIMEOUT` 小一个数量级就够了。
 const SWEEP_INTERVAL: Duration = Duration::from_secs(3);
@@ -74,7 +78,19 @@ fn run() -> io::Result<()> {
         invite_code: invite_code.clone(),
         admin_keys: Vec::new(),
     };
-    let server = Server::new(config);
+    // 存档打不开就**不起来**，不带着一个空库悄悄跑：那样管理员会以为频道全没了，
+    // 而第一次有人建频道时，旧库就被新数据盖过去，真的找不回来了。
+    let store_path = data_dir.join(STORE_FILE);
+    let store = Store::open(&store_path).map_err(|e| {
+        io::Error::other(format!(
+            "{e}\n存档在 {}。实在修不好的话，把它挪走再启动 —— \
+             服务能起来，但所有频道要重建。",
+            store_path.display()
+        ))
+    })?;
+    let saved = store.load().map_err(io::Error::other)?;
+    let restored_channels = saved.channels.len();
+    let server = Server::restore(config, saved);
 
     // 先绑好两个 socket 再往下走：端口被占的话要在打印邀请链接**之前**失败，
     // 不然用户会拿着一条根本连不上的链接去找人。
@@ -86,7 +102,7 @@ fn run() -> io::Result<()> {
     voice_core::net::set_recv_buffer(&voice, voice_core::net::DEFAULT_RECV_BUFFER)?;
 
     let tls_config = Arc::new(server_config(&cert).map_err(io::Error::other)?);
-    let hub = Arc::new(Hub::new(server, voice));
+    let hub = Arc::new(Hub::with_store(server, voice, store));
 
     let host = std::env::var("GOUHUO_HOST").unwrap_or_else(|_| local_address());
     let invite = Invite {
@@ -95,7 +111,13 @@ fn run() -> io::Result<()> {
         cert: cert.fingerprint(),
         code: invite_code,
     };
-    print_banner(&invite, cert_is_new, code_is_new, &data_dir)?;
+    print_banner(
+        &invite,
+        cert_is_new,
+        code_is_new,
+        &data_dir,
+        restored_channels,
+    )?;
 
     server::spawn_watchdog(Arc::clone(&hub), SWEEP_INTERVAL)?;
 
@@ -144,6 +166,7 @@ fn print_banner(
     cert_is_new: bool,
     code_is_new: bool,
     data_dir: &Path,
+    restored_channels: usize,
 ) -> io::Result<()> {
     let link = invite.to_url().map_err(io::Error::other)?;
 
@@ -151,6 +174,9 @@ fn print_banner(
     println!("  篝火服务端已启动");
     println!("  监听 {}:{}", Ipv4Addr::UNSPECIFIED, invite.port);
     println!("  数据目录 {}", data_dir.display());
+    if restored_channels > 0 {
+        println!("  从存档恢复了 {restored_channels} 个频道");
+    }
     println!("  证书指纹 {}", invite.cert.to_grouped_hex());
     if cert_is_new {
         println!("           （新生成的。换机器时把数据目录一起搬走，");

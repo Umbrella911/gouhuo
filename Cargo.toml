@@ -64,6 +64,8 @@ windows = "0.62"
 # 因此默认关着。sonora 不需要任何 C++ 工具链，所以 APM 现在是默认开的。
 # 换之前的 A/B 和它的局限见 docs/apm-backend.md。
 sonora = "0.2"
+# 服务端的存档。bundled = SQLite 源码编进二进制，自部署的人不用装任何东西。
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 # M1 只关心延迟数字，所以 release 必须是真 release。
 # 注意：不开 panic = "abort"，否则 cargo test --release 跑不了。

@@ -167,6 +167,17 @@ pub struct Admitted {
     pub displaced: Option<SessionId>,
 }
 
+/// 从存档里恢复出来的东西，见 `store` 模块。
+///
+/// 这里只放「重启之后还该在」的：频道树和发号游标。在线的人、会话、
+/// 文字消息都不在里面 —— 那些本来就是一断就没的。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Saved {
+    pub channels: Vec<Channel>,
+    /// 下一个要发的频道 id。0 表示存档里没记。
+    pub next_channel_id: ChannelId,
+}
+
 pub struct Server {
     config: Config,
     channels: BTreeMap<ChannelId, ChannelInfo>,
@@ -179,6 +190,83 @@ pub struct Server {
 
 impl Server {
     pub fn new(config: Config) -> Self {
+        Self::restore(config, Saved::default())
+    }
+
+    /// 带着存档起来。
+    ///
+    /// **存档不可信**：它是个文件，会被手改、会坏、会是旧版本写的。所以这里
+    /// 什么都兜着 —— 父频道不存在的挂到根上，成环的拆开挂到根上，名字空的
+    /// 丢掉，多出 [`MAX_CHANNELS`] 的丢掉。宁可少恢复几个频道，也不能起来一个
+    /// 规则被破坏的状态机：后面所有代码都假设频道树是一棵树。
+    pub fn restore(config: Config, saved: Saved) -> Self {
+        let mut server = Self::fresh(config);
+        let root = server.root;
+
+        let mut next = saved.next_channel_id;
+        for channel in saved.channels {
+            next = next.max(channel.id.wrapping_add(1));
+            if channel.id == 0 || channel.name.trim().is_empty() {
+                continue;
+            }
+            if channel.id == root {
+                // 根频道是结构性的：父指向自己、谁都删不掉。只认存档里的
+                // 名字和说明（将来能改名），别的一律按根频道的规矩来。
+                let info = server.channels.get_mut(&root).expect("fresh 建了根");
+                info.wire.name = channel.name;
+                info.wire.description = channel.description;
+                continue;
+            }
+            if server.channels.len() >= MAX_CHANNELS {
+                break;
+            }
+            let created_by = <[u8; PublicKey::LEN]>::try_from(channel.created_by.as_slice())
+                .ok()
+                .map(PublicKey);
+            let wire = Channel {
+                created_by: created_by.map(|k| k.0.to_vec()).unwrap_or_default(),
+                ..channel
+            };
+            server
+                .channels
+                .insert(wire.id, ChannelInfo { wire, created_by });
+        }
+
+        // 父频道不在、或者往上走回不到根（成环）的，挂到根上。
+        let ids: Vec<ChannelId> = server.channels.keys().copied().collect();
+        for id in ids {
+            if id != root && !server.reaches_root(id) {
+                server
+                    .channels
+                    .get_mut(&id)
+                    .expect("刚列出来")
+                    .wire
+                    .parent_id = root;
+            }
+        }
+
+        server.next_channel = next.max(root + 1);
+        server
+    }
+
+    /// 从 `id` 沿着父频道往上走，能不能走到根。
+    fn reaches_root(&self, id: ChannelId) -> bool {
+        let mut current = id;
+        // 最多走频道总数那么多步：比这多就一定是在转圈。
+        for _ in 0..=self.channels.len() {
+            if current == self.root {
+                return true;
+            }
+            match self.channels.get(&current) {
+                Some(c) if c.wire.parent_id != current => current = c.wire.parent_id,
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    /// 只有一个根频道的全新服务器。
+    fn fresh(config: Config) -> Self {
         let root = 1;
         let mut channels = BTreeMap::new();
         channels.insert(
@@ -661,6 +749,126 @@ mod tests {
 
     fn open_server() -> Server {
         Server::new(Config::default())
+    }
+
+    fn saved_channel(id: ChannelId, parent_id: ChannelId, name: &str, by: Option<u8>) -> Channel {
+        Channel {
+            id,
+            parent_id,
+            name: name.to_string(),
+            min_role: Role::Guest as i32,
+            created_by: by.map(|k| key(k).0.to_vec()).unwrap_or_default(),
+            ..Default::default()
+        }
+    }
+
+    fn restored(channels: Vec<Channel>, next_channel_id: ChannelId) -> Server {
+        Server::restore(
+            Config::default(),
+            Saved {
+                channels,
+                next_channel_id,
+            },
+        )
+    }
+
+    /// 重启之后：频道还在，建的人还能删。
+    #[test]
+    fn restored_channels_are_still_owned_by_their_creator() {
+        let mut server = restored(vec![saved_channel(5, 1, "开黑", Some(7))], 6);
+        let owner = admit(&mut server, 7, "阿狸");
+        let stranger = admit(&mut server, 8, "路人");
+
+        assert_eq!(server.channels[&5].wire.name, "开黑");
+        assert!(server.delete_channel(stranger, 5).is_empty(), "别人删掉了");
+        assert!(
+            !server.delete_channel(owner, 5).is_empty(),
+            "建的人删不掉了"
+        );
+        assert!(!server.channels.contains_key(&5));
+    }
+
+    /// 发号游标要接着存档往下走 —— 重启之后再建的频道不能撞上旧 id。
+    #[test]
+    fn new_ids_continue_after_the_saved_ones() {
+        // 存档说游标在 20（中间删过一些），最大的 id 是 9
+        let mut server = restored(vec![saved_channel(9, 1, "老频道", Some(7))], 20);
+        let owner = admit(&mut server, 7, "阿狸");
+        create(&mut server, owner, "新频道");
+        let new_id = server
+            .channels
+            .values()
+            .find(|c| c.wire.name == "新频道")
+            .unwrap()
+            .wire
+            .id;
+        assert_eq!(new_id, 20);
+
+        // 游标没记（旧存档）的话，至少要比最大的 id 大
+        let mut server = restored(vec![saved_channel(9, 1, "老频道", Some(7))], 0);
+        let owner = admit(&mut server, 7, "阿狸");
+        create(&mut server, owner, "新频道");
+        assert!(server
+            .channels
+            .values()
+            .all(|c| c.wire.id != 9 || c.wire.name == "老频道"));
+    }
+
+    /// 存档是个文件，会坏。坏了也得起来一棵合法的树。
+    #[test]
+    fn a_broken_save_still_gives_a_valid_tree() {
+        let server = restored(
+            vec![
+                saved_channel(3, 99, "父频道没了", None),
+                saved_channel(4, 5, "环A", None),
+                saved_channel(5, 4, "环B", None),
+                saved_channel(6, 6, "自己是自己的父", None),
+                saved_channel(7, 1, "   ", None),
+                saved_channel(0, 1, "零号", None),
+                saved_channel(8, 3, "挂在修好的频道下", None),
+            ],
+            0,
+        );
+        let root = server.root_channel();
+        for id in [3, 6] {
+            assert_eq!(
+                server.channels[&id].wire.parent_id, root,
+                "频道 {id} 没挂回根上"
+            );
+        }
+        // 环只拆一处：4 挂回根上之后，5 → 4 → 根 已经合法，5 不用动。
+        let cycle = [4, 5].map(|id| server.channels[&id].wire.parent_id);
+        assert!(cycle.contains(&root), "环没拆开：{cycle:?}");
+        assert_eq!(server.channels[&8].wire.parent_id, 3, "本来就合法的不该动");
+        assert!(!server.channels.contains_key(&7), "空名字的该丢掉");
+        assert!(!server.channels.contains_key(&0));
+        for id in server.channels.keys() {
+            assert!(server.reaches_root(*id), "频道 {id} 走不回根");
+        }
+    }
+
+    /// 根频道只认存档里的名字，别的规矩不能被存档改掉。
+    #[test]
+    fn the_saved_root_cannot_become_deletable() {
+        let mut hacked = saved_channel(1, 3, "改了名的大厅", Some(7));
+        hacked.min_role = Role::Admin as i32;
+        let mut server = restored(vec![hacked], 0);
+        let root = server.root_channel();
+        assert_eq!(server.channels[&root].wire.name, "改了名的大厅");
+        assert_eq!(server.channels[&root].wire.parent_id, root);
+        assert_eq!(server.channels[&root].created_by, None);
+
+        let someone = admit(&mut server, 7, "阿狸");
+        assert!(server.delete_channel(someone, root).is_empty());
+    }
+
+    #[test]
+    fn restoring_respects_the_channel_limit() {
+        let many = (2..(MAX_CHANNELS as u32 + 50))
+            .map(|id| saved_channel(id, 1, "频道", None))
+            .collect();
+        let server = restored(many, 0);
+        assert_eq!(server.channels.len(), MAX_CHANNELS);
     }
 
     fn admit(server: &mut Server, k: u8, name: &str) -> SessionId {

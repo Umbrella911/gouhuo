@@ -25,6 +25,8 @@ transport.workspace = true
 voice-core = { workspace = true, default-features = false }
 rustls.workspace = true
 getrandom.workspace = true
+# 频道树的存档，见 src/store.rs
+rusqlite.workspace = true
 
 [dev-dependencies]
 protocol.workspace = true

@@ -44,6 +44,7 @@ use protocol::PublicKey;
 use voice_core::identity::Identity;
 
 use crate::state::{Broadcast, Server, SessionId};
+use crate::store::Store;
 use crate::voice::{Incoming, VoiceRouter};
 
 /// 多久没收到任何东西就算掉线。客户端每隔几秒会发一次 Ping。
@@ -147,6 +148,10 @@ impl Peer {
 pub struct Hub {
     state: Mutex<Server>,
     peers: Mutex<HashMap<SessionId, Arc<Peer>>>,
+    /// 存档。`None` = 不落盘（测试、或者存档打不开时只在内存里跑）。
+    ///
+    /// **锁的顺序永远是先 `state` 后 `store`**，见 [`Hub::mutate`]。
+    store: Option<Mutex<Store>>,
     /// UDP 那一半。
     pub voice: VoiceRouter,
 }
@@ -156,7 +161,39 @@ impl Hub {
         Self {
             state: Mutex::new(server),
             peers: Mutex::new(HashMap::new()),
+            store: None,
             voice: VoiceRouter::new(voice_socket),
+        }
+    }
+
+    /// 带存档。`server` 应该是用同一份存档 `Server::restore` 出来的。
+    pub fn with_store(server: Server, voice_socket: UdpSocket, store: Store) -> Self {
+        Self {
+            store: Some(Mutex::new(store)),
+            ..Self::new(server, voice_socket)
+        }
+    }
+
+    /// 改状态，并在**同一把锁里**把要落盘的部分写进存档。
+    ///
+    /// 写库不能挪到 [`Hub::dispatch`] 里做：那是在锁外面跑的，两个线程的
+    /// 广播可能乱序。A 删了频道 X（子频道 Y 挪到根上），紧接着 C 删了 Y ——
+    /// 要是 C 的那批先落盘，库里就是先删 Y、再被 A 那批「Y 挪到根上」写回来，
+    /// 一个删掉的频道重启之后又冒出来。在锁里写，落盘顺序就是改状态的顺序。
+    fn mutate(&self, f: impl FnOnce(&mut Server) -> Vec<Broadcast>) -> Vec<Broadcast> {
+        let mut state = self.state.lock().expect("state poisoned");
+        let events = f(&mut state);
+        self.persist(&events);
+        events
+    }
+
+    /// 调用方必须持着 `state` 锁。见 [`Hub::mutate`]。
+    fn persist(&self, events: &[Broadcast]) {
+        let Some(store) = &self.store else { return };
+        if let Err(e) = store.lock().expect("store poisoned").record(events) {
+            // 不因为这个把服务停掉：频道照样能用，只是重启会丢这一次改动。
+            // 在线的人比存档要紧。
+            eprintln!("存档写失败，这次的频道改动重启后会丢：{e}");
         }
     }
 
@@ -328,14 +365,13 @@ pub fn serve_connection(
     hub.peers.lock().expect("peers poisoned").remove(&session);
     // **先摘语音再改状态**：留着的话，一个刚被踢掉的人还能继续往频道里灌声音。
     hub.voice.unregister(session);
-    let events = {
-        let mut state = hub.state.lock().expect("state poisoned");
+    let events = hub.mutate(|state| {
         if peer.timed_out.load(Ordering::Relaxed) {
             state.timeout(session)
         } else {
             state.disconnect(session)
         }
-    };
+    });
     hub.dispatch(events);
     result
 }
@@ -422,7 +458,11 @@ fn authenticate(
     // 到这里才轮到策略。密码学归密码学，策略归 state。
     let admitted = {
         let mut state = hub.state.lock().expect("state poisoned");
-        state.admit(public_key, &auth.invite_code, &auth.desired_name)
+        let admitted = state.admit(public_key, &auth.invite_code, &auth.desired_name);
+        if let Ok(a) = &admitted {
+            hub.persist(&a.broadcasts);
+        }
+        admitted
     };
     let admitted = match admitted {
         Ok(a) => a,
@@ -505,24 +545,18 @@ fn message_loop(
                 Vec::new()
             }
             Some(client_message::Payload::JoinChannel(join)) => {
-                let mut state = hub.state.lock().expect("state poisoned");
-                state.join_channel(peer.session, join.channel_id)
+                hub.mutate(|state| state.join_channel(peer.session, join.channel_id))
             }
             Some(client_message::Payload::CreateChannel(req)) => {
-                let mut state = hub.state.lock().expect("state poisoned");
-                state.create_channel(peer.session, req)
+                hub.mutate(|state| state.create_channel(peer.session, req))
             }
             Some(client_message::Payload::DeleteChannel(req)) => {
-                let mut state = hub.state.lock().expect("state poisoned");
-                state.delete_channel(peer.session, req.channel_id)
+                hub.mutate(|state| state.delete_channel(peer.session, req.channel_id))
             }
-            Some(client_message::Payload::SelfState(s)) => {
-                let mut state = hub.state.lock().expect("state poisoned");
-                state.set_self_state(peer.session, s.self_muted, s.self_deafened)
-            }
+            Some(client_message::Payload::SelfState(s)) => hub
+                .mutate(|state| state.set_self_state(peer.session, s.self_muted, s.self_deafened)),
             Some(client_message::Payload::TextMessage(text)) => {
-                let mut state = hub.state.lock().expect("state poisoned");
-                state.text_message(peer.session, text, now_ms())
+                hub.mutate(|state| state.text_message(peer.session, text, now_ms()))
             }
             // 登录之后再发 Hello / Authenticate 是协议错误，忽略。
             Some(_) => Vec::new(),
