@@ -952,11 +952,7 @@ fn pump_events(
                     app.set_transmitting(false);
                     app.set_input_level(0.0);
                     app.set_reconnecting(
-                        format!(
-                            "连接断了，正在自动重连（第 {attempt} 次）。
-{reason}"
-                        )
-                        .into(),
+                        format!("连接断了，正在自动重连（第 {attempt} 次）。\n{reason}").into(),
                     );
                 }
                 Event::Reconnected => {

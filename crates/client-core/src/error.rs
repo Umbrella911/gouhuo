@@ -147,8 +147,7 @@ pub fn farewell(reason: protocol::control::goodbye::Reason, detail: &str) -> (St
             if detail.is_empty() {
                 "管理员把你踢了出去。可以重新加入 —— 除非接着被封了。".into()
             } else {
-                format!("{detail}
-可以重新加入 —— 除非接着被封了。")
+                format!("{detail}\n可以重新加入 —— 除非接着被封了。")
             },
         ),
         Reason::Banned => (
