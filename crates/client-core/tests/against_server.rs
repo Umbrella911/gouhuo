@@ -493,3 +493,65 @@ fn a_refused_creation_leaves_no_ghost_channel() {
         "被拒之后不该在本地留下一个只有自己看得见的频道"
     );
 }
+
+/// 提示音要的是「进出**我这个**频道」，对着真服务端走一遍：
+/// 连进来、挪走、挪回来、断线。
+#[test]
+fn comings_and_goings_in_my_channel() {
+    let server = open_server();
+    let (_alice, alice_events) = join(&server, "阿狸");
+
+    let (bob, _bob_events) = join(&server, "波波");
+    let event = wait_for(&alice_events, |e| {
+        matches!(e, Event::CameIn { .. } | Event::WentOut { .. })
+    });
+    assert!(
+        matches!(&event, Event::CameIn { name, .. } if name == "波波"),
+        "新来的人落在我的频道，该是「进来了」：{event:?}"
+    );
+
+    bob.create_channel("隔壁", 0);
+    let room = {
+        let deadline = std::time::Instant::now() + WAIT;
+        loop {
+            if let Some(id) = bob
+                .roster()
+                .channels
+                .values()
+                .find(|c| c.name == "隔壁")
+                .map(|c| c.id)
+            {
+                break id;
+            }
+            assert!(std::time::Instant::now() < deadline, "频道没建出来");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    bob.join_channel(room);
+    let event = wait_for(&alice_events, |e| {
+        matches!(e, Event::CameIn { .. } | Event::WentOut { .. })
+    });
+    assert!(
+        matches!(&event, Event::WentOut { name, .. } if name == "波波"),
+        "{event:?}"
+    );
+
+    let root = bob.roster().root().unwrap();
+    bob.join_channel(root);
+    let event = wait_for(&alice_events, |e| {
+        matches!(e, Event::CameIn { .. } | Event::WentOut { .. })
+    });
+    assert!(
+        matches!(&event, Event::CameIn { name, .. } if name == "波波"),
+        "{event:?}"
+    );
+
+    bob.disconnect();
+    let event = wait_for(&alice_events, |e| {
+        matches!(e, Event::CameIn { .. } | Event::WentOut { .. })
+    });
+    assert!(
+        matches!(&event, Event::WentOut { name, .. } if name == "波波"),
+        "{event:?}"
+    );
+}

@@ -116,6 +116,21 @@ pub enum Event {
         session: u32,
         name: String,
     },
+    /// 有人进了**我所在的**频道：从别的频道挪过来，或者刚连上就落在这儿。
+    ///
+    /// 跟 [`Event::Joined`] 不是一回事：那个是「连上了服务器」，不管在哪个频道。
+    /// 提示音和念名字要的是这个 —— 隔壁频道进来个人，跟我没关系。
+    ///
+    /// **我自己换频道不算**：换到一个有五个人的频道，不该念五遍「某某进来了」。
+    CameIn {
+        session: u32,
+        name: String,
+    },
+    /// 有人离开了我所在的频道：挪去了别处，或者断线走了。
+    WentOut {
+        session: u32,
+        name: String,
+    },
     /// 收到一条文字。
     Text(ChatLine),
     /// 连接断了，正在自己重连。**不是错误页** —— 界面该显示「正在重连」，
@@ -720,26 +735,55 @@ fn apply(roster: &Mutex<Roster>, message: ServerMessage) -> Vec<Event> {
             };
             let session = user.session_id;
             let name = user.name.clone();
+            let now_in = user.channel_id;
+            // 在改名单之前记下「我在哪」。我自己的那条 UserState 会改掉它，
+            // 但那种情况下面整个跳过了。
+            let mine = roster.my_channel();
             let previous = roster.users.insert(session, user);
-            match previous {
-                // 第一次见到这个人 —— 但别把自己的登录当成「有人进来了」
-                None if session != roster.me => {
-                    vec![Event::Joined { session, name }, Event::RosterChanged]
+            let mut events = Vec::new();
+            if session != roster.me {
+                let was_in = previous.as_ref().map(|p| p.channel_id);
+                if previous.is_none() {
+                    events.push(Event::Joined {
+                        session,
+                        name: name.clone(),
+                    });
                 }
-                _ => vec![Event::RosterChanged],
+                if was_in != Some(now_in) {
+                    if now_in == mine {
+                        events.push(Event::CameIn {
+                            session,
+                            name: name.clone(),
+                        });
+                    } else if was_in == Some(mine) {
+                        events.push(Event::WentOut {
+                            session,
+                            name: name.clone(),
+                        });
+                    }
+                }
             }
+            events.push(Event::RosterChanged);
+            events
         }
         Some(server_message::Payload::UserLeft(left)) => {
+            let mine = roster.my_channel();
             let Some(user) = roster.users.remove(&left.session_id) else {
                 return Vec::new();
             };
-            vec![
-                Event::Left {
+            let mut events = Vec::new();
+            if user.channel_id == mine && left.session_id != roster.me {
+                events.push(Event::WentOut {
                     session: left.session_id,
-                    name: user.name,
-                },
-                Event::RosterChanged,
-            ]
+                    name: user.name.clone(),
+                });
+            }
+            events.push(Event::Left {
+                session: left.session_id,
+                name: user.name,
+            });
+            events.push(Event::RosterChanged);
+            events
         }
         Some(server_message::Payload::ChannelState(state)) => {
             let Some(channel) = state.channel else {
@@ -904,6 +948,130 @@ mod tests {
             backoff(40, first, max) <= max.mul_f64(1.2),
             "封顶之后不能再涨"
         );
+    }
+
+    fn user(session: u32, name: &str, channel_id: u32) -> protocol::control::User {
+        protocol::control::User {
+            session_id: session,
+            name: name.to_string(),
+            channel_id,
+            ..Default::default()
+        }
+    }
+
+    /// 我（会话 1）在频道 10。
+    fn roster_in_channel_10() -> Mutex<Roster> {
+        let mut roster = Roster {
+            me: 1,
+            ..Default::default()
+        };
+        roster.users.insert(1, user(1, "我", 10));
+        Mutex::new(roster)
+    }
+
+    fn state(u: protocol::control::User) -> ServerMessage {
+        protocol::control::UserState { user: Some(u) }.into()
+    }
+
+    fn left(session: u32) -> ServerMessage {
+        protocol::control::UserLeft {
+            session_id: session,
+            reason: 1,
+        }
+        .into()
+    }
+
+    fn came_in(events: &[Event]) -> Vec<&str> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                Event::CameIn { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn went_out(events: &[Event]) -> Vec<&str> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                Event::WentOut { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn someone_connecting_into_my_channel_came_in() {
+        let roster = roster_in_channel_10();
+        let events = apply(&roster, state(user(2, "阿狸", 10)));
+        assert_eq!(came_in(&events), ["阿狸"]);
+    }
+
+    #[test]
+    fn someone_connecting_elsewhere_is_none_of_my_business() {
+        let roster = roster_in_channel_10();
+        let events = apply(&roster, state(user(2, "阿狸", 20)));
+        assert!(came_in(&events).is_empty());
+        assert!(went_out(&events).is_empty());
+        // 但「连上了服务器」照样报
+        assert!(events.iter().any(|e| matches!(e, Event::Joined { .. })));
+    }
+
+    #[test]
+    fn moving_in_and_out_of_my_channel() {
+        let roster = roster_in_channel_10();
+        apply(&roster, state(user(2, "阿狸", 20)));
+
+        let events = apply(&roster, state(user(2, "阿狸", 10)));
+        assert_eq!(came_in(&events), ["阿狸"]);
+
+        let events = apply(&roster, state(user(2, "阿狸", 30)));
+        assert_eq!(went_out(&events), ["阿狸"]);
+
+        // 在两个别的频道之间挪来挪去，跟我没关系
+        let events = apply(&roster, state(user(2, "阿狸", 20)));
+        assert!(came_in(&events).is_empty() && went_out(&events).is_empty());
+    }
+
+    /// 闭麦、改名这类不换频道的变化，不能当成「又进来了一次」。
+    #[test]
+    fn a_state_change_without_moving_is_not_a_visit() {
+        let roster = roster_in_channel_10();
+        apply(&roster, state(user(2, "阿狸", 10)));
+        let muted = protocol::control::User {
+            self_muted: true,
+            ..user(2, "阿狸", 10)
+        };
+        let events = apply(&roster, state(muted));
+        assert!(came_in(&events).is_empty() && went_out(&events).is_empty());
+    }
+
+    #[test]
+    fn disconnecting_from_my_channel_went_out() {
+        let roster = roster_in_channel_10();
+        apply(&roster, state(user(2, "阿狸", 10)));
+        apply(&roster, state(user(3, "波波", 20)));
+
+        assert_eq!(went_out(&apply(&roster, left(2))), ["阿狸"]);
+        assert!(
+            went_out(&apply(&roster, left(3))).is_empty(),
+            "隔壁的人走了"
+        );
+    }
+
+    /// 我换到一个有人的频道：那些人本来就在，不是「进来了」。
+    #[test]
+    fn my_own_move_announces_nobody() {
+        let roster = roster_in_channel_10();
+        apply(&roster, state(user(2, "阿狸", 20)));
+        apply(&roster, state(user(3, "波波", 20)));
+
+        let events = apply(&roster, state(user(1, "我", 20)));
+        assert!(came_in(&events).is_empty() && went_out(&events).is_empty());
+
+        // 挪过去之后，阿狸再走就是「从我这儿走了」
+        assert_eq!(went_out(&apply(&roster, left(2))), ["阿狸"]);
     }
 
     fn channel(id: u32, name: &str) -> Channel {
