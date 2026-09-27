@@ -154,6 +154,11 @@ envelope_from!(
     JoinChannel => client_message::Payload::JoinChannel,
     CreateChannel => client_message::Payload::CreateChannel,
     DeleteChannel => client_message::Payload::DeleteChannel,
+    EditChannel => client_message::Payload::EditChannel,
+    KickUser => client_message::Payload::KickUser,
+    BanUser => client_message::Payload::BanUser,
+    Unban => client_message::Payload::Unban,
+    SetRole => client_message::Payload::SetRole,
     SelfState => client_message::Payload::SelfState,
 );
 
@@ -167,6 +172,7 @@ envelope_from!(
     UserLeft => server_message::Payload::UserLeft,
     ChannelState => server_message::Payload::ChannelState,
     Goodbye => server_message::Payload::Goodbye,
+    BanList => server_message::Payload::BanList,
 );
 
 // TextMessage 两边都有，From 会冲突（一个类型只能有一个 From<TextMessage> 目标），

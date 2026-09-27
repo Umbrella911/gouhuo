@@ -246,6 +246,67 @@ message TextMessage {
   int64 timestamp_ms = 4;
 }
 
+// 改一个频道：改名、改说明、挪到别的父频道下。
+//
+// 发的是**完整的目标状态**，不是差量：不想改的字段填当前值。跟 UserState
+// 同一个理由 —— proto3 分不清「没带这个字段」和「带了但是空」。
+//
+// 谁能改：建的人自己，或者频道管理及以上。根频道只有管理员能改，而且只能
+// 改名和说明，挪不了。不能挪到自己的子孙下面（那会成环）。
+// 改成了服务端广播一条 ChannelState 给所有人；没改成什么都不发。
+message EditChannel {
+  uint32 channel_id = 1;
+  string name = 2;
+  string description = 3;
+  uint32 parent_id = 4;
+}
+
+// 把一个人踢出服务器。他可以马上再连回来 —— 要他回不来用 BanUser。
+//
+// 频道管理及以上能踢，而且只能踢角色比自己低的人。被踢的人先收到
+// Goodbye{KICKED}，客户端因此不会自动重连。
+message KickUser {
+  uint32 session_id = 1;
+  // 给被踢的人看的理由，可以空着。
+  string reason = 2;
+}
+
+// 封禁：踢出去，并且这个公钥以后再也进不来。只有管理员能封，
+// 只能封角色比自己低的人。
+message BanUser {
+  uint32 session_id = 1;
+  string reason = 2;
+}
+
+// 解封。只有管理员能解。
+message Unban {
+  bytes public_key = 1;
+}
+
+// 改一个在线的人的角色。只有管理员能改，不能改自己的，也不能改别的管理员的。
+// 改成了服务端广播一条 UserState；角色按公钥记住，下次进来还是这个角色。
+message SetRole {
+  uint32 session_id = 1;
+  Role role = 2;
+}
+
+// 封禁名单里的一条。
+message BannedUser {
+  bytes public_key = 1;
+  // 被封时叫什么。昵称不是身份，这里只是让管理员认得出是谁。
+  string name = 2;
+  int64 banned_at_ms = 3;
+  // 谁封的（当时的昵称）。
+  string banned_by = 4;
+  string reason = 5;
+}
+
+// 完整的封禁名单。**只发给管理员**：登录时发一次，名单一变再发一次。
+// 别人不需要知道谁被封了，那不是公开信息。
+message BanList {
+  repeated BannedUser entries = 1;
+}
+
 message SelfState {
   bool self_muted = 1;
   bool self_deafened = 2;
@@ -288,6 +349,11 @@ message ClientMessage {
     SelfState self_state = 6;
     CreateChannel create_channel = 7;
     DeleteChannel delete_channel = 8;
+    EditChannel edit_channel = 9;
+    KickUser kick_user = 10;
+    BanUser ban_user = 11;
+    Unban unban = 12;
+    SetRole set_role = 13;
   }
 }
 
@@ -303,5 +369,6 @@ message ServerMessage {
     ChannelState channel_state = 7;
     TextMessage text_message = 8;
     Goodbye goodbye = 9;
+    BanList ban_list = 10;
   }
 }

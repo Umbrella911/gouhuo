@@ -63,7 +63,10 @@ impl core::fmt::Display for Fingerprint {
 }
 
 /// Ed25519 公钥 —— 用户身份本身。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// 可以排序（按字节），只是为了能当有序表的键：服务端的角色表、封禁名单
+/// 按它存，顺序稳定，测试和存档都好对。大小本身没有任何含义。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PublicKey(pub [u8; PublicKey::LEN]);
 
 impl PublicKey {
