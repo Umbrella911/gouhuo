@@ -17,6 +17,12 @@
 //! | `GOUHUO_HOST` | 写进邀请链接的地址 | 自动探测的局域网地址 |
 //! | `GOUHUO_INVITE` | 邀请码；设成空串表示不要邀请码 | 首次启动随机生成 |
 //! | `GOUHUO_MAX_USERS` | 人数上限 | `20` |
+//!
+//! # 管理员
+//!
+//! 还没有管理员的时候，启动时会多打一条**管理员链接**。自己用它连进去就成了
+//! 管理员（按公钥记进存档），链接随即作废。管理员身份丢了（重装系统又没导出
+//! 身份）的话，带上 `--new-admin-link` 启动，会再发一条。
 
 use std::fs;
 use std::io;
@@ -25,6 +31,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use protocol::control::Role;
 use protocol::Invite;
 use server::conn::Hub;
 use server::state::{Config, Server};
@@ -81,16 +88,27 @@ fn run() -> io::Result<()> {
     // 存档打不开就**不起来**，不带着一个空库悄悄跑：那样管理员会以为频道全没了，
     // 而第一次有人建频道时，旧库就被新数据盖过去，真的找不回来了。
     let store_path = data_dir.join(STORE_FILE);
-    let store = Store::open(&store_path).map_err(|e| {
+    let mut store = Store::open(&store_path).map_err(|e| {
         io::Error::other(format!(
             "{e}\n存档在 {}。实在修不好的话，把它挪走再启动 —— \
              服务能起来，但所有频道要重建。",
             store_path.display()
         ))
     })?;
-    let saved = store.load().map_err(io::Error::other)?;
+    let mut saved = store.load().map_err(io::Error::other)?;
     let restored_channels = saved.channels.len();
+
+    // 没有管理员、也没有还没用掉的管理员链接：发一条。要了新的（身份丢了）也发。
+    // 旧的那条会被覆盖掉，只有最新这条有效。
+    let has_admin = saved.roles.iter().any(|(_, role)| *role == Role::Admin);
+    let wants_new_link = std::env::args().any(|arg| arg == "--new-admin-link");
+    if wants_new_link || (!has_admin && saved.admin_claim.is_none()) {
+        let code = random_code()?;
+        store.save_admin_claim(&code).map_err(io::Error::other)?;
+        saved.admin_claim = Some(code);
+    }
     let server = Server::restore(config, saved);
+    let admin_claim = server.admin_claim().map(str::to_string);
 
     // 先绑好两个 socket 再往下走：端口被占的话要在打印邀请链接**之前**失败，
     // 不然用户会拿着一条根本连不上的链接去找人。
@@ -111,8 +129,14 @@ fn run() -> io::Result<()> {
         cert: cert.fingerprint(),
         code: invite_code,
     };
+    // 在 Hub 拿走 server 之前把管理员链接取出来。
+    let admin_invite = admin_claim.map(|code| Invite {
+        code: Some(code),
+        ..invite.clone()
+    });
     print_banner(
         &invite,
+        admin_invite.as_ref(),
         cert_is_new,
         code_is_new,
         &data_dir,
@@ -153,16 +177,24 @@ fn load_or_create_invite_code(dir: &Path) -> io::Result<(Option<String>, bool)> 
         }
     }
 
-    // 10 字节 = 80 位。邀请码是公网上能被猜的东西，长度得够。
-    let mut raw = [0u8; 10];
-    getrandom::fill(&mut raw).map_err(|e| io::Error::other(format!("拿不到随机数: {e}")))?;
-    let code = protocol::base32::encode(&raw);
+    let code = random_code()?;
     fs::write(&path, format!("{code}\n"))?;
     Ok((Some(code), true))
 }
 
+/// 一个随机码，给邀请链接和管理员链接用。
+///
+/// 10 字节 = 80 位。这些码是公网上能被猜的东西，长度得够 —— 尤其是管理员链接，
+/// 猜中了就是整个服务器。
+fn random_code() -> io::Result<String> {
+    let mut raw = [0u8; 10];
+    getrandom::fill(&mut raw).map_err(|e| io::Error::other(format!("拿不到随机数: {e}")))?;
+    Ok(protocol::base32::encode(&raw))
+}
+
 fn print_banner(
     invite: &Invite,
+    admin_invite: Option<&Invite>,
     cert_is_new: bool,
     code_is_new: bool,
     data_dir: &Path,
@@ -187,6 +219,13 @@ fn print_banner(
     println!();
     println!("      {link}");
     println!();
+    if let Some(admin) = admin_invite {
+        let admin_link = admin.to_url().map_err(io::Error::other)?;
+        println!("  管理员链接（只给自己用！用它连进去就成了管理员，用过一次就作废）：");
+        println!();
+        println!("      {admin_link}");
+        println!();
+    }
     if invite.code.is_none() {
         println!("  ⚠ 没设邀请码：任何知道地址和指纹的人都能进。");
     } else if code_is_new {

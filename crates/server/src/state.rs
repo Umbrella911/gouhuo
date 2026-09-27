@@ -13,8 +13,8 @@
 use std::collections::BTreeMap;
 
 use protocol::control::{
-    rejected, user_left, Channel, ChannelState, CreateChannel, Rejected, Role, ServerMessage,
-    TextMessage, User, UserLeft, UserState, Welcome,
+    goodbye, rejected, user_left, BanList, BannedUser, Channel, ChannelState, CreateChannel,
+    EditChannel, Rejected, Role, ServerMessage, TextMessage, User, UserLeft, UserState, Welcome,
 };
 use protocol::PublicKey;
 
@@ -50,8 +50,19 @@ pub const MAX_CHANNELS: usize = 128;
 /// 防滥用的闸打开了。`Role` 的注释里写的就是「成员：能建临时频道」。
 const MIN_ROLE_TO_CREATE_CHANNEL: Role = Role::Member;
 
-/// 删别人建的频道要的最低角色。**建的人自己不受这条限制。**
+/// 删、改别人建的频道要的最低角色。**建的人自己不受这条限制。**
 const MIN_ROLE_TO_DELETE_OTHERS_CHANNEL: Role = Role::ChannelAdmin;
+
+/// 踢人要的最低角色。`Role` 的注释里写的就是「频道管理：能踢人」。
+const MIN_ROLE_TO_KICK: Role = Role::ChannelAdmin;
+
+/// 踢人、封禁时附带的理由的长度上限（字节）。
+pub const MAX_REASON_BYTES: usize = 200;
+
+/// 角色的高低。**只拿来比较**，别的地方不要直接比 `as i32`。
+fn rank(role: Role) -> i32 {
+    role as i32
+}
 
 /// 要发给谁。
 #[derive(Debug, Clone, PartialEq)]
@@ -62,6 +73,57 @@ pub enum Broadcast {
     Channel(ChannelId, ServerMessage),
     /// 只发给一个人。
     One(SessionId, ServerMessage),
+    /// 断开这个人的连接，断之前先用 `Goodbye` 告诉他为什么。
+    ///
+    /// 状态里已经把他摘掉了，连接层只管关 socket。**排在同一批里别的广播前面**：
+    /// 先让他收到「你被踢了」，再让别人收到「他走了」。
+    Kick {
+        session: SessionId,
+        reason: goodbye::Reason,
+        detail: String,
+    },
+}
+
+/// 状态机里「重启之后也该在」的那些变化。连接层每次改完状态就取走，
+/// 交给存档写盘（见 `store` 和 `conn::Hub::mutate`）。
+///
+/// 状态机自己不碰存档，只是把变化记在这里 —— 跟 [`Broadcast`] 是同一个思路：
+/// 规则在这里，IO 在外面。
+#[derive(Debug, Clone, PartialEq)]
+pub enum Change {
+    /// 建了或者改了（改名、挪父频道）一个频道。存的是改完之后的完整样子。
+    ChannelSaved(Channel),
+    ChannelRemoved(ChannelId),
+    /// 某个公钥的角色定下来了。之后他再进来就是这个角色，不看邀请码。
+    RoleSet(PublicKey, Role),
+    BanAdded(BanEntry),
+    BanRemoved(PublicKey),
+    /// 管理员链接被用掉了，作废。
+    AdminClaimUsed,
+}
+
+/// 封禁名单里的一条。
+#[derive(Debug, Clone, PartialEq)]
+pub struct BanEntry {
+    pub public_key: PublicKey,
+    /// 被封时叫什么。只是让管理员认得出是谁，不参与任何判断。
+    pub name: String,
+    pub banned_at_ms: i64,
+    /// 谁封的（当时的昵称）。
+    pub banned_by: String,
+    pub reason: String,
+}
+
+impl BanEntry {
+    fn to_wire(&self) -> BannedUser {
+        BannedUser {
+            public_key: self.public_key.0.to_vec(),
+            name: self.name.clone(),
+            banned_at_ms: self.banned_at_ms,
+            banned_by: self.banned_by.clone(),
+            reason: self.reason.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -176,6 +238,11 @@ pub struct Saved {
     pub channels: Vec<Channel>,
     /// 下一个要发的频道 id。0 表示存档里没记。
     pub next_channel_id: ChannelId,
+    /// 按公钥定下来的角色。
+    pub roles: Vec<(PublicKey, Role)>,
+    pub bans: Vec<BanEntry>,
+    /// 还没被用掉的管理员链接里的码。`None` = 没有（已经有管理员了，或者从没发过）。
+    pub admin_claim: Option<String>,
 }
 
 pub struct Server {
@@ -186,6 +253,14 @@ pub struct Server {
     root: ChannelId,
     /// 下一个要发的频道 id。**只增不减**，见 [`Server::next_channel_id`]。
     next_channel: ChannelId,
+    /// 按公钥定下来的角色。有这一条的人进来时就是这个角色，不看邀请码 ——
+    /// 被管理员提成成员的人，不该因为手里是一条旧链接就变回访客。
+    granted: BTreeMap<PublicKey, Role>,
+    bans: BTreeMap<PublicKey, BanEntry>,
+    /// 管理员链接里的码。用它进来的第一个人成为管理员，然后作废。
+    admin_claim: Option<String>,
+    /// 还没被存档取走的变化，见 [`Change`]。
+    changes: Vec<Change>,
 }
 
 impl Server {
@@ -246,7 +321,35 @@ impl Server {
         }
 
         server.next_channel = next.max(root + 1);
+
+        for (key, role) in saved.roles {
+            // 存档里的 Unspecified 当成没记：不能凭一行坏数据给人一个奇怪的角色。
+            if role != Role::Unspecified {
+                server.granted.insert(key, role);
+            }
+        }
+        for entry in saved.bans {
+            server.bans.insert(entry.public_key, entry);
+        }
+        server.admin_claim = saved.admin_claim.filter(|code| !code.trim().is_empty());
         server
+    }
+
+    /// 取走还没落盘的变化。连接层每改一次状态就调一次。
+    pub fn take_changes(&mut self) -> Vec<Change> {
+        std::mem::take(&mut self.changes)
+    }
+
+    /// 有没有管理员：配置里写的，或者存档里定过的。
+    ///
+    /// 没有的话服务端启动时会发一条管理员链接，见 `main.rs`。
+    pub fn has_admin(&self) -> bool {
+        !self.config.admin_keys.is_empty() || self.granted.values().any(|r| *r == Role::Admin)
+    }
+
+    /// 还没被用掉的管理员链接里的码。
+    pub fn admin_claim(&self) -> Option<&str> {
+        self.admin_claim.as_deref()
     }
 
     /// 从 `id` 沿着父频道往上走，能不能走到根。
@@ -294,6 +397,10 @@ impl Server {
             root,
             // root 占了 1。
             next_channel: root + 1,
+            granted: BTreeMap::new(),
+            bans: BTreeMap::new(),
+            admin_claim: None,
+            changes: Vec::new(),
         }
     }
 
@@ -335,18 +442,28 @@ impl Server {
         invite_code: &str,
         desired_name: &str,
     ) -> Result<Admitted, Denied> {
-        let is_admin = self.config.admin_keys.contains(&public_key);
+        let configured_admin = self.config.admin_keys.contains(&public_key);
+        if self.bans.contains_key(&public_key) && !configured_admin {
+            return Err(Denied::Banned);
+        }
 
-        // 管理员不受邀请码和人数限制约束 —— 否则服务器满了管理员就进不去
-        // 处理问题了，而那正是最需要管理员的时候。
-        let role = if is_admin {
+        // 用管理员链接进来的：成为管理员，链接作废。**先比码再看别的** ——
+        // 服务器要邀请码的话，管理员链接里的码本身就是通行证。
+        let claimed = !invite_code.is_empty() && self.admin_claim.as_deref() == Some(invite_code);
+
+        let role = if configured_admin || claimed {
             Role::Admin
+        } else if let Some(role) = self.granted.get(&public_key) {
+            *role
         } else {
             match self.check_invite(invite_code) {
                 Some(role) => role,
                 None => return Err(Denied::InviteRequired),
             }
         };
+        // 管理员不受人数限制约束 —— 否则服务器满了管理员就进不去处理问题了，
+        // 而那正是最需要管理员的时候。
+        let is_admin = role == Role::Admin;
 
         // 同一个公钥再连一次 = 顶号。
         //
@@ -364,6 +481,13 @@ impl Server {
 
         if !is_admin && self.users.len() >= self.config.max_users {
             return Err(Denied::Full);
+        }
+
+        if claimed {
+            self.admin_claim = None;
+            self.granted.insert(public_key, Role::Admin);
+            self.changes.push(Change::RoleSet(public_key, Role::Admin));
+            self.changes.push(Change::AdminClaimUsed);
         }
 
         let session_id = self.next_session;
@@ -386,6 +510,9 @@ impl Server {
         // 先把新人告诉所有人（含他自己也没关系，客户端按 session_id 去重），
         // 再单独给他发 Welcome。
         broadcasts.push(Broadcast::Everyone(UserState { user: Some(wire) }.into()));
+        if is_admin {
+            broadcasts.push(Broadcast::One(session_id, self.ban_list()));
+        }
 
         Ok(Admitted {
             session_id,
@@ -565,6 +692,7 @@ impl Server {
                 created_by: Some(creator_key),
             },
         );
+        self.changes.push(Change::ChannelSaved(wire.clone()));
 
         vec![Broadcast::Everyone(
             ChannelState {
@@ -613,6 +741,7 @@ impl Server {
         for id in orphans {
             let info = self.channels.get_mut(&id).expect("just listed");
             info.wire.parent_id = self.root;
+            self.changes.push(Change::ChannelSaved(info.wire.clone()));
             out.push(Broadcast::Everyone(
                 ChannelState {
                     channel: Some(info.wire.clone()),
@@ -636,6 +765,7 @@ impl Server {
         }
 
         let removed = self.channels.remove(&target).expect("just checked");
+        self.changes.push(Change::ChannelRemoved(target));
         out.push(Broadcast::Everyone(
             ChannelState {
                 channel: Some(removed.wire),
@@ -644,6 +774,219 @@ impl Server {
             .into(),
         ));
         out
+    }
+
+    /// 改一个频道：名字、说明、父频道。见 `EditChannel` 的协议注释。
+    ///
+    /// 跟建频道一样，被拒就是什么都不发。名字不合法整条拒掉；父频道不合法
+    /// （不存在、是自己、是自己的子孙）只是不挪，名字照改 —— 客户端手里的
+    /// 频道树可能刚好过时，不该因为这个连改名都失败。
+    pub fn edit_channel(&mut self, session: SessionId, req: EditChannel) -> Vec<Broadcast> {
+        let target = req.channel_id;
+        let Some(user) = self.users.get(&session) else {
+            return Vec::new();
+        };
+        let Some(channel) = self.channels.get(&target) else {
+            return Vec::new();
+        };
+        let allowed = if target == self.root {
+            user.role == Role::Admin
+        } else {
+            channel.created_by == Some(user.public_key)
+                || rank(user.role) >= rank(MIN_ROLE_TO_DELETE_OTHERS_CHANNEL)
+        };
+        if !allowed {
+            return Vec::new();
+        }
+
+        let name = req.name.trim();
+        if name.is_empty() || name.len() > MAX_CHANNEL_NAME_BYTES {
+            return Vec::new();
+        }
+        let description = req.description.trim();
+        if description.len() > MAX_CHANNEL_DESCRIPTION_BYTES {
+            return Vec::new();
+        }
+
+        let current_parent = channel.wire.parent_id;
+        let parent_id = if target == self.root {
+            self.root
+        } else if req.parent_id != target
+            && self.channels.contains_key(&req.parent_id)
+            && !self.is_under(req.parent_id, target)
+        {
+            req.parent_id
+        } else {
+            current_parent
+        };
+
+        let info = self.channels.get_mut(&target).expect("just checked");
+        if info.wire.name == name
+            && info.wire.description == description
+            && info.wire.parent_id == parent_id
+        {
+            return Vec::new();
+        }
+        info.wire.name = name.to_string();
+        info.wire.description = description.to_string();
+        info.wire.parent_id = parent_id;
+        let wire = info.wire.clone();
+        self.changes.push(Change::ChannelSaved(wire.clone()));
+        vec![Broadcast::Everyone(
+            ChannelState {
+                channel: Some(wire),
+                removed: false,
+            }
+            .into(),
+        )]
+    }
+
+    /// `candidate` 是不是 `ancestor` 自己或者它的子孙。挪频道时防成环用。
+    fn is_under(&self, candidate: ChannelId, ancestor: ChannelId) -> bool {
+        let mut current = candidate;
+        for _ in 0..=self.channels.len() {
+            if current == ancestor {
+                return true;
+            }
+            match self.channels.get(&current) {
+                Some(c) if c.wire.parent_id != current => current = c.wire.parent_id,
+                _ => return false,
+            }
+        }
+        // 走了这么多步还没到头 = 已经在转圈了。当成「是」，拒掉这次挪动。
+        true
+    }
+
+    /// 踢人。见 `KickUser` 的协议注释。
+    pub fn kick(&mut self, session: SessionId, target: SessionId, reason: &str) -> Vec<Broadcast> {
+        let (Some(actor), Some(victim)) = (self.users.get(&session), self.users.get(&target))
+        else {
+            return Vec::new();
+        };
+        if session == target
+            || rank(actor.role) < rank(MIN_ROLE_TO_KICK)
+            || rank(victim.role) >= rank(actor.role)
+        {
+            return Vec::new();
+        }
+        let detail = with_reason(format!("{} 把你请出了服务器", actor.name), reason);
+        let mut out = vec![Broadcast::Kick {
+            session: target,
+            reason: goodbye::Reason::Kicked,
+            detail,
+        }];
+        out.extend(self.remove_user(target, user_left::Reason::Kicked));
+        out
+    }
+
+    /// 封禁。见 `BanUser` 的协议注释。`now_ms` 由连接层给 —— 这里不碰时钟。
+    pub fn ban(
+        &mut self,
+        session: SessionId,
+        target: SessionId,
+        reason: &str,
+        now_ms: i64,
+    ) -> Vec<Broadcast> {
+        let (Some(actor), Some(victim)) = (self.users.get(&session), self.users.get(&target))
+        else {
+            return Vec::new();
+        };
+        if session == target || actor.role != Role::Admin || rank(victim.role) >= rank(actor.role) {
+            return Vec::new();
+        }
+        let mut reason = reason.trim().to_string();
+        truncate_utf8(&mut reason, MAX_REASON_BYTES);
+        let entry = BanEntry {
+            public_key: victim.public_key,
+            name: victim.name.clone(),
+            banned_at_ms: now_ms,
+            banned_by: actor.name.clone(),
+            reason: reason.clone(),
+        };
+        let detail = with_reason(format!("{} 封禁了你", actor.name), &reason);
+
+        self.bans.insert(entry.public_key, entry.clone());
+        self.changes.push(Change::BanAdded(entry));
+
+        let mut out = vec![Broadcast::Kick {
+            session: target,
+            reason: goodbye::Reason::Banned,
+            detail,
+        }];
+        out.extend(self.remove_user(target, user_left::Reason::Banned));
+        out.extend(self.ban_list_to_admins());
+        out
+    }
+
+    /// 解封。只有管理员能解。
+    pub fn unban(&mut self, session: SessionId, public_key: &[u8]) -> Vec<Broadcast> {
+        let Some(actor) = self.users.get(&session) else {
+            return Vec::new();
+        };
+        if actor.role != Role::Admin {
+            return Vec::new();
+        }
+        let Ok(key) = <[u8; PublicKey::LEN]>::try_from(public_key).map(PublicKey) else {
+            return Vec::new();
+        };
+        if self.bans.remove(&key).is_none() {
+            return Vec::new();
+        }
+        self.changes.push(Change::BanRemoved(key));
+        self.ban_list_to_admins()
+    }
+
+    /// 改一个在线的人的角色。见 `SetRole` 的协议注释。
+    ///
+    /// 不能改自己的：最后一个管理员手一滑把自己降成成员，这个服务器就再也
+    /// 没有管理员了。也不能改别的管理员的：两个管理员互相降级没有赢家。
+    pub fn set_role(
+        &mut self,
+        session: SessionId,
+        target: SessionId,
+        role: Role,
+    ) -> Vec<Broadcast> {
+        let (Some(actor), Some(victim)) = (self.users.get(&session), self.users.get(&target))
+        else {
+            return Vec::new();
+        };
+        if session == target
+            || actor.role != Role::Admin
+            || victim.role == Role::Admin
+            || role == Role::Unspecified
+            || victim.role == role
+        {
+            return Vec::new();
+        }
+        let user = self.users.get_mut(&target).expect("just checked");
+        user.role = role;
+        let wire = user.to_wire();
+        let key = user.public_key;
+        self.granted.insert(key, role);
+        self.changes.push(Change::RoleSet(key, role));
+
+        let mut out = vec![Broadcast::Everyone(UserState { user: Some(wire) }.into())];
+        if role == Role::Admin {
+            out.push(Broadcast::One(target, self.ban_list()));
+        }
+        out
+    }
+
+    /// 完整的封禁名单，按封禁时间排。
+    fn ban_list(&self) -> ServerMessage {
+        let mut entries: Vec<BannedUser> = self.bans.values().map(BanEntry::to_wire).collect();
+        entries.sort_by_key(|e| e.banned_at_ms);
+        BanList { entries }.into()
+    }
+
+    /// 名单变了：发给每个在线的管理员。
+    fn ban_list_to_admins(&self) -> Vec<Broadcast> {
+        let list = self.ban_list();
+        self.users
+            .values()
+            .filter(|u| u.role == Role::Admin)
+            .map(|u| Broadcast::One(u.session_id, list.clone()))
+            .collect()
     }
 
     /// 下一个没被用过的频道 id。
@@ -710,6 +1053,17 @@ impl Server {
 }
 
 /// 清掉昵称里会把界面搞乱的东西，并限长。
+/// 「某某把你请出了服务器：理由」。理由空着就不带冒号。
+fn with_reason(what: String, reason: &str) -> String {
+    let mut reason = reason.trim().to_string();
+    truncate_utf8(&mut reason, MAX_REASON_BYTES);
+    if reason.is_empty() {
+        what
+    } else {
+        format!("{what}：{reason}")
+    }
+}
+
 fn sanitize_name(raw: &str) -> String {
     let cleaned: String = raw
         .chars()
@@ -768,6 +1122,7 @@ mod tests {
             Saved {
                 channels,
                 next_channel_id,
+                ..Saved::default()
             },
         )
     }
@@ -1428,5 +1783,384 @@ mod tests {
         assert!(server.join_channel(guest, id).is_empty(), "访客进不去");
         assert_eq!(server.channel_of(guest), Some(server.root_channel()));
         assert!(!server.join_channel(admin, id).is_empty(), "管理员进得去");
+    }
+
+    // ======================================================================
+    // 管理员链接、角色、踢人、封禁、改频道
+    // ======================================================================
+
+    /// 带着一条还没用掉的管理员链接起来的服务器。
+    fn claimable_server() -> Server {
+        Server::restore(
+            Config::default(),
+            Saved {
+                admin_claim: Some("admin-code".into()),
+                ..Saved::default()
+            },
+        )
+    }
+
+    fn admit_admin(server: &mut Server, k: u8) -> SessionId {
+        server
+            .admit(key(k), "admin-code", "管理员")
+            .unwrap()
+            .session_id
+    }
+
+    fn role_of(server: &Server, session: SessionId) -> Role {
+        server.users[&session].role
+    }
+
+    fn kicked(events: &[Broadcast]) -> Option<(SessionId, goodbye::Reason)> {
+        events.iter().find_map(|e| match e {
+            Broadcast::Kick {
+                session, reason, ..
+            } => Some((*session, *reason)),
+            _ => None,
+        })
+    }
+
+    fn ban_lists_to(events: &[Broadcast]) -> Vec<SessionId> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                Broadcast::One(to, m)
+                    if matches!(
+                        m.payload,
+                        Some(protocol::control::server_message::Payload::BanList(_))
+                    ) =>
+                {
+                    Some(*to)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_admin_link_makes_exactly_one_admin() {
+        let mut server = claimable_server();
+        assert!(!server.has_admin());
+
+        let admin = admit_admin(&mut server, 1);
+        assert_eq!(role_of(&server, admin), Role::Admin);
+        assert!(server.has_admin());
+        assert_eq!(server.admin_claim(), None, "用过的链接该作废");
+        assert_eq!(
+            server.take_changes(),
+            vec![Change::RoleSet(key(1), Role::Admin), Change::AdminClaimUsed]
+        );
+
+        // 第二个人拿同一条链接进来：只是个普通人
+        let second = server.admit(key(2), "admin-code", "也想当").unwrap();
+        assert_ne!(second.welcome.role, Role::Admin as i32);
+    }
+
+    /// 服务器要邀请码时，管理员链接里的码本身就是通行证。
+    #[test]
+    fn the_admin_link_works_on_a_gated_server() {
+        let mut server = Server::restore(
+            Config {
+                require_invite: true,
+                invite_code: Some("letmein".into()),
+                ..Config::default()
+            },
+            Saved {
+                admin_claim: Some("admin-code".into()),
+                ..Saved::default()
+            },
+        );
+        let admin = admit_admin(&mut server, 1);
+        assert_eq!(role_of(&server, admin), Role::Admin);
+    }
+
+    /// 管理员一进来就拿到封禁名单；别人拿不到。
+    #[test]
+    fn only_admins_receive_the_ban_list() {
+        let mut server = claimable_server();
+        let admitted = server.admit(key(1), "admin-code", "管理员").unwrap();
+        assert_eq!(
+            ban_lists_to(&admitted.broadcasts),
+            vec![admitted.session_id]
+        );
+
+        let member = server.admit(key(2), "", "阿狸").unwrap();
+        assert!(ban_lists_to(&member.broadcasts).is_empty());
+    }
+
+    /// 被管理员定过角色的人，下次进来就是这个角色，不看手里是哪条链接。
+    #[test]
+    fn a_granted_role_outlives_the_invite_code() {
+        let mut server = Server::restore(
+            Config {
+                require_invite: true,
+                invite_code: Some("letmein".into()),
+                ..Config::default()
+            },
+            Saved {
+                roles: vec![(key(2), Role::ChannelAdmin)],
+                ..Saved::default()
+            },
+        );
+        // 没带码，照样进得来，而且是频道管理
+        let admitted = server.admit(key(2), "", "阿狸").unwrap();
+        assert_eq!(admitted.welcome.role, Role::ChannelAdmin as i32);
+        // 没被定过角色的人照旧要码
+        assert_eq!(
+            server.admit(key(3), "", "路人").unwrap_err(),
+            Denied::InviteRequired
+        );
+    }
+
+    #[test]
+    fn channel_admins_kick_those_below_them() {
+        let mut server = claimable_server();
+        let admin = admit_admin(&mut server, 1);
+        let mod_ = admit(&mut server, 2, "频道管理");
+        let member = admit(&mut server, 3, "阿狸");
+        let other = admit(&mut server, 4, "波波");
+        server.set_role(admin, mod_, Role::ChannelAdmin);
+
+        // 成员踢不了人
+        assert!(server.kick(member, other, "").is_empty());
+        // 频道管理踢不了管理员，也踢不了自己
+        assert!(server.kick(mod_, admin, "").is_empty());
+        assert!(server.kick(mod_, mod_, "").is_empty());
+
+        let events = server.kick(mod_, member, "刷屏");
+        assert_eq!(
+            kicked(&events),
+            Some((member, goodbye::Reason::Kicked)),
+            "{events:?}"
+        );
+        assert!(
+            matches!(events[0], Broadcast::Kick { .. }),
+            "先让他知道被踢了，再告诉别人他走了"
+        );
+        let Broadcast::Kick { detail, .. } = &events[0] else {
+            unreachable!()
+        };
+        assert!(
+            detail.contains("频道管理") && detail.contains("刷屏"),
+            "{detail}"
+        );
+        assert!(!server.users.contains_key(&member));
+
+        // 踢完了能马上回来 —— 这是踢不是封
+        assert!(server.admit(key(3), "", "阿狸").is_ok());
+    }
+
+    /// 频道管理之间谁也踢不了谁。
+    #[test]
+    fn equals_cannot_kick_each_other() {
+        let mut server = claimable_server();
+        let admin = admit_admin(&mut server, 1);
+        let a = admit(&mut server, 2, "甲");
+        let b = admit(&mut server, 3, "乙");
+        server.set_role(admin, a, Role::ChannelAdmin);
+        server.set_role(admin, b, Role::ChannelAdmin);
+        assert!(server.kick(a, b, "").is_empty());
+    }
+
+    #[test]
+    fn only_admins_ban_and_the_banned_stay_out() {
+        let mut server = claimable_server();
+        let admin = admit_admin(&mut server, 1);
+        let mod_ = admit(&mut server, 2, "频道管理");
+        let troll = admit(&mut server, 3, "捣乱的");
+        server.set_role(admin, mod_, Role::ChannelAdmin);
+        server.take_changes();
+
+        assert!(server.ban(mod_, troll, "", 0).is_empty(), "频道管理不能封");
+
+        let events = server.ban(admin, troll, "  刷屏  ", 1234);
+        assert_eq!(kicked(&events), Some((troll, goodbye::Reason::Banned)));
+        assert_eq!(
+            ban_lists_to(&events),
+            vec![admin],
+            "名单变了要告诉在线的管理员"
+        );
+        let changes = server.take_changes();
+        let [Change::BanAdded(entry)] = changes.as_slice() else {
+            panic!("{changes:?}");
+        };
+        assert_eq!(entry.name, "捣乱的");
+        assert_eq!(entry.reason, "刷屏");
+        assert_eq!(entry.banned_by, "管理员");
+
+        assert_eq!(
+            server.admit(key(3), "", "换个名字").unwrap_err(),
+            Denied::Banned
+        );
+    }
+
+    #[test]
+    fn unbanning_lets_them_back_in() {
+        let mut server = claimable_server();
+        let admin = admit_admin(&mut server, 1);
+        let member = admit(&mut server, 2, "阿狸");
+        let troll = admit(&mut server, 3, "捣乱的");
+        server.ban(admin, troll, "", 0);
+
+        assert!(
+            server.unban(member, &key(3).0).is_empty(),
+            "只有管理员能解封"
+        );
+        assert!(server.unban(admin, &[1, 2, 3]).is_empty(), "公钥长度不对");
+
+        let events = server.unban(admin, &key(3).0);
+        assert_eq!(ban_lists_to(&events), vec![admin]);
+        assert!(server.admit(key(3), "", "捣乱的").is_ok());
+    }
+
+    #[test]
+    fn roles_are_set_by_admins_only_and_never_on_admins() {
+        let mut server = claimable_server();
+        let admin = admit_admin(&mut server, 1);
+        let member = admit(&mut server, 2, "阿狸");
+        let other = admit(&mut server, 3, "波波");
+        server.take_changes();
+
+        assert!(server
+            .set_role(member, other, Role::ChannelAdmin)
+            .is_empty());
+        assert!(
+            server.set_role(admin, admin, Role::Member).is_empty(),
+            "不能改自己"
+        );
+        assert!(server.set_role(admin, member, Role::Unspecified).is_empty());
+
+        let events = server.set_role(admin, member, Role::ChannelAdmin);
+        assert_eq!(role_of(&server, member), Role::ChannelAdmin);
+        assert!(
+            matches!(events[0], Broadcast::Everyone(_)),
+            "所有人都该看到"
+        );
+        assert_eq!(
+            server.take_changes(),
+            vec![Change::RoleSet(key(2), Role::ChannelAdmin)]
+        );
+
+        // 提成管理员：立刻拿到封禁名单；之后别的管理员动不了他
+        let events = server.set_role(admin, member, Role::Admin);
+        assert_eq!(ban_lists_to(&events), vec![member]);
+        assert!(server.set_role(admin, member, Role::Guest).is_empty());
+    }
+
+    fn edit(
+        server: &mut Server,
+        session: SessionId,
+        channel_id: ChannelId,
+        name: &str,
+        parent_id: ChannelId,
+    ) -> Vec<Broadcast> {
+        server.edit_channel(
+            session,
+            EditChannel {
+                channel_id,
+                name: name.into(),
+                description: String::new(),
+                parent_id,
+            },
+        )
+    }
+
+    #[test]
+    fn the_creator_renames_their_own_channel_and_strangers_cannot() {
+        let mut server = open_server();
+        let owner = admit(&mut server, 1, "阿狸");
+        let stranger = admit(&mut server, 2, "路人");
+        let id = created_id(&create(&mut server, owner, "开黑"));
+        let root = server.root_channel();
+        server.take_changes();
+
+        assert!(edit(&mut server, stranger, id, "我的了", root).is_empty());
+        let events = edit(&mut server, owner, id, "  吃鸡  ", root);
+        assert_eq!(events.len(), 1);
+        assert_eq!(server.channels[&id].wire.name, "吃鸡");
+        let changes = server.take_changes();
+        assert!(
+            matches!(&changes[..], [Change::ChannelSaved(c)] if c.name == "吃鸡"),
+            "{changes:?}"
+        );
+
+        // 没改动就什么都不发，也不写盘
+        assert!(edit(&mut server, owner, id, "吃鸡", root).is_empty());
+        assert!(server.take_changes().is_empty());
+        // 空名字拒掉
+        assert!(edit(&mut server, owner, id, "   ", root).is_empty());
+    }
+
+    #[test]
+    fn channel_admins_can_edit_other_peoples_channels() {
+        let mut server = claimable_server();
+        let admin = admit_admin(&mut server, 1);
+        let owner = admit(&mut server, 2, "阿狸");
+        let mod_ = admit(&mut server, 3, "频道管理");
+        server.set_role(admin, mod_, Role::ChannelAdmin);
+        let id = created_id(&create(&mut server, owner, "开黑"));
+        let root = server.root_channel();
+        assert!(!edit(&mut server, mod_, id, "改个名", root).is_empty());
+    }
+
+    /// 挪到自己的子孙下面会成环：不挪，但名字照改。
+    #[test]
+    fn a_channel_cannot_be_moved_under_itself() {
+        let mut server = open_server();
+        let owner = admit(&mut server, 1, "阿狸");
+        let parent = created_id(&create(&mut server, owner, "父"));
+        let child = created_id(&server.create_channel(
+            owner,
+            CreateChannel {
+                name: "子".into(),
+                parent_id: parent,
+                ..Default::default()
+            },
+        ));
+        let root = server.root_channel();
+
+        edit(&mut server, owner, parent, "新名字", child);
+        assert_eq!(server.channels[&parent].wire.parent_id, root, "成环了");
+        assert_eq!(server.channels[&parent].wire.name, "新名字");
+
+        edit(&mut server, owner, parent, "新名字", parent);
+        assert_eq!(
+            server.channels[&parent].wire.parent_id, root,
+            "父频道成了自己"
+        );
+
+        // 正常的挪动照样可以
+        let other = created_id(&create(&mut server, owner, "另一个"));
+        edit(&mut server, owner, child, "子", other);
+        assert_eq!(server.channels[&child].wire.parent_id, other);
+    }
+
+    /// 根频道只有管理员能改，而且只能改名，挪不了。
+    #[test]
+    fn only_admins_rename_the_root_and_it_never_moves() {
+        let mut server = claimable_server();
+        let admin = admit_admin(&mut server, 1);
+        let member = admit(&mut server, 2, "阿狸");
+        let root = server.root_channel();
+        let other = created_id(&create(&mut server, member, "别处"));
+
+        assert!(edit(&mut server, member, root, "我的大厅", root).is_empty());
+        assert!(!edit(&mut server, admin, root, "公会大厅", other).is_empty());
+        assert_eq!(server.channels[&root].wire.name, "公会大厅");
+        assert_eq!(server.channels[&root].wire.parent_id, root);
+    }
+
+    /// 频道的建、改、删都要记成变化，存档才知道要写什么。
+    #[test]
+    fn channel_changes_are_recorded_for_the_store() {
+        let mut server = open_server();
+        let owner = admit(&mut server, 1, "阿狸");
+        assert!(server.take_changes().is_empty(), "进来一个人不用写盘");
+
+        let id = created_id(&create(&mut server, owner, "开黑"));
+        assert!(matches!(&server.take_changes()[..], [Change::ChannelSaved(c)] if c.id == id));
+
+        server.delete_channel(owner, id);
+        assert_eq!(server.take_changes(), vec![Change::ChannelRemoved(id)]);
     }
 }

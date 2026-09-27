@@ -38,7 +38,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use protocol::control::{
     client_message, decode_frame, encode_frame, goodbye, peek_frame_len, Challenge, ClientMessage,
-    Goodbye, Rejected, ServerMessage, MAX_FRAME_BODY, PROTOCOL_VERSION,
+    Goodbye, Rejected, Role, ServerMessage, MAX_FRAME_BODY, PROTOCOL_VERSION,
 };
 use protocol::PublicKey;
 use voice_core::identity::Identity;
@@ -183,17 +183,19 @@ impl Hub {
     fn mutate(&self, f: impl FnOnce(&mut Server) -> Vec<Broadcast>) -> Vec<Broadcast> {
         let mut state = self.state.lock().expect("state poisoned");
         let events = f(&mut state);
-        self.persist(&events);
+        self.persist(&mut state);
         events
     }
 
-    /// 调用方必须持着 `state` 锁。见 [`Hub::mutate`]。
-    fn persist(&self, events: &[Broadcast]) {
+    /// 把状态机记下的变化写进存档。调用方持着 `state` 锁（就是传进来的这个）。
+    /// 见 [`Hub::mutate`]。
+    fn persist(&self, state: &mut Server) {
+        let changes = state.take_changes();
         let Some(store) = &self.store else { return };
-        if let Err(e) = store.lock().expect("store poisoned").record(events) {
-            // 不因为这个把服务停掉：频道照样能用，只是重启会丢这一次改动。
+        if let Err(e) = store.lock().expect("store poisoned").record(&changes) {
+            // 不因为这个把服务停掉：改动在内存里照样生效，只是重启会丢。
             // 在线的人比存档要紧。
-            eprintln!("存档写失败，这次的频道改动重启后会丢：{e}");
+            eprintln!("存档写失败，这次的改动重启后会丢：{e}");
         }
     }
 
@@ -235,6 +237,17 @@ impl Hub {
                 Broadcast::One(session, msg) => {
                     if let Some(peer) = peers.iter().find(|p| p.session == session) {
                         peer.send(&msg);
+                    }
+                }
+                Broadcast::Kick {
+                    session,
+                    reason,
+                    detail,
+                } => {
+                    // 先摘语音：不然在他的连接线程收尾之前，他还能往频道里灌几帧声音。
+                    self.voice.unregister(session);
+                    if let Some(peer) = peers.iter().find(|p| p.session == session) {
+                        peer.kick(reason, &detail);
                     }
                 }
             }
@@ -459,9 +472,8 @@ fn authenticate(
     let admitted = {
         let mut state = hub.state.lock().expect("state poisoned");
         let admitted = state.admit(public_key, &auth.invite_code, &auth.desired_name);
-        if let Ok(a) = &admitted {
-            hub.persist(&a.broadcasts);
-        }
+        // 用管理员链接进来的，「他是管理员」和「链接作废」都要落盘。
+        hub.persist(&mut state);
         admitted
     };
     let admitted = match admitted {
@@ -557,6 +569,22 @@ fn message_loop(
                 .mutate(|state| state.set_self_state(peer.session, s.self_muted, s.self_deafened)),
             Some(client_message::Payload::TextMessage(text)) => {
                 hub.mutate(|state| state.text_message(peer.session, text, now_ms()))
+            }
+            Some(client_message::Payload::EditChannel(req)) => {
+                hub.mutate(|state| state.edit_channel(peer.session, req))
+            }
+            Some(client_message::Payload::KickUser(req)) => {
+                hub.mutate(|state| state.kick(peer.session, req.session_id, &req.reason))
+            }
+            Some(client_message::Payload::BanUser(req)) => {
+                hub.mutate(|state| state.ban(peer.session, req.session_id, &req.reason, now_ms()))
+            }
+            Some(client_message::Payload::Unban(req)) => {
+                hub.mutate(|state| state.unban(peer.session, &req.public_key))
+            }
+            Some(client_message::Payload::SetRole(req)) => {
+                let role = Role::try_from(req.role).unwrap_or(Role::Unspecified);
+                hub.mutate(|state| state.set_role(peer.session, req.session_id, role))
             }
             // 登录之后再发 Hello / Authenticate 是协议错误，忽略。
             Some(_) => Vec::new(),

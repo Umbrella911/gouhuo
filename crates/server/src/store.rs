@@ -4,25 +4,25 @@
 //!
 //! # 存什么、不存什么
 //!
-//! 存：频道树（含谁建的）和频道发号游标。
+//! 存：频道树（含谁建的）、频道发号游标、按公钥定下来的角色、封禁名单、
+//! 还没被用掉的管理员链接。
 //!
 //! 不存：谁在线、会话、文字消息。前两样本来就是一断就没的；文字消息在
 //! 「明确不做」的清单里（长期消息历史），这是语音软件不是聊天软件。
 //!
 //! # 状态机不知道有这一层
 //!
-//! [`crate::state`] 一行 SQL 都没有，也不该有。它的每次变化本来就以
-//! [`Broadcast`] 的形式说出来了，而频道的每一次变化（建、挪、删）都是一条
-//! 带着完整信息的 `ChannelState`。所以这里只做一件事：**把那些广播翻译成
-//! 写库**。启动时反过来，读出 [`Saved`] 交给 [`crate::state::Server::restore`]。
+//! [`crate::state`] 一行 SQL 都没有，也不该有。它每改一次状态，就把「重启之后
+//! 也该在」的那部分记成 [`Change`]；连接层在同一把锁里取走（`take_changes`），
+//! 交给 [`Store::record`]。启动时反过来，读出 [`Saved`] 交给
+//! [`crate::state::Server::restore`]。
 //!
 //! 写库必须跟改状态在同一把锁里，顺序才不会乱，见 `conn::Hub::mutate`。
 //!
 //! # 为什么是 SQLite
 //!
-//! 眼下只有频道，一个文本文件也够用。但接下来要存的是封禁名单和角色（#6），
-//! 那些要的是「改一半断电也不会坏」。SQLite 的事务白给这一点，而且它是
-//! 编进二进制里的（`bundled`），自部署的人不需要装任何东西。
+//! 封禁名单和角色要的是「改一半断电也不会坏」。SQLite 的事务白给这一点，
+//! 而且它是编进二进制里的（`bundled`），自部署的人不需要装任何东西。
 //!
 //! # 版本
 //!
@@ -32,10 +32,11 @@
 
 use std::path::Path;
 
-use protocol::control::{server_message, Channel};
+use protocol::control::{Channel, Role};
+use protocol::PublicKey;
 use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::state::{Broadcast, ChannelId, Saved};
+use crate::state::{BanEntry, Change, ChannelId, Saved};
 
 /// 表结构的迁移，第 n 条把库从版本 n 升到 n+1。**只能往后加。**
 const MIGRATIONS: &[&str] = &[
@@ -56,12 +57,32 @@ const MIGRATIONS: &[&str] = &[
          key   TEXT PRIMARY KEY,
          value INTEGER NOT NULL
      );",
+    // v2：角色、封禁、管理员链接。
+    //
+    // role 存的是协议里 Role 的数值。secrets 放不该出现在日志里的东西，
+    // 眼下只有还没被用掉的管理员链接里的码。
+    "CREATE TABLE roles (
+         public_key BLOB    PRIMARY KEY,
+         role       INTEGER NOT NULL
+     );
+     CREATE TABLE bans (
+         public_key   BLOB    PRIMARY KEY,
+         name         TEXT    NOT NULL,
+         banned_at_ms INTEGER NOT NULL,
+         banned_by    TEXT    NOT NULL DEFAULT '',
+         reason       TEXT    NOT NULL DEFAULT ''
+     );
+     CREATE TABLE secrets (
+         key   TEXT PRIMARY KEY,
+         value TEXT NOT NULL
+     );",
 ];
 
 /// 这个版本的服务端认得的最高表结构版本。
 pub const SCHEMA_VERSION: u32 = MIGRATIONS.len() as u32;
 
 const NEXT_CHANNEL_KEY: &str = "next_channel_id";
+const ADMIN_CLAIM_KEY: &str = "admin_claim";
 
 pub struct Store {
     conn: Connection,
@@ -134,6 +155,8 @@ impl Store {
     }
 
     /// 读出存档，交给 `Server::restore`。
+    ///
+    /// 公钥长度不对、角色认不出来的行直接跳过：存档是个文件，会被手改。
     pub fn load(&self) -> Result<Saved, StoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, parent_id, name, description, max_users, min_role, created_by
@@ -162,72 +185,155 @@ impl Store {
             )
             .optional()?;
 
+        let mut stmt = self
+            .conn
+            .prepare("SELECT public_key, role FROM roles ORDER BY public_key")?;
+        let roles = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i32>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter_map(|(key, role)| Some((to_key(&key)?, Role::try_from(role).ok()?)))
+            .collect();
+
+        let mut stmt = self.conn.prepare(
+            "SELECT public_key, name, banned_at_ms, banned_by, reason FROM bans ORDER BY banned_at_ms",
+        )?;
+        let bans = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter_map(|(key, name, banned_at_ms, banned_by, reason)| {
+                Some(BanEntry {
+                    public_key: to_key(&key)?,
+                    name,
+                    banned_at_ms,
+                    banned_by,
+                    reason,
+                })
+            })
+            .collect();
+
+        let admin_claim: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM secrets WHERE key = ?1",
+                [ADMIN_CLAIM_KEY],
+                |r| r.get(0),
+            )
+            .optional()?;
+
         Ok(Saved {
             channels,
             next_channel_id: next_channel_id.unwrap_or(0),
+            roles,
+            bans,
+            admin_claim,
         })
     }
 
-    /// 把一批广播里要落盘的部分写进去。**一批一个事务**：删频道那一下会挪人、
-    /// 挪子频道、再删自己，要么全写进去，要么全没写。
-    ///
-    /// 眼下落盘的只有 `ChannelState`：频道的建、挪、删全都是它。
-    pub fn record(&mut self, events: &[Broadcast]) -> Result<(), StoreError> {
-        let changes: Vec<(&Channel, bool)> = events
-            .iter()
-            .filter_map(|event| {
-                let message = match event {
-                    Broadcast::Everyone(m) | Broadcast::Channel(_, m) | Broadcast::One(_, m) => m,
-                };
-                match &message.payload {
-                    Some(server_message::Payload::ChannelState(state)) => {
-                        state.channel.as_ref().map(|c| (c, state.removed))
-                    }
-                    _ => None,
-                }
-            })
-            .collect();
+    /// 记下一条新的管理员链接里的码。启动时发现还没有管理员才会调。
+    pub fn save_admin_claim(&mut self, code: &str) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO secrets (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![ADMIN_CLAIM_KEY, code],
+        )?;
+        Ok(())
+    }
+
+    /// 把状态机记下的变化写进去。**一批一个事务**：删频道那一下会挪子频道、
+    /// 再删自己，要么全写进去，要么全没写。
+    pub fn record(&mut self, changes: &[Change]) -> Result<(), StoreError> {
         if changes.is_empty() {
             return Ok(());
         }
-
         let tx = self.conn.transaction()?;
-        for (channel, removed) in changes {
-            if removed {
-                tx.execute("DELETE FROM channels WHERE id = ?1", [channel.id])?;
-                continue;
+        for change in changes {
+            match change {
+                Change::ChannelSaved(channel) => {
+                    let created_by =
+                        (!channel.created_by.is_empty()).then_some(&channel.created_by);
+                    tx.execute(
+                        "INSERT INTO channels (id, parent_id, name, description, max_users, min_role, created_by)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                         ON CONFLICT(id) DO UPDATE SET
+                             parent_id = excluded.parent_id,
+                             name = excluded.name,
+                             description = excluded.description,
+                             max_users = excluded.max_users,
+                             min_role = excluded.min_role,
+                             created_by = excluded.created_by",
+                        params![
+                            channel.id,
+                            channel.parent_id,
+                            channel.name,
+                            channel.description,
+                            channel.max_users,
+                            channel.min_role,
+                            created_by,
+                        ],
+                    )?;
+                    // 发号游标只往前走：删掉最大的那个频道之后重启，
+                    // 也不会把它的 id 再发出去。
+                    tx.execute(
+                        "INSERT INTO meta (key, value) VALUES (?1, ?2)
+                         ON CONFLICT(key) DO UPDATE SET value = max(value, excluded.value)",
+                        params![NEXT_CHANNEL_KEY, channel.id.wrapping_add(1)],
+                    )?;
+                }
+                Change::ChannelRemoved(id) => {
+                    tx.execute("DELETE FROM channels WHERE id = ?1", [id])?;
+                }
+                Change::RoleSet(key, role) => {
+                    tx.execute(
+                        "INSERT INTO roles (public_key, role) VALUES (?1, ?2)
+                         ON CONFLICT(public_key) DO UPDATE SET role = excluded.role",
+                        params![key.0.as_slice(), *role as i32],
+                    )?;
+                }
+                Change::BanAdded(entry) => {
+                    tx.execute(
+                        "INSERT INTO bans (public_key, name, banned_at_ms, banned_by, reason)
+                         VALUES (?1, ?2, ?3, ?4, ?5)
+                         ON CONFLICT(public_key) DO UPDATE SET
+                             name = excluded.name,
+                             banned_at_ms = excluded.banned_at_ms,
+                             banned_by = excluded.banned_by,
+                             reason = excluded.reason",
+                        params![
+                            entry.public_key.0.as_slice(),
+                            entry.name,
+                            entry.banned_at_ms,
+                            entry.banned_by,
+                            entry.reason,
+                        ],
+                    )?;
+                }
+                Change::BanRemoved(key) => {
+                    tx.execute("DELETE FROM bans WHERE public_key = ?1", [key.0.as_slice()])?;
+                }
+                Change::AdminClaimUsed => {
+                    tx.execute("DELETE FROM secrets WHERE key = ?1", [ADMIN_CLAIM_KEY])?;
+                }
             }
-            let created_by = (!channel.created_by.is_empty()).then_some(&channel.created_by);
-            tx.execute(
-                "INSERT INTO channels (id, parent_id, name, description, max_users, min_role, created_by)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                 ON CONFLICT(id) DO UPDATE SET
-                     parent_id = excluded.parent_id,
-                     name = excluded.name,
-                     description = excluded.description,
-                     max_users = excluded.max_users,
-                     min_role = excluded.min_role,
-                     created_by = excluded.created_by",
-                params![
-                    channel.id,
-                    channel.parent_id,
-                    channel.name,
-                    channel.description,
-                    channel.max_users,
-                    channel.min_role,
-                    created_by,
-                ],
-            )?;
-            // 发号游标只往前走：删掉最大的那个频道之后重启，也不会把它的 id 再发出去。
-            tx.execute(
-                "INSERT INTO meta (key, value) VALUES (?1, ?2)
-                 ON CONFLICT(key) DO UPDATE SET value = max(value, excluded.value)",
-                params![NEXT_CHANNEL_KEY, channel.id.wrapping_add(1)],
-            )?;
         }
         tx.commit()?;
         Ok(())
     }
+}
+
+fn to_key(bytes: &[u8]) -> Option<PublicKey> {
+    <[u8; PublicKey::LEN]>::try_from(bytes).ok().map(PublicKey)
 }
 
 #[cfg(test)]
@@ -235,7 +341,6 @@ mod tests {
     use super::*;
     use crate::state::{Config, Server, SessionId};
     use protocol::control::CreateChannel;
-    use protocol::PublicKey;
 
     fn temp_db(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("gouhuo-store-{name}-{}", std::process::id()));
@@ -244,18 +349,41 @@ mod tests {
         dir.join("gouhuo.db")
     }
 
-    fn create(server: &mut Server, session: SessionId, name: &str) -> Vec<Broadcast> {
+    /// 改一次状态、把变化落盘，跟 `Hub::mutate` 做的一样。
+    fn apply<T>(store: &mut Store, server: &mut Server, f: impl FnOnce(&mut Server) -> T) -> T {
+        let out = f(server);
+        store.record(&server.take_changes()).unwrap();
+        out
+    }
+
+    fn create(server: &mut Server, session: SessionId, name: &str) {
         server.create_channel(
             session,
             CreateChannel {
                 name: name.to_string(),
                 ..Default::default()
             },
-        )
+        );
     }
 
     fn id_of(saved: &Saved, name: &str) -> Option<ChannelId> {
         saved.channels.iter().find(|c| c.name == name).map(|c| c.id)
+    }
+
+    fn admin_server(store: &mut Store) -> (Server, SessionId) {
+        let mut server = Server::restore(
+            Config::default(),
+            Saved {
+                admin_claim: Some("claim".into()),
+                ..Saved::default()
+            },
+        );
+        let admin = apply(store, &mut server, |s| {
+            s.admit(PublicKey([1; 32]), "claim", "管理员")
+        })
+        .unwrap()
+        .session_id;
+        (server, admin)
     }
 
     /// 整条路走一遍：建 → 落盘 → 关掉 → 重新打开 → 恢复 → 建的人还能删。
@@ -268,7 +396,7 @@ mod tests {
             let mut store = Store::open(&path).unwrap();
             let mut server = Server::restore(Config::default(), store.load().unwrap());
             let session = server.admit(owner, "", "阿狸").unwrap().session_id;
-            store.record(&create(&mut server, session, "开黑")).unwrap();
+            apply(&mut store, &mut server, |s| create(s, session, "开黑"));
         }
 
         let mut store = Store::open(&path).unwrap();
@@ -279,9 +407,8 @@ mod tests {
 
         let mut server = Server::restore(Config::default(), saved);
         let session = server.admit(owner, "", "阿狸").unwrap().session_id;
-        let events = server.delete_channel(session, id);
+        let events = apply(&mut store, &mut server, |s| s.delete_channel(session, id));
         assert!(!events.is_empty(), "重启之后建的人删不掉了");
-        store.record(&events).unwrap();
         assert_eq!(id_of(&store.load().unwrap(), "开黑"), None, "删了没落盘");
     }
 
@@ -296,20 +423,20 @@ mod tests {
             .unwrap()
             .session_id;
 
-        store.record(&create(&mut server, admin, "父")).unwrap();
+        apply(&mut store, &mut server, |s| create(s, admin, "父"));
         let parent = id_of(&store.load().unwrap(), "父").unwrap();
-        store
-            .record(&server.create_channel(
+        apply(&mut store, &mut server, |s| {
+            s.create_channel(
                 admin,
                 CreateChannel {
                     name: "子".into(),
                     parent_id: parent,
                     ..Default::default()
                 },
-            ))
-            .unwrap();
+            )
+        });
 
-        store.record(&server.delete_channel(admin, parent)).unwrap();
+        apply(&mut store, &mut server, |s| s.delete_channel(admin, parent));
         let saved = store.load().unwrap();
         let child = saved.channels.iter().find(|c| c.name == "子").unwrap();
         assert_eq!(child.parent_id, server.root_channel());
@@ -325,26 +452,115 @@ mod tests {
             .admit(PublicKey([7; 32]), "", "阿狸")
             .unwrap()
             .session_id;
-        store.record(&create(&mut server, admin, "一次性")).unwrap();
+        apply(&mut store, &mut server, |s| create(s, admin, "一次性"));
         let id = id_of(&store.load().unwrap(), "一次性").unwrap();
-        store.record(&server.delete_channel(admin, id)).unwrap();
+        apply(&mut store, &mut server, |s| s.delete_channel(admin, id));
 
         let saved = store.load().unwrap();
         assert!(saved.channels.iter().all(|c| c.id != id));
         assert_eq!(saved.next_channel_id, id + 1);
     }
 
-    /// 在线状态、文字消息这些不落盘。
+    /// 在线状态、闭麦这些不落盘。
     #[test]
-    fn only_channel_changes_are_written() {
+    fn transient_state_is_not_written() {
         let mut store = Store::in_memory().unwrap();
         let mut server = Server::new(Config::default());
-        let admission = server.admit(PublicKey([7; 32]), "", "阿狸").unwrap();
-        store.record(&admission.broadcasts).unwrap();
-        store
-            .record(&server.set_self_state(admission.session_id, true, false))
-            .unwrap();
+        let session = apply(&mut store, &mut server, |s| {
+            s.admit(PublicKey([7; 32]), "", "阿狸")
+        })
+        .unwrap()
+        .session_id;
+        apply(&mut store, &mut server, |s| {
+            s.set_self_state(session, true, false)
+        });
         assert_eq!(store.load().unwrap(), Saved::default());
+    }
+
+    /// 管理员链接：存下来、被用掉之后删掉，用它的人的管理员身份存下来。
+    #[test]
+    fn the_admin_claim_is_saved_then_consumed() {
+        let mut store = Store::in_memory().unwrap();
+        store.save_admin_claim("claim").unwrap();
+        assert_eq!(store.load().unwrap().admin_claim.as_deref(), Some("claim"));
+
+        let mut server = Server::restore(Config::default(), store.load().unwrap());
+        apply(&mut store, &mut server, |s| {
+            s.admit(PublicKey([1; 32]), "claim", "我")
+        })
+        .unwrap();
+
+        let saved = store.load().unwrap();
+        assert_eq!(saved.admin_claim, None, "用过的管理员链接还在");
+        assert_eq!(saved.roles, vec![(PublicKey([1; 32]), Role::Admin)]);
+    }
+
+    /// 角色、封禁都要跟着重启走。
+    #[test]
+    fn roles_and_bans_survive_a_restart() {
+        let path = temp_db("roles-bans");
+        let member = PublicKey([2; 32]);
+        let troll = PublicKey([3; 32]);
+        {
+            let mut store = Store::open(&path).unwrap();
+            let (mut server, admin) = admin_server(&mut store);
+            let m = server.admit(member, "", "阿狸").unwrap().session_id;
+            let t = server.admit(troll, "", "捣乱的").unwrap().session_id;
+            apply(&mut store, &mut server, |s| {
+                s.set_role(admin, m, Role::ChannelAdmin)
+            });
+            apply(&mut store, &mut server, |s| s.ban(admin, t, "刷屏", 1234));
+        }
+
+        let store = Store::open(&path).unwrap();
+        let saved = store.load().unwrap();
+        assert!(saved.roles.contains(&(member, Role::ChannelAdmin)));
+        assert_eq!(saved.bans.len(), 1);
+        assert_eq!(saved.bans[0].public_key, troll);
+        assert_eq!(saved.bans[0].name, "捣乱的");
+        assert_eq!(saved.bans[0].reason, "刷屏");
+        assert_eq!(saved.bans[0].banned_at_ms, 1234);
+
+        let mut server = Server::restore(Config::default(), saved);
+        assert!(
+            server.admit(troll, "", "换个名字").is_err(),
+            "重启之后被封的人又进来了"
+        );
+        let welcome = server.admit(member, "", "阿狸").unwrap().welcome;
+        assert_eq!(welcome.role, Role::ChannelAdmin as i32, "重启之后角色没了");
+    }
+
+    #[test]
+    fn unbanning_is_persisted() {
+        let mut store = Store::in_memory().unwrap();
+        let (mut server, admin) = admin_server(&mut store);
+        let troll = PublicKey([3; 32]);
+        let t = server.admit(troll, "", "捣乱的").unwrap().session_id;
+        apply(&mut store, &mut server, |s| s.ban(admin, t, "", 1));
+        apply(&mut store, &mut server, |s| s.unban(admin, &troll.0));
+        assert!(store.load().unwrap().bans.is_empty());
+    }
+
+    /// 存档里坏掉的行跳过，不让整个服务器起不来。
+    #[test]
+    fn broken_rows_are_skipped() {
+        let mut store = Store::in_memory().unwrap();
+        store
+            .conn
+            .execute_batch(
+                "INSERT INTO roles VALUES (x'0102', 4);
+                 INSERT INTO roles VALUES (zeroblob(32), 99);
+                 INSERT INTO bans VALUES (x'01', '短公钥', 1, '', '');",
+            )
+            .unwrap();
+        let saved = store.load().unwrap();
+        assert!(saved.roles.is_empty(), "{:?}", saved.roles);
+        assert!(saved.bans.is_empty());
+        // 好的行照样读得出来
+        store
+            .record(&[Change::RoleSet(PublicKey([5; 32]), Role::Member)])
+            .unwrap();
+        assert_eq!(store.load().unwrap().roles.len(), 1);
     }
 
     #[test]
@@ -357,6 +573,26 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    /// 上一版（v1）写的库要能升上来，里面的频道还在。
+    #[test]
+    fn a_v1_store_is_migrated_and_keeps_its_channels() {
+        let path = temp_db("migrate");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(MIGRATIONS[0]).unwrap();
+            conn.pragma_update(None, "user_version", 1).unwrap();
+            conn.execute(
+                "INSERT INTO channels (id, parent_id, name, min_role) VALUES (5, 1, '老频道', 1)",
+                [],
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let saved = store.load().unwrap();
+        assert_eq!(id_of(&saved, "老频道"), Some(5));
+        assert!(saved.roles.is_empty() && saved.bans.is_empty());
     }
 
     /// 新版本服务端写的库，旧版本不能硬开。
