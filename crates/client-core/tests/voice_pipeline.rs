@@ -38,7 +38,7 @@ use voice_core::audio::{
     Capture, CollectingRender, NullRender, Render, SyntheticCapture, FRAME_SAMPLES, SAMPLE_RATE,
 };
 use voice_core::identity::Identity;
-use voice_core::pipeline::{Pipeline, PipelineConfig, TransmitMode, DEFAULT_JITTER_FRAMES};
+use voice_core::pipeline::{default_jitter, Pipeline, PipelineConfig, TransmitMode};
 
 /// 啁啾前面留多少帧静音。
 ///
@@ -99,7 +99,7 @@ fn voice_config(client: &Client, server: &TestServer, mode: TransmitMode) -> Pip
         server: addr,
         upstream_key: *client.voice_keys().upstream.as_bytes(),
         downstream_key: *client.voice_keys().downstream.as_bytes(),
-        jitter_frames: DEFAULT_JITTER_FRAMES,
+        jitter: default_jitter(),
         mode,
     }
 }
@@ -326,7 +326,8 @@ fn end_to_end_latency_is_measured_not_added_up() {
     //
     // 分帧 10 ms + 编码器前瞻 + 抖动缓冲。实测必须**大于等于**它 ——
     // 小于就说明有一段根本没生效（比如抖动缓冲被绕过去了）。
-    let floor = voice_core::pipeline::intrinsic_latency_ms(DEFAULT_JITTER_FRAMES);
+    // 自适应缓冲最浅是一帧（本机回环上没有抖动，它就停在最浅）。
+    let floor = voice_core::pipeline::intrinsic_latency_ms(1);
 
     println!("端到端（不含声卡和 APM）：{measured_ms:.1} ms");
     println!("理论下限：{floor:.1} ms");

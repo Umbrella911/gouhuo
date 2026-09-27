@@ -228,13 +228,13 @@ pub fn run(cfg: &RunCfg) -> io::Result<RunResult> {
                             out.pcm.extend(std::iter::repeat(0i16).take(n));
                             continue;
                         }
-                        Playout::Frame { seq, payload } => (payload.as_slice(), Some(*seq)),
+                        Playout::Frame { seq, payload, .. } => (payload.as_slice(), Some(*seq)),
                         Playout::Lost { seq } if out.lost_seqs.len() < 32 => {
                             out.lost_seqs.push(*seq);
                             (&[][..], None)
                         }
                         // 空输入 = 让 Opus 做丢包隐藏。
-                        Playout::Lost { .. } | Playout::Underrun => (&[][..], None),
+                        Playout::Lost { .. } | Playout::Stall | Playout::Underrun => (&[][..], None),
                     };
 
                     let t = Instant::now();

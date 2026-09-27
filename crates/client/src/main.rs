@@ -24,7 +24,7 @@ use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 use voice_core::cue::{chime, Chime};
 use voice_core::identity::Identity;
 use voice_core::miccheck::{scan_microphones, MicCheck};
-use voice_core::pipeline::{Pipeline, PipelineConfig, TransmitMode, DEFAULT_JITTER_FRAMES};
+use voice_core::pipeline::{default_jitter, Pipeline, PipelineConfig, TransmitMode};
 use voice_core::tts::{speakable_name, Announcer};
 
 /// 多久去问一次语音链路的状态。
@@ -318,7 +318,7 @@ fn start_voice(app: &App, state: &Arc<Mutex<State>>, client: &Client) {
         server: addr,
         upstream_key: *client.voice_keys().upstream.as_bytes(),
         downstream_key: *client.voice_keys().downstream.as_bytes(),
-        jitter_frames: DEFAULT_JITTER_FRAMES,
+        jitter: default_jitter(),
         mode,
     };
 

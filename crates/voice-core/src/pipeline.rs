@@ -29,10 +29,11 @@
 //!
 //! 静默带宽因此是 57 字节 / 2 秒 ≈ 0.23 kbps。
 //!
-//! # 第一版没做的
+//! # 抖动缓冲是自适应的
 //!
-//! 抖动缓冲是**固定深度**的。自适应缓冲 + PLC 是这个项目技术含量最高的地方，
-//! 单独一个里程碑做。这里先跑通。
+//! 每个说话人一个 [`Playback`]：深度跟着网络走，卡完之后靠加速播（删基音周期）
+//! 把延迟还回去。见 `jitter` 和 `playout` 两个模块的文档。
+//! 固定深度的那个还在（[`JitterConfig::fixed`]），测量工具拿它当基线。
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io;
@@ -49,13 +50,18 @@ use protocol::{
 use crate::audio::{Capture, Render, FRAME_MS, FRAME_SAMPLES, SAMPLE_RATE};
 use crate::codec::{VoiceDecoder, VoiceEncoder};
 use crate::cue::CueQueue;
-use crate::jitter::{JitterBuffer, JitterConfig, Playout};
+use crate::jitter::JitterConfig;
+use crate::playout::Playback;
 
-/// 抖动缓冲的固定深度（帧）。
-///
-/// M1 量过：2 帧（20 ms）在「同城」和「跨省」两档网络下都不欠载，
-/// 而且是能跑进延迟预算的最浅的一档。自适应版本见路线图。
+/// 固定抖动缓冲的深度（帧）。**语音链路已经不用它了**，留着给测量工具当基线：
+/// M1 量过，2 帧（20 ms）在「同城」和「跨省」两档网络下都不欠载，
+/// 是能跑进延迟预算的最浅的一档。
 pub const DEFAULT_JITTER_FRAMES: usize = 2;
+
+/// 语音链路默认用的抖动缓冲：自适应的。
+pub fn default_jitter() -> JitterConfig {
+    JitterConfig::adaptive(FRAME_MS as f64)
+}
 
 /// 多久发一次保活包。
 ///
@@ -162,7 +168,8 @@ pub struct PipelineConfig {
     pub server: SocketAddr,
     pub upstream_key: [u8; 32],
     pub downstream_key: [u8; 32],
-    pub jitter_frames: usize,
+    /// 抖动缓冲。正常用 [`default_jitter`]。
+    pub jitter: JitterConfig,
     pub mode: TransmitMode,
 }
 
@@ -175,7 +182,8 @@ pub struct VoiceStats {
     pub rtt_ms: f64,
     pub packets_sent: u64,
     pub packets_received: u64,
-    /// 抖动缓冲欠载了多少次 —— 这个数涨就是能听出来的卡顿。
+    /// 该播的帧没到、只好用 PLC 顶上的次数（说话中途，不算句间停顿）——
+    /// 这个数涨就是能听出来的卡顿。
     pub underruns: u64,
     /// 现在谁在说话。
     pub speaking: Vec<u32>,
@@ -187,27 +195,45 @@ pub struct VoiceStats {
 }
 
 struct Speaker {
-    jitter: JitterBuffer,
-    decoder: VoiceDecoder,
+    playback: Playback<VoiceDecoder>,
     last_packet: Instant,
     last_voice: Instant,
     /// 每个人的音量，界面上可以单独调。1.0 是原样。
     volume: f32,
-    /// 收到过 terminator，这一段说完了。
+    /// 上一个包头里的采样时间戳，和它解开回绕之后的值。见 [`Speaker::sent_ms`]。
+    last_timestamp: Option<(u32, i64)>,
+    /// 已经报给 `Shared::underruns` 的次数，只报增量。
+    reported_stalls: u64,
+    /// 收到过 terminator，这一段说完了。说话指示据此立刻熄灭，不用等超时。
     ended: bool,
 }
 
 impl Speaker {
-    fn new(jitter_frames: usize) -> Result<Self, opus::Error> {
+    fn new(jitter: JitterConfig) -> Result<Self, opus::Error> {
         let now = Instant::now();
         Ok(Self {
-            jitter: JitterBuffer::new(JitterConfig::fixed(jitter_frames)),
-            decoder: VoiceDecoder::new()?,
+            playback: Playback::new(jitter, VoiceDecoder::new()?, FRAME_SAMPLES),
             last_packet: now,
             last_voice: now - SPEAKING_TIMEOUT,
             volume: 1.0,
+            last_timestamp: None,
+            reported_stalls: 0,
             ended: false,
         })
+    }
+
+    /// 包头里的采样时间戳 → 发送端采到这一帧的时刻（毫秒，发送端自己的时钟）。
+    ///
+    /// 时间戳是 u32 个采样点，48 kHz 下 24.8 小时绕一圈 —— 一挂就是几小时的场景里
+    /// 真会碰上。所以按跟上一个包的差值累加，而不是直接除。差值当成有符号的：
+    /// 乱序到的包时间戳比上一个小，那是往回的一小步，不是往前绕了一整圈。
+    fn sent_ms(&mut self, timestamp: u32) -> f64 {
+        let unwrapped = match self.last_timestamp {
+            None => timestamp as i64,
+            Some((last, base)) => base + timestamp.wrapping_sub(last) as i32 as i64,
+        };
+        self.last_timestamp = Some((timestamp, unwrapped));
+        unwrapped as f64 * 1000.0 / SAMPLE_RATE as f64
     }
 }
 
@@ -254,6 +280,12 @@ struct Shared {
 impl Shared {
     fn now_ms(&self) -> u64 {
         self.started.elapsed().as_millis() as u64
+    }
+
+    /// 同一个原点，带小数的毫秒。抖动缓冲要亚毫秒的精度：
+    /// 本机回环上一跳才几十微秒，按整毫秒算全是 0。
+    fn now_ms_f64(&self) -> f64 {
+        self.started.elapsed().as_secs_f64() * 1000.0
     }
 
     /// 从链路起来算的微秒数。u32 大约 71 分钟回绕 —— 只拿来算往返时间，
@@ -306,7 +338,7 @@ impl Pipeline {
             started: Instant::now(),
         });
 
-        let jitter_frames = cfg.jitter_frames.max(1);
+        let jitter = cfg.jitter;
         let processor: Option<Arc<dyn AudioProcessor>> = processor.map(Arc::from);
         let mut threads = Vec::new();
 
@@ -349,7 +381,7 @@ impl Pipeline {
             let key = cfg.downstream_key;
             let server = cfg.server;
             threads.push(spawn("gouhuo-voice-recv", move || {
-                recv_loop(socket, &stop, &shared, key, server, jitter_frames);
+                recv_loop(socket, &stop, &shared, key, server, jitter);
             })?);
         }
 
@@ -637,7 +669,7 @@ fn recv_loop(
     shared: &Shared,
     key: [u8; 32],
     server: SocketAddr,
-    jitter_frames: usize,
+    jitter: JitterConfig,
 ) {
     crate::clock::boost_current_thread();
     let cipher = VoiceCipher::new(&key);
@@ -684,7 +716,7 @@ fn recv_loop(
         let speaker = match speakers.entry(header.session) {
             std::collections::btree_map::Entry::Occupied(e) => e.into_mut(),
             std::collections::btree_map::Entry::Vacant(e) => {
-                let Ok(mut speaker) = Speaker::new(jitter_frames) else {
+                let Ok(mut speaker) = Speaker::new(jitter) else {
                     continue;
                 };
                 if let Some(&volume) = shared
@@ -701,12 +733,16 @@ fn recv_loop(
         speaker.last_packet = Instant::now();
 
         if header.is_terminator() {
+            speaker.playback.end_at(header.seq);
             speaker.ended = true;
             continue;
         }
         speaker.ended = false;
         speaker.last_voice = Instant::now();
-        speaker.jitter.push(header.seq, payload.clone());
+        let sent_ms = speaker.sent_ms(header.timestamp);
+        speaker
+            .playback
+            .push(header.seq, sent_ms, payload.clone(), shared.now_ms_f64());
     }
 }
 
@@ -730,24 +766,20 @@ fn play_loop(
             // 走掉的人要清掉，否则解码器会一直攒着
             speakers.retain(|_, s| now.duration_since(s.last_packet) < SPEAKER_IDLE);
 
+            let now_ms = shared.now_ms_f64();
             for speaker in speakers.values_mut() {
-                let got = match speaker.jitter.pop() {
-                    Playout::Frame { payload, .. } => {
-                        speaker.decoder.decode(&payload, &mut decoded).is_ok()
-                    }
-                    // 丢了一帧：让解码器自己编一帧出来。**不能塞静音** ——
-                    // 解码器有内部状态，跳过一帧会让下一帧真包也解错。
-                    Playout::Lost { .. } => speaker.decoder.conceal(&mut decoded).is_ok(),
-                    Playout::Underrun => {
-                        // 缓冲空了。对方不说话时这是正常的，所以只在
-                        // 「他还在说」的时候才算欠载。
-                        if !speaker.ended {
-                            shared.underruns.fetch_add(1, Ordering::Relaxed);
-                        }
-                        false
-                    }
-                    Playout::Prebuffering => false,
-                };
+                // 丢包、迟到都在里面处理了：让解码器自己编一帧（PLC），
+                // 攒多了就加速播。见 playout 模块。
+                let got = speaker.playback.pull(now_ms, &mut decoded);
+                // 「停着等」只会在说话中途发生（说完了有 terminator），
+                // 所以它正好就是能听出来的那种卡。
+                let stalls = speaker.playback.jitter().stats.stalls;
+                if stalls > speaker.reported_stalls {
+                    shared
+                        .underruns
+                        .fetch_add(stalls - speaker.reported_stalls, Ordering::Relaxed);
+                    speaker.reported_stalls = stalls;
+                }
                 if !got {
                     continue;
                 }

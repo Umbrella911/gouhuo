@@ -24,8 +24,10 @@ pub mod metrics;
 #[cfg(feature = "pipeline")]
 pub mod miccheck;
 pub mod net;
+pub mod netsim;
 #[cfg(feature = "pipeline")]
 pub mod pipeline;
+pub mod playout;
 pub mod redline;
 pub mod signal;
 pub mod timescale;

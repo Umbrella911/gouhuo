@@ -49,7 +49,7 @@ pub fn chime(kind: Chime) -> Vec<f32> {
         Chime::WentOut => (880.0, 659.25),
     };
     let mut out = tone(first, 0.09);
-    out.extend(std::iter::repeat_n(0.0, samples_for(0.02)));
+    out.resize(out.len() + samples_for(0.02), 0.0);
     out.extend(tone(second, 0.12));
     out
 }
