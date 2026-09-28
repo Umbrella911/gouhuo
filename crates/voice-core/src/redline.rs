@@ -71,13 +71,15 @@ pub const SILENT_KBPS: f64 = 5.0;
 /// 下行按 20 人全说话算也才 1.6 Mbps，比一路 1080p 视频还少得多。
 pub const SPEAKING_KBPS: f64 = 80.0;
 
-/// voice-core 常驻内存，MB。**还没实测过。**
+/// voice-core 常驻内存，MB。
 ///
 /// 从 60 放到 100：60 是拍的，而现在 libwebrtc 的 APM 也进来了，它自己有一堆
 /// 滤波器状态。100 MB 对一个常驻后台的语音内核仍然是很克制的数字
 /// （Discord 动辄几百 MB 到 1 GB）。
 ///
-/// M6 实测（#11），再按实测收紧。实测不达标才考虑把 voice-core 拆成独立进程。
+/// M6 实测（#11）：**整个客户端进程**在频道里 73.0 MB（见
+/// [`MEASURED_CLIENT_IN_CHANNEL_RSS_MB`]），语音那一半约 13 MB（减掉登录页的 60 MB）。
+/// 离线很远，不用拆进程。线先不收：这是产品线，是对用户的承诺，不是防回归闸。
 pub const VOICE_CORE_RSS_MB: f64 = 100.0;
 
 /// 安装包，MB。
@@ -227,8 +229,22 @@ pub const MEASURED_AEC_HARM_DB: f64 = 1.1;
 /// 实测的客户端界面进程常驻内存，MB。
 ///
 /// 连上服务器、名单和频道树都画出来之后的稳定值，dist profile。
-/// **不含音频那半边** —— WASAPI 和 APM 接进来之后要重新量。
+/// **不含音频那半边** —— 那一半见 [`MEASURED_CLIENT_IN_CHANNEL_RSS_MB`]。
+/// M6 在登录页空闲时又量了一次，60.0，对得上。
 pub const MEASURED_UI_RSS_MB: f64 = 59.4;
+
+/// 实测的客户端**整个进程**常驻内存（工作集），MB：在频道里，有一个人一直在说话。
+///
+/// dist profile，60 秒平均。前台、最小化、收在托盘里三种状态差不到 0.2 MB ——
+/// Windows 并没有在最小化时裁剪工作集（当初以为会）。量法和四种状态的完整表
+/// 见 docs/measurements.md 的 M6 一节，原始输出存档在 docs/m6-footprint.txt，
+/// 复现：`scripts\m6-footprint.ps1`。挂着 48 分钟，私有字节前后一半平均 56.71 / 56.70。
+///
+/// 含界面和音频两半，拿它跟 [`VOICE_CORE_RSS_MB`] 比是偏保守的。
+pub const MEASURED_CLIENT_IN_CHANNEL_RSS_MB: f64 = 73.0;
+
+/// 同上，私有字节（提交大小）。这才是真正占着的，工作集可能被系统换出去一部分。
+pub const MEASURED_CLIENT_IN_CHANNEL_PRIVATE_MB: f64 = 57.0;
 
 /// 实测的冷启动到窗口出现，毫秒（dist profile，三次取最差的稳态值）。
 ///
@@ -287,6 +303,14 @@ const _: () = assert!(
 // 今天的实测值必须在产品线之内 —— 不然就是在承诺做不到的事。
 const _: () = assert!(MEASURED_E2E_MS <= E2E_MS, "实测的端到端延迟超出了产品线");
 
+const _: () = assert!(
+    MEASURED_CLIENT_IN_CHANNEL_RSS_MB < VOICE_CORE_RSS_MB,
+    "整个客户端在频道里的内存已经顶到 voice-core 的线了"
+);
+const _: () = assert!(
+    MEASURED_CLIENT_IN_CHANNEL_PRIVATE_MB <= MEASURED_CLIENT_IN_CHANNEL_RSS_MB,
+    "私有字节比工作集还大，多半是抄错了数"
+);
 const _: () = assert!(
     MEASURED_UI_RSS_MB < UI_RSS_MB,
     "界面内存实测已经顶到线了：要么是真的变重了，要么该重新定一次"
