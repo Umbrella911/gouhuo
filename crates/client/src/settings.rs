@@ -20,6 +20,37 @@ use std::path::{Path, PathBuf};
 
 use voice_core::hotkey::Key;
 
+/// 点窗口的 × 时怎么办。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseAction {
+    /// 每次问：收到托盘还是退出。**默认** —— 两种习惯的人都照顾到，
+    /// 而且没人会在不知情的情况下挂在频道里。
+    Ask,
+    /// 收到托盘，继续在频道里。
+    Tray,
+    /// 退出。
+    Quit,
+}
+
+impl CloseAction {
+    /// 界面上那一排按钮的序号。
+    pub fn index(self) -> i32 {
+        match self {
+            CloseAction::Ask => 0,
+            CloseAction::Tray => 1,
+            CloseAction::Quit => 2,
+        }
+    }
+
+    pub fn from_index(index: i32) -> Self {
+        match index {
+            1 => CloseAction::Tray,
+            2 => CloseAction::Quit,
+            _ => CloseAction::Ask,
+        }
+    }
+}
+
 /// 按住说话还是语音激活。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TalkMode {
@@ -61,6 +92,8 @@ pub struct Settings {
     pub announce_names: bool,
     /// 提示音和念名字的音量，百分比。
     pub cue_volume: u32,
+    /// 点窗口的 × 时怎么办。
+    pub close_action: CloseAction,
 }
 
 /// 提示音音量的默认值。提示音本身已经比人声轻了，再打个六折：
@@ -122,6 +155,7 @@ impl Default for Settings {
             cue_sounds: true,
             announce_names: false,
             cue_volume: DEFAULT_CUE_VOLUME,
+            close_action: CloseAction::Ask,
         }
     }
 }
@@ -199,6 +233,14 @@ impl Settings {
                     }
                 }
                 "ptt_key" => settings.ptt_key = value.parse().ok().and_then(Key::decode),
+                "close" => {
+                    settings.close_action = match value {
+                        "tray" => CloseAction::Tray,
+                        "quit" => CloseAction::Quit,
+                        // 认不出来的回到「每次问」：比悄悄替用户选一个好。
+                        _ => CloseAction::Ask,
+                    }
+                }
                 "cue_sounds" => settings.cue_sounds = value != "off",
                 "announce_names" => settings.announce_names = value == "on",
                 "cue_volume" => {
@@ -250,7 +292,8 @@ impl Settings {
              render_device={}\n\
              cue_sounds={}\n\
              announce_names={}\n\
-             cue_volume={}\n",
+             cue_volume={}\n\
+             close={}\n",
             // 值里有换行的话会把文件切坏，所以过滤掉。
             // 昵称里的换行是粘贴时最容易带进来的东西。
             one_line(&self.nick),
@@ -263,6 +306,11 @@ impl Settings {
             on_off(self.cue_sounds),
             on_off(self.announce_names),
             self.cue_volume,
+            match self.close_action {
+                CloseAction::Ask => "ask",
+                CloseAction::Tray => "tray",
+                CloseAction::Quit => "quit",
+            },
         ) + &self.serialize_volumes()
     }
 
@@ -318,6 +366,7 @@ mod tests {
             cue_sounds: false,
             announce_names: true,
             cue_volume: 35,
+            close_action: CloseAction::Tray,
         }
     }
 
@@ -490,6 +539,23 @@ mod tests {
         let garbled = Settings::parse("cue_sounds=也许\nannounce_names=也许\n");
         assert!(garbled.cue_sounds, "认不出来的值不该把提示音关掉");
         assert!(!garbled.announce_names, "认不出来的值不该让电脑突然开口");
+    }
+
+    /// 默认每次问；写坏了也回到每次问，不替用户悄悄选一个。
+    #[test]
+    fn closing_asks_by_default_and_when_garbled() {
+        assert_eq!(Settings::default().close_action, CloseAction::Ask);
+        assert_eq!(
+            Settings::parse("close=也许\n").close_action,
+            CloseAction::Ask
+        );
+        assert_eq!(
+            Settings::parse("close=quit\n").close_action,
+            CloseAction::Quit
+        );
+        for action in [CloseAction::Ask, CloseAction::Tray, CloseAction::Quit] {
+            assert_eq!(CloseAction::from_index(action.index()), action);
+        }
     }
 
     /// 设置文件跟身份文件放在一起，搬机器的时候一起走。

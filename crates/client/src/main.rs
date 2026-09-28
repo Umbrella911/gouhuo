@@ -45,7 +45,7 @@ const PTT_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 
 mod settings;
 
-use settings::{db_to_level, level_to_db, snap_volume, Settings, TalkMode};
+use settings::{db_to_level, level_to_db, snap_volume, CloseAction, Settings, TalkMode};
 use voice_core::hotkey::{Hotkeys, Key};
 
 slint::include_modules!();
@@ -179,6 +179,7 @@ fn run() -> Result<(), Failure> {
     app.set_cue_sounds(stored.cue_sounds);
     app.set_announce_names(stored.announce_names);
     app.set_cue_volume(stored.cue_volume as f32 / 100.0);
+    app.set_close_action(stored.close_action.index());
     if let Some(hotkeys) = &hotkeys {
         hotkeys.set_ptt(stored.ptt_key);
     }
@@ -198,6 +199,9 @@ fn run() -> Result<(), Failure> {
     wire_actions(&app, &state);
     wire_settings(&app, &state, hotkeys.clone());
     wire_scan(&app, &state);
+    wire_close(&app, &state);
+    let tray = wire_tray(&app, &state);
+    TRAY.with(|slot| *slot.borrow_mut() = tray);
     load_devices(&app, &state);
     spawn_status_poll(app.as_weak(), Arc::clone(&state));
     if let Some(hotkeys) = hotkeys {
@@ -219,7 +223,9 @@ fn run() -> Result<(), Failure> {
         app.invoke_join();
     }
 
-    let result = slint::run_event_loop();
+    // **不能用 run_event_loop**：它在最后一个窗口隐藏时就返回，收到托盘等于退出。
+    // 真正的退出走 quit_app。
+    let result = slint::run_event_loop_until_quit();
     tear_down();
     result.map_err(Failure::EventLoop)?;
     Ok(())
@@ -288,6 +294,9 @@ thread_local! {
     /// 等用户按键设置热键时，接收那个键的通道。
     static REBIND: RefCell<Option<std::sync::mpsc::Receiver<Key>>> =
         const { RefCell::new(None) };
+    /// 托盘图标。丢掉它图标就没了，所以跟定时器一样放在这儿活到最后。
+    /// `None` = 建不起来（系统不支持之类）—— 那样点 × 就只能退出，不能收起来。
+    static TRAY: RefCell<Option<Tray>> = const { RefCell::new(None) };
 }
 
 /// 点「加入」之后发生的事。
@@ -907,6 +916,7 @@ fn spawn_status_poll(weak: slint::Weak<App>, state: Arc<Mutex<State>>) {
                 locked.capture.clone(),
             )
         };
+        update_tray(&app, client.as_ref());
 
         // 实际用的是哪个设备、是不是虚拟声卡。两条路共用同一个把手。
         if let Some(capture) = capture {
@@ -1082,6 +1092,10 @@ fn pump_events(
                         Ended::Refused { headline, advice } => {
                             app.set_error_headline(headline.into());
                             app.set_error_advice(advice.into());
+                            // 收在托盘里的时候被踢了、被封了、被顶号了：把窗口叫出来，
+                            // 不然用户以为自己还在频道里，一直对着空气说话。
+                            let _ = app.show();
+                            app.window().set_minimized(false);
                         }
                     }
                 }
@@ -1477,6 +1491,202 @@ fn tear_down() {
     PTT_TIMER.with(|slot| slot.borrow_mut().take());
     VOICE_TIMER.with(|slot| slot.borrow_mut().take());
     REBIND.with(|slot| slot.borrow_mut().take());
+    TRAY.with(|slot| slot.borrow_mut().take());
+}
+
+/// 点窗口的 × 怎么办、托盘里点「退出」怎么办。
+fn wire_close(app: &App, state: &Arc<Mutex<State>>) {
+    {
+        let weak = app.as_weak();
+        let state = Arc::clone(state);
+        app.window().on_close_requested(move || {
+            use slint::CloseRequestResponse::{HideWindow, KeepWindowShown};
+            let Some(app) = weak.upgrade() else {
+                return HideWindow;
+            };
+            let has_tray = TRAY.with(|slot| slot.borrow().is_some());
+            let (client, action) = {
+                let locked = state.lock().expect("state poisoned");
+                (locked.client.clone(), locked.settings.close_action)
+            };
+            // 没连着就没什么可「继续」的；没有托盘就没地方收。都直接退出。
+            let Some(client) = client.filter(|_| app.get_connected() && has_tray) else {
+                quit_app(&state);
+                return HideWindow;
+            };
+            match action {
+                CloseAction::Tray => HideWindow,
+                CloseAction::Quit => {
+                    quit_app(&state);
+                    HideWindow
+                }
+                CloseAction::Ask => {
+                    app.set_close_prompt_channel(current_channel_name(&client).into());
+                    app.set_close_prompt(true);
+                    KeepWindowShown
+                }
+            }
+        });
+    }
+
+    {
+        let weak = app.as_weak();
+        let state = Arc::clone(state);
+        app.on_close_choice(move |to_tray, remember| {
+            let Some(app) = weak.upgrade() else { return };
+            app.set_close_prompt(false);
+            if remember {
+                let action = if to_tray {
+                    CloseAction::Tray
+                } else {
+                    CloseAction::Quit
+                };
+                app.set_close_action(action.index());
+                let mut locked = state.lock().expect("state poisoned");
+                locked.settings.close_action = action;
+                let _ = locked.settings.save();
+            }
+            if to_tray {
+                let _ = app.hide();
+            } else {
+                quit_app(&state);
+            }
+        });
+    }
+
+    {
+        let weak = app.as_weak();
+        let state = Arc::clone(state);
+        app.on_set_close_action(move |index| {
+            let action = CloseAction::from_index(index);
+            if let Some(app) = weak.upgrade() {
+                app.set_close_action(action.index());
+            }
+            let mut locked = state.lock().expect("state poisoned");
+            locked.settings.close_action = action;
+            let _ = locked.settings.save();
+        });
+    }
+}
+
+/// 真的退出：先离开频道（服务端和别人那边马上看到你走了，而不是等 30 秒超时），
+/// 再停掉事件循环。
+fn quit_app(state: &Arc<Mutex<State>>) {
+    let client = {
+        let mut locked = state.lock().expect("state poisoned");
+        locked.voice = None;
+        locked.client.clone()
+    };
+    if let Some(client) = client {
+        client.disconnect();
+    }
+    let _ = slint::quit_event_loop();
+}
+
+fn current_channel_name(client: &Client) -> String {
+    let roster = client.roster();
+    roster
+        .channels
+        .get(&roster.my_channel())
+        .map(|c| c.name.clone())
+        .unwrap_or_default()
+}
+
+/// 建托盘图标，接上它的菜单。建不起来返回 `None`，不影响别的。
+fn wire_tray(app: &App, state: &Arc<Mutex<State>>) -> Option<Tray> {
+    let tray = match Tray::new() {
+        Ok(tray) => tray,
+        Err(e) => {
+            eprintln!("托盘图标建不起来，点 × 只能退出：{e}");
+            return None;
+        }
+    };
+    tray.set_status("篝火 · 没连着".into());
+    {
+        let weak = app.as_weak();
+        tray.on_show_window(move || {
+            if let Some(app) = weak.upgrade() {
+                let _ = app.show();
+                app.window().set_minimized(false);
+            }
+        });
+    }
+    {
+        let weak = app.as_weak();
+        tray.on_toggle_mute(move || {
+            if let Some(app) = weak.upgrade() {
+                app.invoke_toggle_mute();
+            }
+        });
+    }
+    {
+        let weak = app.as_weak();
+        tray.on_toggle_deafen(move || {
+            if let Some(app) = weak.upgrade() {
+                app.invoke_toggle_deafen();
+            }
+        });
+    }
+    {
+        let weak = app.as_weak();
+        tray.on_leave(move || {
+            if let Some(app) = weak.upgrade() {
+                app.invoke_leave();
+            }
+        });
+    }
+    {
+        let state = Arc::clone(state);
+        tray.on_quit(move || quit_app(&state));
+    }
+    Some(tray)
+}
+
+/// 把连接和麦克风的状态搬到托盘图标上。跟着状态轮询的定时器一起跑。
+fn update_tray(app: &App, client: Option<&Client>) {
+    TRAY.with(|slot| {
+        let slot = slot.borrow();
+        let Some(tray) = slot.as_ref() else { return };
+        let connected = app.get_connected() && client.is_some();
+        let muted = app.get_self_muted();
+        let deafened = app.get_self_deafened();
+        let icon = match (connected, muted || deafened) {
+            (false, _) => 0,
+            (true, false) => 1,
+            (true, true) => 2,
+        };
+        let status = match client {
+            _ if !connected => "篝火 · 没连着".to_string(),
+            _ if !app.get_reconnecting().is_empty() => "篝火 · 正在重连…".to_string(),
+            Some(client) => {
+                let mic = if deafened {
+                    "关着耳朵"
+                } else if muted {
+                    "闭着麦"
+                } else {
+                    "麦克风开着"
+                };
+                format!("篝火 · 在「{}」里 · {mic}", current_channel_name(client))
+            }
+            None => "篝火".to_string(),
+        };
+        // 值没变就别设：定时器一秒二十次，每次都设会让托盘一直在重建图标。
+        if tray.get_state() != icon {
+            tray.set_state(icon);
+        }
+        if tray.get_status().as_str() != status {
+            tray.set_status(status.into());
+        }
+        if tray.get_connected() != connected {
+            tray.set_connected(connected);
+        }
+        if tray.get_muted() != muted {
+            tray.set_muted(muted);
+        }
+        if tray.get_deafened() != deafened {
+            tray.set_deafened(deafened);
+        }
+    });
 }
 
 /// 返回 `(身份, 是不是这次新建的)`。
