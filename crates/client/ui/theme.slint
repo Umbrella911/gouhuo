@@ -38,6 +38,13 @@ export component Btn inherits Rectangle {
     in property <bool> enabled: true;
     callback clicked();
 
+    // 告诉读屏软件（和 Windows 的 UI 自动化）这是个按钮、叫什么、按下去做什么。
+    // 不写的话，整个界面对读屏软件来说一个按钮都没有。
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-enabled: root.enabled;
+    accessible-action-default => { if (root.enabled) { root.clicked(); } }
+
     height: 36px;
     border-radius: Theme.radius;
     background: !root.enabled

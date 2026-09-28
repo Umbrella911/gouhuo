@@ -219,7 +219,9 @@ fn run() -> Result<(), Failure> {
         app.invoke_join();
     }
 
-    slint::run_event_loop().map_err(Failure::EventLoop)?;
+    let result = slint::run_event_loop();
+    tear_down();
+    result.map_err(Failure::EventLoop)?;
     Ok(())
 }
 
@@ -1462,6 +1464,19 @@ fn wire_actions(app: &App, state: &Arc<Mutex<State>>) {
             }
         });
     }
+}
+
+/// 事件循环停了之后、`main` 返回之前，把线程局部变量里带后台线程的东西收干净。
+///
+/// **不能留给进程退出时自动析构。** Windows 上 `main` 返回之后，系统先把别的线程
+/// 全杀掉，然后才析构线程局部变量。按住说话的定时器里攥着全局热键（`Hotkeys`），
+/// 它析构时要 join 自己的 Raw Input 线程 —— 那个线程已经被杀了，join 就 panic，
+/// 析构里的 panic 直接 abort。调试版的 abort 会把进程卡在系统的错误报告上，
+/// 表现为「点了退出，进程却一直挂在后台」。是不是撞上全看时序，所以时有时无。
+fn tear_down() {
+    PTT_TIMER.with(|slot| slot.borrow_mut().take());
+    VOICE_TIMER.with(|slot| slot.borrow_mut().take());
+    REBIND.with(|slot| slot.borrow_mut().take());
 }
 
 /// 返回 `(身份, 是不是这次新建的)`。
