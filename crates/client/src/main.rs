@@ -43,6 +43,15 @@ const VOICE_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 /// 20 ms 是两帧音频，用户感觉不出来；再快就只是在空转了。
 const PTT_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 
+/// 窗口看不见（最小化、收在托盘里）时，界面同步多久一次。
+///
+/// 这时候电平条、谁在说话都没人看，只剩托盘图标要跟着麦克风状态走，以及发现窗口
+/// 被恢复了、切回 [`VOICE_POLL`]。半秒够：恢复窗口后电平条最多晚半秒动起来。
+///
+/// 为什么要管这个：篝火真正的用法是进游戏之后挂在后台几个小时。实测（#11）改之前
+/// 界面线程不管窗口在不在都每秒醒 190 次左右，跟游戏抢的就是这种零碎的调度。
+const BACKGROUND_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+
 mod settings;
 
 use settings::{db_to_level, level_to_db, snap_volume, CloseAction, Settings, TalkMode};
@@ -917,6 +926,39 @@ fn spawn_status_poll(weak: slint::Weak<App>, state: Arc<Mutex<State>>) {
             )
         };
         update_tray(&app, client.as_ref());
+
+        // 按住说话的定时器只在真用得着的时候跑。收在托盘里、用按住说话打游戏时
+        // 它照跑 —— 那正是它最要紧的时候。
+        let ptt_needed = app.get_rebinding() || (voice.is_some() && app.get_ptt_mode());
+        PTT_TIMER.with(|slot| {
+            if let Some(timer) = slot.borrow().as_ref() {
+                if ptt_needed && !timer.running() {
+                    timer.restart();
+                } else if !ptt_needed && timer.running() {
+                    timer.stop();
+                }
+            }
+        });
+
+        // 窗口看不见就只管托盘，界面同步放慢。窗口开着但没什么在动的时候
+        // （没进频道、也没在试麦 —— 登录页）同样放慢：电平条、说话指示都没有。
+        let hidden = !app.window().is_visible() || app.window().is_minimized();
+        let idle = voice.is_none() && mic_check.is_none();
+        let interval = if hidden || idle {
+            BACKGROUND_POLL
+        } else {
+            VOICE_POLL
+        };
+        VOICE_TIMER.with(|slot| {
+            if let Some(timer) = slot.borrow().as_ref() {
+                if timer.interval() != interval {
+                    timer.set_interval(interval);
+                }
+            }
+        });
+        if hidden {
+            return;
+        }
 
         // 实际用的是哪个设备、是不是虚拟声卡。两条路共用同一个把手。
         if let Some(capture) = capture {
