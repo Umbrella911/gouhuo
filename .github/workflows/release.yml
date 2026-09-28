@@ -1,0 +1,63 @@
+name: release
+
+# 推一个 v* 标签就出一版：编安装包和服务端，建一个**草稿** Release 把它们挂上去。
+#
+#   git tag -s v0.1.0 -m "篝火 0.1.0" && git push origin v0.1.0
+#
+# 是草稿，不是直接发布：自己下下来装一遍、写好说明，再在网页上点「发布」。
+# 客户端的「检查更新」看的是 /releases/latest，草稿不算 —— 点发布之前没人会被提示。
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # 见 redline.yml：VS 自带的 cmake 4.x 不认 libopus 声明的老最低版本。
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # 标签和 Cargo.toml 的版本号对不上的话，exe 里写的版本、安装包的文件名、
+      # 检查更新比较的版本就全乱了。先拦住。
+      - name: 标签要跟 Cargo.toml 的版本一致
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}".TrimStart("v")
+          $in = $false; $version = $null
+          foreach ($line in Get-Content Cargo.toml) {
+            if ($line -match '^\[') { $in = ($line -eq '[workspace.package]') }
+            if ($in -and $line -match '^version\s*=\s*"([^"]+)"') { $version = $Matches[1]; break }
+          }
+          if ($tag -ne $version) { throw "标签是 $tag，Cargo.toml 里是 $version" }
+
+      - name: 装 Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: 编安装包
+        shell: pwsh
+        run: .\packaging\windows\build.ps1
+
+      - name: 编服务端
+        run: cargo build --profile dist -p server --bin gouhuo-server
+
+      - name: 建草稿 Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart("v")
+          Copy-Item target\dist\gouhuo-server.exe "target\gouhuo-server-$version-windows-x64.exe"
+          gh release create "${{ github.ref_name }}" --draft --verify-tag `
+            --title "篝火 $version" `
+            --notes "安装：下载 gouhuo-setup-$version.exe 双击。没签名，Windows 会拦一下，点「更多信息」→「仍要运行」。" `
+            "target\installer\gouhuo-setup-$version.exe" `
+            "target\gouhuo-server-$version-windows-x64.exe"

@@ -94,6 +94,8 @@ pub struct Settings {
     pub cue_volume: u32,
     /// 点窗口的 × 时怎么办。
     pub close_action: CloseAction,
+    /// 启动时去 GitHub 看一眼有没有新版本。见 update.rs。
+    pub check_updates: bool,
 }
 
 /// 提示音音量的默认值。提示音本身已经比人声轻了，再打个六折：
@@ -156,6 +158,7 @@ impl Default for Settings {
             announce_names: false,
             cue_volume: DEFAULT_CUE_VOLUME,
             close_action: CloseAction::Ask,
+            check_updates: true,
         }
     }
 }
@@ -242,6 +245,7 @@ impl Settings {
                     }
                 }
                 "cue_sounds" => settings.cue_sounds = value != "off",
+                "check_updates" => settings.check_updates = value != "off",
                 "announce_names" => settings.announce_names = value == "on",
                 "cue_volume" => {
                     if let Ok(percent) = value.parse::<u32>() {
@@ -293,7 +297,8 @@ impl Settings {
              cue_sounds={}\n\
              announce_names={}\n\
              cue_volume={}\n\
-             close={}\n",
+             close={}\n\
+             check_updates={}\n",
             // 值里有换行的话会把文件切坏，所以过滤掉。
             // 昵称里的换行是粘贴时最容易带进来的东西。
             one_line(&self.nick),
@@ -311,6 +316,7 @@ impl Settings {
                 CloseAction::Tray => "tray",
                 CloseAction::Quit => "quit",
             },
+            on_off(self.check_updates),
         ) + &self.serialize_volumes()
     }
 
@@ -367,6 +373,7 @@ mod tests {
             announce_names: true,
             cue_volume: 35,
             close_action: CloseAction::Tray,
+            check_updates: false,
         }
     }
 

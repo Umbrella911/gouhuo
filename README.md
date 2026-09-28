@@ -11,7 +11,8 @@
 看看能不能把接入语音的心智负担降下来。
 
 > **当前状态：还不能给不懂技术的人用。** 语音链路、服务端、界面、加密都通了，
-> 端到端延迟 91.9 ms 实测。缺的是安装包（M6）—— 现在只能自己 `cargo build`。
+> 端到端延迟 91.9 ms 实测。安装包做好了，还没发第一个版本 —— 在那之前只能自己
+> `cargo build`，或者[自己打一个安装包](#自己打安装包)。
 > 详见[路线图](#路线图)。
 
 ---
@@ -58,6 +59,23 @@ CI 直接读那里（`--assert-gate`），不在别处重复写。
 
 ---
 
+## 安装
+
+到 [Releases](https://github.com/parz1/gouhuo/releases) 下载 `gouhuo-setup-<版本>.exe`，双击。
+
+- **不要管理员权限**：装在你自己的用户目录下（`%LOCALAPPDATA%\Programs\gouhuo`），
+  网吧、公司电脑上也能装
+- 装完之后，别人发来的 `gouhuo://` 链接点一下就能进频道。篝火已经开着的话，
+  链接会交给开着的那个，不会再开一个
+- **Windows 会拦一下**：安装包还没有代码签名，SmartScreen 会说「Windows 已保护你的
+  电脑」。点「更多信息」→「仍要运行」。签名证书要钱，等用的人多了再买
+- **检查更新**：启动时去 GitHub 看一眼最新的版本号，有新版本就在窗口里提一句，
+  不会自己下载、自己装。什么都不上传；设置里能关
+- **卸载**：在「设置 → 应用」里卸。身份（`%APPDATA%\gouhuo`）**不会**删 ——
+  那是你的密钥，删了就再也找不回这个身份。真不要了自己删那个目录
+
+---
+
 ## 快速开始
 
 需要 **Rust（MSVC toolchain）** 和 **CMake**（`audiopus_sys` 要从源码编 libopus）。
@@ -100,6 +118,18 @@ cargo run --release -p client --bin gouhuo -- gouhuo://j/...
 ```
 
 不带参数启动也行，界面里有粘链接的框。
+
+### 自己打安装包
+
+要装 [Inno Setup 6](https://jrsoftware.org/isinfo.php)（`winget install JRSoftware.InnoSetup`）。
+
+```powershell
+.\packaging\windows\build.ps1
+```
+
+出来的是 `target\installer\gouhuo-setup-<版本>.exe`。推一个 `v*` 标签，CI 会做同样的事，
+再建一个草稿 Release 把安装包和服务端挂上去，见
+[`.github/workflows/release.yml`](.github/workflows/release.yml)。
 
 ---
 
@@ -203,7 +233,13 @@ cargo run --release -p device-probe        # 设备延迟 + APM 逐块计价
 - ✅ 托盘：点 × 第一次问「收到托盘还是退出」，能记住；托盘图标看得出麦克风开没开
 
 **M5** ✅ 自适应抖动缓冲 + PLC：抖一小时，延迟回到起点（固定缓冲 30 → 220 ms，自适应 33 → 38 ms，[量法](docs/measurements.md#m5-结论自适应抖动缓冲)）
-**M6** 打包、安装包体积实测、游戏帧时间影响实测
+**M6** 打包、安装包体积实测、游戏帧时间影响实测 —— 进行中
+
+- ✅ 静态链接 CRT：没装 VC++ 运行库的机器上也能开
+- ✅ 内存和后台开销实测：在频道里 73 MB，收到托盘挂 48 分钟不涨（[量法](docs/measurements.md#m6客户端的内存和后台开销)）
+- ✅ 安装包：按用户装、不弹 UAC；注册 `gouhuo://` 协议；只开一个实例，链接转交给开着的那个；启动时检查更新
+- ⬜ 安装包体积实测
+- ⬜ 跟真游戏一起跑时的帧时间影响
 **M7** 游戏 SDK：让游戏开发者把篝火嵌进自己的游戏当语音系统 —— 不注册、不收费、服务器自己架
 
 ### 平台

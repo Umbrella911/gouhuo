@@ -53,6 +53,8 @@ const PTT_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 const BACKGROUND_POLL: std::time::Duration = std::time::Duration::from_millis(500);
 
 mod settings;
+mod single_instance;
+mod update;
 
 use settings::{db_to_level, level_to_db, snap_volume, CloseAction, Settings, TalkMode};
 use voice_core::hotkey::{Hotkeys, Key};
@@ -74,7 +76,22 @@ enum Failure {
 }
 
 fn main() {
-    let error = match run() {
+    // 已经有一个在跑了：把这次的链接交给它，自己退出。见 single_instance.rs。
+    // 名额要攥到进程结束。
+    let key = single_instance::key();
+    let (_instance, already_running) = single_instance::claim(&key);
+    if already_running {
+        // 那边可能也刚启动、还没开始收（窗口建好才开始）：连着点两下图标就是这样。
+        // 多等一会儿，别急着自己也开起来、把那边顶掉。
+        let link = link_from_args().unwrap_or_default();
+        for _ in 0..20 {
+            if single_instance::forward(&key, &link) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+    let error = match run(&key) {
         Ok(()) => return,
         Err(Failure::EventLoop(e)) => e,
         Err(Failure::Window(e)) => {
@@ -136,7 +153,7 @@ fn show_fatal(message: &str) {
 /// 没有这个的话，那条路只有在一台没显卡驱动的机器上才测得到。
 const SIMULATE_WINDOW_FAILURE: &str = "GOUHUO_SIMULATE_WINDOW_FAILURE";
 
-fn run() -> Result<(), Failure> {
+fn run(instance_key: &str) -> Result<(), Failure> {
     if std::env::var_os(SIMULATE_WINDOW_FAILURE).is_some()
         && std::env::var_os(FALLBACK_MARKER).is_none()
     {
@@ -189,6 +206,7 @@ fn run() -> Result<(), Failure> {
     app.set_announce_names(stored.announce_names);
     app.set_cue_volume(stored.cue_volume as f32 / 100.0);
     app.set_close_action(stored.close_action.index());
+    app.set_check_updates(stored.check_updates);
     if let Some(hotkeys) = &hotkeys {
         hotkeys.set_ptt(stored.ptt_key);
     }
@@ -209,10 +227,12 @@ fn run() -> Result<(), Failure> {
     wire_settings(&app, &state, hotkeys.clone());
     wire_scan(&app, &state);
     wire_close(&app, &state);
+    wire_update(&app, &state);
     let tray = wire_tray(&app, &state);
     TRAY.with(|slot| *slot.borrow_mut() = tray);
     load_devices(&app, &state);
     spawn_status_poll(app.as_weak(), Arc::clone(&state));
+    listen_for_other_instances(&app, &state, instance_key);
     if let Some(hotkeys) = hotkeys {
         spawn_ptt_poll(app.as_weak(), Arc::clone(&state), hotkeys);
     }
@@ -239,6 +259,129 @@ fn run() -> Result<(), Failure> {
     result.map_err(Failure::EventLoop)?;
     Ok(())
 }
+
+/// 检查更新：开关、「去下载」，以及启动时查一次。
+fn wire_update(app: &App, state: &Arc<Mutex<State>>) {
+    {
+        let state = Arc::clone(state);
+        let weak = app.as_weak();
+        app.on_set_check_updates(move |on| {
+            let mut locked = state.lock().expect("state poisoned");
+            locked.settings.check_updates = on;
+            let _ = locked.settings.save();
+            if let Some(app) = weak.upgrade() {
+                app.set_check_updates(on);
+            }
+        });
+    }
+    // 查到的发布页地址。只有检查更新那条路会写它，而且只写 GitHub 上本仓库的地址。
+    let url = Arc::new(Mutex::new(String::new()));
+    {
+        let url = Arc::clone(&url);
+        app.on_open_update(move || open_in_browser(&url.lock().expect("url poisoned")));
+    }
+    if !state.lock().expect("state poisoned").settings.check_updates {
+        return;
+    }
+    let weak = app.as_weak();
+    update::check_in_background(move |available| {
+        let _ = weak.upgrade_in_event_loop(move |app| {
+            *url.lock().expect("url poisoned") = available.url;
+            app.set_update_version(available.version.into());
+        });
+    });
+}
+
+#[cfg(windows)]
+fn open_in_browser(url: &str) {
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    // 只打开 https 的网址：ShellExecute 什么都能「打开」，包括本地程序。
+    if !url.starts_with("https://") {
+        return;
+    }
+    let wide = |s: &str| s.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
+    let (verb, target) = (wide("open"), wide(url));
+    // SAFETY: 两个字符串以 0 结尾，活到调用结束；其余参数为空。
+    unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            target.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn open_in_browser(_url: &str) {}
+
+/// 收别的 `gouhuo.exe` 转交过来的链接（用户又点了一条邀请链接，或者又双击了图标）。
+fn listen_for_other_instances(app: &App, state: &Arc<Mutex<State>>, key: &str) {
+    let weak = app.as_weak();
+    let state = Arc::clone(state);
+    let served = single_instance::serve(key, move |message| {
+        let state = Arc::clone(&state);
+        let _ = weak.upgrade_in_event_loop(move |app| on_forwarded(&app, &state, &message));
+    });
+    if let Err(e) = served {
+        // 没它也能用，只是点链接会再开一个、把这边顶下去（跟没做单实例时一样）。
+        eprintln!("收不了别的实例转交的链接：{e}");
+    }
+}
+
+fn on_forwarded(app: &App, state: &Arc<Mutex<State>>, message: &str) {
+    // 不管带没带链接，先把窗口叫出来：收在托盘里的时候再点一次图标，
+    // 用户要的就是看到窗口。
+    let _ = app.show();
+    app.window().set_minimized(false);
+    bring_to_front(app);
+
+    // 只认邀请链接，跟命令行参数一个规矩。
+    let link = message.trim();
+    if !link.starts_with(protocol::URL_PREFIX) || app.get_connecting() {
+        return;
+    }
+    if app.get_connected() {
+        let current = state
+            .lock()
+            .expect("state poisoned")
+            .settings
+            .last_invite
+            .clone();
+        if current == link {
+            return;
+        }
+        // 点了另一个服务器的链接：离开这边，去那边。点链接这个动作本身就是
+        // 「我要去那儿」，再问一句只是多一步。
+        app.invoke_leave();
+    }
+    app.set_invite_link(link.into());
+    app.invoke_join();
+}
+
+/// 把窗口拉到最前面。转交的那个进程已经用 AllowSetForegroundWindow 把权限让给我们了，
+/// 不然 Windows 只会让任务栏按钮闪一下。
+#[cfg(windows)]
+fn bring_to_front(app: &App) {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use windows_sys::Win32::UI::WindowsAndMessaging::SetForegroundWindow;
+
+    let handle = app.window().window_handle();
+    let Ok(handle) = handle.window_handle() else {
+        return;
+    };
+    let RawWindowHandle::Win32(win32) = handle.as_raw() else {
+        return;
+    };
+    // SAFETY: hwnd 来自窗口系统本身。
+    unsafe { SetForegroundWindow(win32.hwnd.get() as *mut core::ffi::c_void) };
+}
+
+#[cfg(not(windows))]
+fn bring_to_front(_app: &App) {}
 
 /// 让标题栏跟着窗口一起是深色的。
 ///

@@ -22,7 +22,28 @@ slint = { workspace = true, features = ["raw-window-handle-06"] }
 raw-window-handle = "0.6"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Time", "Win32_Graphics_Dwm", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Time",
+    "Win32_Graphics_Dwm",
+    "Win32_UI_WindowsAndMessaging",
+    # 只开一个实例、把链接转交给已经在跑的那个：见 src/single_instance.rs
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+    # 检查更新（src/update.rs）和打开下载页
+    "Win32_Networking_WinHttp",
+    "Win32_UI_Shell",
+] }
 
 [build-dependencies]
 slint-build.workspace = true
+# 把图标和版本信息编进 exe（Windows 资源）。它负责找到 Windows SDK 的 rc.exe。
+embed-resource = "3"
+
+[dev-dependencies]
+# 只给 examples/make_icon.rs 用：从 SVG 生成 exe 图标。跟 Slint 自己用的是同一个版本，
+# 不多编一份。
+resvg = "0.48"

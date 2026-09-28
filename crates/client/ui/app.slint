@@ -123,6 +123,41 @@ export component Tray inherits SystemTrayIcon {
     }
 }
 
+/// 「有新版本」那一条。不挡着什么，点 × 这次就不再提。
+component UpdateBar inherits Rectangle {
+    in property <string> version;
+    callback open();
+    callback dismiss();
+
+    background: #1d2330;
+    border-radius: Theme.radius;
+    HorizontalLayout {
+        padding: 10px;
+        padding-left: 14px;
+        spacing: 8px;
+        Text {
+            text: "篝火有新版本了：" + root.version;
+            color: Theme.text;
+            font-size: 13px;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+            wrap: word-wrap;
+        }
+        Btn {
+            width: 72px;
+            label: "去下载";
+            primary: true;
+            clicked => { root.open(); }
+        }
+        Btn {
+            width: 36px;
+            label: "×";
+            accessible-label: "这次不提了";
+            clicked => { root.dismiss(); }
+        }
+    }
+}
+
 export component App inherits Window {
     title: "篝火";
     icon: @image-url("icons/flame.svg");
@@ -249,6 +284,13 @@ export component App inherits Window {
     /// 照着「阿狸进来了」的样子响一遍，调音量用。
     callback preview-cues();
 
+    // ---- 更新 ----
+    /// 有新版本时是它的版本号，没有是空的。
+    in-out property <string> update-version;
+    callback open-update();
+    in-out property <bool> check-updates: true;
+    callback set-check-updates(bool);
+
     // ---- 关闭 ----
     /// 点 × 时怎么办：0 每次问，1 收到托盘，2 退出。
     in-out property <int> close-action: 0;
@@ -332,6 +374,12 @@ export component App inherits Window {
                         wrap: word-wrap;
                     }
                 }
+            }
+
+            if root.update-version != "": UpdateBar {
+                version: root.update-version;
+                open => { root.open-update(); }
+                dismiss => { root.update-version = ""; }
             }
 
             // 连不上的时候最想确认的就是「是不是我麦克风的问题」，
@@ -850,6 +898,12 @@ export component App inherits Window {
                 }
                 Rectangle { height: 1px; background: Theme.line; }
 
+                if root.update-version != "": UpdateBar {
+                    version: root.update-version;
+                    open => { root.open-update(); }
+                    dismiss => { root.update-version = ""; }
+                }
+
                 if root.reconnecting != "": Rectangle {
                     background: #2a251a;
                     HorizontalLayout {
@@ -1289,6 +1343,21 @@ export component App inherits Window {
                     }
                     Text {
                         text: "没连着服务器的时候点 × 总是直接退出。收到托盘之后，托盘图标上看得出麦克风开没开。";
+                        color: Theme.faint;
+                        font-size: 11px;
+                        wrap: word-wrap;
+                    }
+
+                    HorizontalLayout {
+                        spacing: 6px;
+                        Btn {
+                            label: root.check-updates ? "启动时检查更新：开" : "启动时检查更新：关";
+                            primary: root.check-updates;
+                            clicked => { root.set-check-updates(!root.check-updates); }
+                        }
+                    }
+                    Text {
+                        text: "只去 GitHub 看一眼最新的版本号，什么都不上传。有新版本就在窗口里提一句，不会自己下载、自己装。";
                         color: Theme.faint;
                         font-size: 11px;
                         wrap: word-wrap;
