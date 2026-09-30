@@ -162,7 +162,8 @@ impl std::fmt::Display for ApmModule {
 use std::sync::Mutex;
 
 use sonora::config::{
-    EchoCanceller, GainController2, HighPassFilter, NoiseSuppression, NoiseSuppressionLevel,
+    AdaptiveDigital, EchoCanceller, GainController2, HighPassFilter, NoiseSuppression,
+    NoiseSuppressionLevel,
 };
 use sonora::{AudioProcessing, Config, StreamConfig};
 
@@ -305,9 +306,17 @@ fn build_config(cfg: ApmConfig) -> Config {
             // 上游叫 analyze_linear_aec_output，这边叫 ..._when_available，同一个东西。
             analyze_linear_aec_output_when_available: false,
         }),
-        // 两边的 GainController2 都是 derive 的 Default（adaptive_digital: None），
-        // 所以 default() 在两个后端里是同一个意思。
-        gain_controller2: cfg.gain_control.then_some(GainController2::default()),
+        // 默认 adaptive_digital=None 不会自动调音量。限制增益，避免猛抬底噪。
+        // 历史 C++/Rust A/B 使用的都是关闭自适应增益的旧配置，不能沿用其性能数字。
+        gain_controller2: cfg.gain_control.then_some(GainController2 {
+            adaptive_digital: Some(AdaptiveDigital {
+                max_gain_db: 20.0,
+                initial_gain_db: 0.0,
+                max_gain_change_db_per_second: 3.0,
+                ..AdaptiveDigital::default()
+            }),
+            ..GainController2::default()
+        }),
         ..Default::default()
     }
 }
@@ -317,6 +326,53 @@ mod tests {
     use super::*;
 
     const RATE: u32 = 48_000;
+
+    #[test]
+    fn adaptive_gain_does_not_create_sound_from_silence() {
+        let apm = Apm::new(RATE, ApmConfig::only(ApmModule::GainControl)).unwrap();
+        for _ in 0..300 {
+            let mut frame = vec![0.0; 480];
+            apm.process_capture(&mut frame).unwrap();
+            assert!(frame.iter().all(|s| s.is_finite() && s.abs() < 1e-7));
+        }
+    }
+
+    #[test]
+    fn adaptive_gain_actually_amplifies_quiet_voiced_input() {
+        let apm = Apm::new(RATE, ApmConfig::only(ApmModule::GainControl)).unwrap();
+        let mut input_energy = 0.0f64;
+        let mut output_energy = 0.0f64;
+        for k in 0..800 {
+            let mut frame: Vec<f32> = (0..480)
+                .map(|i| {
+                    let t = (k * 480 + i) as f32 / RATE as f32;
+                    let envelope = 0.4 + 0.6 * (std::f32::consts::TAU * 3.0 * t).sin().powi(2);
+                    envelope
+                        * (1..=12)
+                            .map(|harmonic| {
+                                0.008 / harmonic as f32
+                                    * (std::f32::consts::TAU * 150.0 * harmonic as f32 * t).sin()
+                            })
+                            .sum::<f32>()
+                })
+                .collect();
+            if k >= 700 {
+                input_energy += frame.iter().map(|s| f64::from(*s).powi(2)).sum::<f64>();
+            }
+            apm.process_capture(&mut frame).unwrap();
+            assert!(frame.iter().all(|s| s.is_finite() && s.abs() <= 1.0));
+            if k >= 700 {
+                output_energy += frame.iter().map(|s| f64::from(*s).powi(2)).sum::<f64>();
+            }
+        }
+        let gain_db = 10.0 * (output_energy / input_energy).log10();
+        // VAD treats synthetic harmonics conservatively. Require measurable gain,
+        // rather than assuming this fixture has the confidence of human speech.
+        assert!(
+            (0.5..=20.5).contains(&gain_db),
+            "quiet voiced gain: {gain_db:.2} dB"
+        );
+    }
 
     #[test]
     fn frame_is_ten_milliseconds() {

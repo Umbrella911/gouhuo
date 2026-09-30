@@ -10,6 +10,10 @@ rust-version = "1.91"
 license = "MPL-2.0"
 description = "客户端语音内核：音频 IO / APM / Opus / 抖动缓冲 / 传输 / 热键。M1 只含抖动缓冲、实时时钟与度量。"
 
+[[example]]
+name = "quality-probe"
+required-features = ["pipeline", "apm"]
+
 [features]
 # 默认带上 APM。客户端要它，服务端不要 —— 见下。
 default = ["pipeline", "apm"]

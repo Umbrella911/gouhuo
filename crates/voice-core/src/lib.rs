@@ -20,6 +20,7 @@ pub mod cue;
 pub mod hotkey;
 pub mod identity;
 pub mod jitter;
+pub mod limiter;
 pub mod metrics;
 #[cfg(feature = "pipeline")]
 pub mod miccheck;

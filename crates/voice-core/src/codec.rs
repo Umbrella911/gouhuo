@@ -27,10 +27,9 @@ pub const MAX_PACKET: usize = 400;
 
 /// 默认码率。
 ///
-/// 24 kbps 在 Opus 的语音模式下已经很干净了。带宽产品线是说话时 80 kbps，
-/// 那里面还要算上包头（13 字节）、AEAD tag（16 字节）和 IP/UDP（28 字节）——
-/// 50 包/秒下光这些就是 22.8 kbps。
-pub const DEFAULT_BITRATE: i32 = 24_000;
+/// 32 kbps 是待真人盲听验收的默认候选。10 ms 帧、IPv4 时固定开销
+/// 为 45.6 kbps，总计约 77.6 kbps；实际 VBR/FEC 开销由 quality-probe 报告。
+pub const DEFAULT_BITRATE: i32 = 32_000;
 
 /// 编码复杂度。
 ///
@@ -45,8 +44,13 @@ pub struct VoiceEncoder {
 
 impl VoiceEncoder {
     pub fn new() -> Result<Self, opus::Error> {
+        Self::with_bitrate(DEFAULT_BITRATE)
+    }
+
+    /// 测量工具/高音质调用方可选择码率，其余配置与线上保持一致。
+    pub fn with_bitrate(bitrate: i32) -> Result<Self, opus::Error> {
         let mut encoder = Encoder::new(SAMPLE_RATE, Channels::Mono, Application::Voip)?;
-        encoder.set_bitrate(Bitrate::Bits(DEFAULT_BITRATE))?;
+        encoder.set_bitrate(Bitrate::Bits(bitrate))?;
         encoder.set_complexity(DEFAULT_COMPLEXITY)?;
         encoder.set_signal(Signal::Voice)?;
         encoder.set_inband_fec(true)?;

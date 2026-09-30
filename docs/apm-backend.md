@@ -1,5 +1,9 @@
 # APM 用哪个后端：C++ 的 libwebrtc，还是纯 Rust 的 sonora
 
+> 音质修复后显式启用了 adaptive_digital（最大增益 20 dB、初始 0 dB、
+> 每秒最大变化 3 dB）。本文历史 A/B 中的两端都没有启用自适应增益；
+> CPU、延迟及声学数字不能作为新配置的验收结果。见 [音质验收](audio-quality.md)。
+
 > **状态：已经换了。** C++ 那份、`third_party/` 和 `[patch.crates-io]` 都删掉了，
 > APM 现在默认开着 —— `git clone` 完 `cargo run` 跑出来的客户端带回声消除和降噪，
 > 不需要装任何东西。
