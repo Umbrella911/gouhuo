@@ -18,8 +18,8 @@
 mod imp {
     use std::io;
     use windows_sys::Win32::Foundation::{
-        CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
-        GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+        CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, ERROR_NO_DATA, ERROR_PIPE_BUSY,
+        ERROR_PIPE_CONNECTED, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, FlushFileBuffers, ReadFile, WriteFile, OPEN_EXISTING, PIPE_ACCESS_INBOUND,
@@ -158,8 +158,7 @@ mod imp {
                 let mut handle = first as HANDLE;
                 loop {
                     // SAFETY: handle 是建好还没连过的管道；阻塞等一个客户端连上来。
-                    let connected = unsafe { ConnectNamedPipe(handle, std::ptr::null_mut()) } != 0
-                        || unsafe { GetLastError() } == ERROR_PIPE_CONNECTED;
+                    let connected = connect_pipe(handle);
                     let next = create_pipe(&name);
                     if connected {
                         if let Some(message) = read_all(handle) {
@@ -177,6 +176,19 @@ mod imp {
                 }
             })?;
         Ok(())
+    }
+
+    fn connect_pipe(handle: HANDLE) -> bool {
+        // SAFETY: handle 是新建的管道实例。
+        if unsafe { ConnectNamedPipe(handle, std::ptr::null_mut()) } != 0 {
+            return true;
+        }
+        // 空消息没有字节需要 flush，发送端可能在 accept 前就已关闭。
+        // ERROR_NO_DATA 仍表示发生过连接，读出空消息以唤起原窗口。
+        matches!(
+            unsafe { GetLastError() },
+            ERROR_PIPE_CONNECTED | ERROR_NO_DATA
+        )
     }
 
     fn read_all(handle: HANDLE) -> Option<String> {
@@ -205,6 +217,40 @@ mod imp {
             }
         }
         String::from_utf8(out).ok()
+    }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn empty_client_closed_before_accept_is_still_a_message() {
+            let (_, name) = names(&format!("closed-empty-{}", std::process::id()));
+            let name = wide(&name);
+            let server = create_pipe(&name);
+            assert_ne!(server, INVALID_HANDLE_VALUE);
+            // 确定性重现：客户端在接收线程调用 ConnectNamedPipe 前完成空消息并关闭。
+            let client = unsafe {
+                CreateFileW(
+                    name.as_ptr(),
+                    GENERIC_WRITE,
+                    0,
+                    std::ptr::null(),
+                    OPEN_EXISTING,
+                    0,
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_ne!(client, INVALID_HANDLE_VALUE);
+            unsafe { CloseHandle(client) };
+            let connected = connect_pipe(server);
+            let message = connected.then(|| read_all(server)).flatten();
+            unsafe {
+                DisconnectNamedPipe(server);
+                CloseHandle(server);
+            }
+            assert!(connected, "空消息的客户端提前关闭不应丢掉这次点击");
+            assert_eq!(message.as_deref(), Some(""));
+        }
     }
 }
 
