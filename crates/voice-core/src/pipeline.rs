@@ -844,12 +844,9 @@ fn play_loop(
             mix.fill(0.0);
         }
 
-        // 多路叠加会超出 ±1。硬截会变成方波（很难听的失真），
-        // 用 tanh 把峰值压回来 —— 小信号几乎不变，大信号平滑地压缩。
+        // 多路叠加会超出 ±1。低电平不变，拐点处幅度和斜率都连续。
         for sample in mix.iter_mut() {
-            if sample.abs() > 0.7 {
-                *sample = sample.tanh();
-            }
+            *sample = crate::limiter::soft_limit(*sample);
         }
 
         // **播之前**告诉 APM 我们要播什么，它才能把回声消掉。

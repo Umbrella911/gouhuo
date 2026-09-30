@@ -112,7 +112,9 @@ jobs:
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: test
-        run: cargo test --workspace
+        run: |
+          cargo test --workspace
+          cargo test -p voice-core --example quality-probe
 
   # 延迟数字**不在这里测**。
   #
