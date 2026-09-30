@@ -449,3 +449,23 @@ fn silent_connection_is_eventually_dropped() {
 fn clone_identity(identity: &Identity) -> Identity {
     Identity::import(&identity.export()).unwrap()
 }
+
+/// 0.1.x 的协议 v1 必须在进入认证前明确拒绝。
+#[test]
+fn legacy_v1_is_rejected_before_authentication() {
+    let server = open_server();
+    let mut old = Client::connect(&server);
+    old.send(Hello {
+        protocol_version: 1,
+        client_version: "0.1.1".into(),
+        public_key: old.identity.public_key().0.to_vec(),
+    });
+    let Some(server_message::Payload::Rejected(rejected)) = old.recv().payload else {
+        panic!("旧客户端没有收到版本拒绝")
+    };
+    assert_eq!(
+        rejected.reason,
+        protocol::control::rejected::Reason::VersionMismatch as i32
+    );
+    assert_eq!(server.hub.user_count(), 0);
+}

@@ -169,6 +169,7 @@ pub struct Client {
 }
 
 pub struct VoiceKeys {
+    pub sequences: Arc<protocol::VoiceSequences>,
     pub upstream: VoiceKey,
     pub downstream: VoiceKey,
 }
@@ -348,6 +349,12 @@ impl Client {
     /// 当前这次连接的语音密钥。**重连之后会变。**
     pub fn voice_keys(&self) -> Arc<VoiceKeys> {
         Arc::clone(&self.shared.link().voice)
+    }
+
+    /// 同一次连接的会话、端口与密钥/序号快照，避免重连时分别取值混用新旧连接。
+    pub fn voice_session(&self) -> (u32, u16, Arc<VoiceKeys>) {
+        let link = self.shared.link();
+        (link.session_id, link.udp_port, Arc::clone(&link.voice))
     }
 
     /// 借出名单来画界面。**别在持有它的时候做慢事情** ——
@@ -759,6 +766,7 @@ fn establish(
     // 语音密钥在这里就有了 —— 不另起握手，见 transport::derive_voice_key。
     // 每条连接一对新的：重连换了连接就换了密钥，序号从头来也不会撞上防重放窗口。
     let voice = VoiceKeys {
+        sequences: Arc::new(protocol::VoiceSequences::default()),
         upstream: derive_voice_key(&conn, UPSTREAM)
             .map_err(|e| ConnectError::Tls(e.to_string()))?,
         downstream: derive_voice_key(&conn, DOWNSTREAM)

@@ -27,9 +27,14 @@ rustls.workspace = true
 getrandom.workspace = true
 # 频道树的存档，见 src/store.rs
 rusqlite.workspace = true
+# 控制面等待可读/可写事件，不使用会吞数据的 socket 读超时。
+polling = "3"
 
 [dev-dependencies]
 protocol.workspace = true
 transport.workspace = true
 voice-core = { workspace = true, default-features = false }
 rustls.workspace = true
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { workspace = true, features = ["Win32_Networking_WinSock"] }

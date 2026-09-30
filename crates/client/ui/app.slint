@@ -221,6 +221,9 @@ export component App inherits Window {
     in-out property <bool> self-deafened: false;
     // UDP 通不通。不通的时候要让用户看见，而不是让他纳闷为什么没声音。
     in property <bool> udp-ok: false;
+    in property <bool> udp-failed: false;
+    in property <string> diagnostics;
+    in-out property <bool> diagnostics-open: false;
     // 语音那边出的错（设备打不开、采样率不对）。要能直接显示给用户。
     in property <string> voice-error;
     // 连接断了、正在自己重连时的说明。空表示没在重连。
@@ -282,6 +285,8 @@ export component App inherits Window {
     in-out property <float> cue-volume: 0.6;
 
     // ---- 回调 ----
+    callback retry-voice();
+    callback show-diagnostics();
     callback join();
     callback leave();
     callback join-channel(int);
@@ -882,7 +887,7 @@ export component App inherits Window {
                                         : root.voice-error != ""
                                         ? "语音出错"
                                         : (!root.udp-ok
-                                            ? "语音连接中…"
+                                            ? (root.udp-failed ? "语音网络未连通" : "语音连接中…")
                                             : (root.ptt-mode
                                                 ? (root.ptt-label == ""
                                                     ? "没绑说话键"
@@ -1026,6 +1031,51 @@ export component App inherits Window {
                             font-size: 12px;
                             wrap: word-wrap;
                         }
+                    }
+                }
+
+                if root.udp-failed && root.reconnecting == "": Rectangle {
+                    background: #2a1d1d;
+                    VerticalLayout {
+                        padding: 12px;
+                        Text {
+                            text: "语音网络没有连通。请让服主检查语音端口的 UDP 防火墙和端口转发；文字连接正常也不代表语音能通。";
+                            color: Theme.warn;
+                            font-size: 12px;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
+                HorizontalLayout {
+                    padding-left: 12px;
+                    padding-right: 12px;
+                    spacing: 8px;
+                    if root.voice-error != "" || root.udp-failed: Btn {
+                        label: "重试语音";
+                        enabled: root.reconnecting == "";
+                        clicked => { root.retry-voice(); }
+                    }
+                    Btn {
+                        label: "诊断信息";
+                        clicked => { root.show-diagnostics(); }
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                }
+                if root.diagnostics-open: Rectangle {
+                    background: Theme.panel;
+                    VerticalLayout {
+                        padding: 12px;
+                        spacing: 6px;
+                        Text { text: "选中下面的文字，Ctrl+C 复制；点诊断信息可刷新。"; color: Theme.dim; font-size: 12px; wrap: word-wrap; }
+                        TextInput {
+                            text: root.diagnostics;
+                            read-only: true;
+                            single-line: false;
+                            color: Theme.text;
+                            font-size: 12px;
+                            height: 180px;
+                        }
+                        Btn { label: "收起诊断"; clicked => { root.diagnostics-open = false; } }
                     }
                 }
 

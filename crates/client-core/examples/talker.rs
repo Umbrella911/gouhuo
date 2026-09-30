@@ -14,6 +14,7 @@
 //! 界面上「在说话」只看有没有收到包，跟音量无关，调界面时不用听一屋子嗡嗡声。
 
 use std::io;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use client_core::Client;
@@ -94,7 +95,8 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let Some(server) = format!("{}:{}", client.server_host(), client.udp_port())
+    let (session_id, udp_port, keys) = client.voice_session();
+    let Some(server) = format!("{}:{}", client.server_host(), udp_port)
         .parse()
         .ok()
     else {
@@ -105,11 +107,11 @@ fn main() {
         );
         std::process::exit(1);
     };
-    let keys = client.voice_keys();
     let _voice = Pipeline::start(
         PipelineConfig {
-            session_id: client.session_id(),
+            session_id,
             server,
+            sequences: Arc::clone(&keys.sequences),
             upstream_key: *keys.upstream.as_bytes(),
             downstream_key: *keys.downstream.as_bytes(),
             jitter: default_jitter(),

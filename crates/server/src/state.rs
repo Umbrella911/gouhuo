@@ -249,7 +249,8 @@ pub struct Server {
     config: Config,
     channels: BTreeMap<ChannelId, ChannelInfo>,
     users: BTreeMap<SessionId, UserInfo>,
-    next_session: SessionId,
+    // 下行 nonce 包含来源 session；同一次服务器运行期间禁止回绕复用。
+    next_session: u64,
     root: ChannelId,
     /// 下一个要发的频道 id。**只增不减**，见 [`Server::next_channel_id`]。
     next_channel: ChannelId,
@@ -442,6 +443,7 @@ impl Server {
         invite_code: &str,
         desired_name: &str,
     ) -> Result<Admitted, Denied> {
+        let session_id = u32::try_from(self.next_session).map_err(|_| Denied::Full)?;
         let configured_admin = self.config.admin_keys.contains(&public_key);
         if self.bans.contains_key(&public_key) && !configured_admin {
             return Err(Denied::Banned);
@@ -490,8 +492,7 @@ impl Server {
             self.changes.push(Change::AdminClaimUsed);
         }
 
-        let session_id = self.next_session;
-        self.next_session = self.next_session.wrapping_add(1).max(1);
+        self.next_session += 1;
 
         let name = self.unique_name(desired_name);
         let user = UserInfo {
@@ -2162,5 +2163,19 @@ mod tests {
 
         server.delete_channel(owner, id);
         assert_eq!(server.take_changes(), vec![Change::ChannelRemoved(id)]);
+    }
+    #[test]
+    fn session_exhaustion_cannot_reuse_downstream_nonces_or_displace_users() {
+        let mut server = Server::new(Config::default());
+        let first = server.admit(key(1), "", "first").unwrap().session_id;
+        server.next_session = u32::MAX as u64;
+        assert_eq!(
+            server.admit(key(2), "", "last").unwrap().session_id,
+            u32::MAX
+        );
+        assert_eq!(server.admit(key(3), "", "overflow"), Err(Denied::Full));
+        assert_eq!(server.admit(key(1), "", "reconnect"), Err(Denied::Full));
+        assert!(server.users.contains_key(&first));
+        assert_eq!(server.user_count(), 2);
     }
 }

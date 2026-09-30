@@ -26,7 +26,7 @@ use rustls::ConnectionCommon;
 pub const VOICE_KEY_LEN: usize = 32;
 
 /// 派生标签。**改用途就换标签**，见模块文档。
-pub const VOICE_KEY_LABEL: &[u8] = b"gouhuo voice udp v1";
+pub const VOICE_KEY_LABEL: &[u8] = b"gouhuo voice udp v2";
 
 /// 上行：客户端发给服务端的语音。
 pub const UPSTREAM: &[u8] = b"client-to-server";
@@ -96,7 +96,7 @@ mod tests {
     #[test]
     fn label_carries_a_version() {
         let label = std::str::from_utf8(VOICE_KEY_LABEL).unwrap();
-        assert!(label.contains("v1"), "标签必须带版本，见模块文档");
+        assert!(label.contains("v2"), "标签必须与当前协议版本一致");
         assert!(label.starts_with("gouhuo"), "带上项目名，避免跟别的用途撞");
     }
 

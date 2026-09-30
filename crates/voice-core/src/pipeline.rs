@@ -164,6 +164,8 @@ impl TransmitMode {
 }
 
 pub struct PipelineConfig {
+    /// 必须与 upstream_key 的生命周期一致，换设备时继续共享。
+    pub sequences: Arc<protocol::VoiceSequences>,
     pub session_id: u32,
     pub server: SocketAddr,
     pub upstream_key: [u8; 32],
@@ -176,6 +178,9 @@ pub struct PipelineConfig {
 /// 界面要显示的东西。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct VoiceStats {
+    pub sequences_exhausted: bool,
+    pub udp_failed: bool,
+    pub error: Option<String>,
     /// UDP 那条路通不通（保活有没有回来）。不通就该退回 TCP 传语音。
     pub udp_ok: bool,
     /// 最近一次保活的往返时间，毫秒。
@@ -239,6 +244,7 @@ impl Speaker {
 
 /// 一条跑着的语音链路。丢掉它就会把所有线程停下来。
 pub struct Pipeline {
+    sequences: Arc<protocol::VoiceSequences>,
     stop: Arc<AtomicBool>,
     transmitting: Arc<AtomicBool>,
     muted: Arc<AtomicBool>,
@@ -251,6 +257,7 @@ pub struct Pipeline {
 }
 
 struct Shared {
+    error: Mutex<Option<String>>,
     speakers: Mutex<BTreeMap<u32, Speaker>>,
     /// 每个人的音量，按会话 id。**跟 [`Speaker`] 分开存**：
     ///
@@ -325,6 +332,7 @@ impl Pipeline {
         let mode = Arc::new(AtomicU32::new(cfg.mode.encode()));
         let monitoring = Arc::new(AtomicBool::new(false));
         let shared = Arc::new(Shared {
+            error: Mutex::new(None),
             speakers: Mutex::new(BTreeMap::new()),
             volumes: Mutex::new(BTreeMap::new()),
             cues: Arc::new(CueQueue::new()),
@@ -355,6 +363,7 @@ impl Pipeline {
             let key = cfg.upstream_key;
             let server = cfg.server;
             let mode = Arc::clone(&mode);
+            let sequences = Arc::clone(&cfg.sequences);
             threads.push(spawn("gouhuo-voice-send", move || {
                 send_loop(
                     &mut *capture,
@@ -369,6 +378,7 @@ impl Pipeline {
                     key,
                     server,
                     mode,
+                    sequences,
                 );
             })?);
         }
@@ -404,12 +414,14 @@ impl Pipeline {
             let key = cfg.upstream_key;
             let server = cfg.server;
             let shared = Arc::clone(&shared);
+            let sequences = Arc::clone(&cfg.sequences);
             threads.push(spawn("gouhuo-voice-keepalive", move || {
-                keepalive_loop(socket, &stop, &shared, session_id, key, server);
+                keepalive_loop(socket, &stop, &shared, session_id, key, server, sequences);
             })?);
         }
 
         Ok(Self {
+            sequences: cfg.sequences,
             stop,
             transmitting,
             muted,
@@ -519,6 +531,14 @@ impl Pipeline {
             && self.shared.now_ms().saturating_sub(last) < UDP_DEAD_AFTER.as_millis() as u64;
 
         VoiceStats {
+            sequences_exhausted: self.sequences.exhausted(),
+            udp_failed: !udp_ok && self.shared.started.elapsed() >= UDP_DEAD_AFTER,
+            error: self
+                .shared
+                .error
+                .lock()
+                .expect("voice error poisoned")
+                .clone(),
             udp_ok,
             rtt_ms: self.shared.rtt_us.load(Ordering::Relaxed) as f64 / 1000.0,
             packets_sent: self.shared.packets_sent.load(Ordering::Relaxed),
@@ -573,6 +593,7 @@ fn send_loop(
     key: [u8; 32],
     server: SocketAddr,
     mode: Arc<AtomicU32>,
+    sequences: Arc<protocol::VoiceSequences>,
 ) {
     // 音频线程要优先于游戏线程被调度，否则一次掉帧就是一次爆音。
     crate::clock::boost_current_thread();
@@ -584,18 +605,22 @@ fn send_loop(
 
     let mut frame = vec![0.0f32; FRAME_SAMPLES];
     let mut wire = Vec::with_capacity(MAX_DATAGRAM);
-    let mut seq: u32 = 0;
     // 采样时钟：**每采一帧都加**，不管发没发。这样对面能从时间戳上看出
     // 中间静默了多久，而不是以为包丢了。
-    let mut timestamp: u32 = 0;
     let mut was_sending = false;
 
     while !stop.load(Ordering::Relaxed) {
         match capture.read(&mut frame) {
             Ok(true) => {}
-            _ => return,
+            Ok(false) => return,
+            Err(error) => {
+                *shared.error.lock().expect("voice error poisoned") = Some(format!(
+                    "麦克风无法继续录音：{error}。请检查设备后点重试语音，或在设置里换一个麦克风。"
+                ));
+                return;
+            }
         }
-        timestamp = timestamp.wrapping_add(FRAME_SAMPLES as u32);
+        let timestamp = sequences.advance_samples(FRAME_SAMPLES as u32);
 
         if let Some(processor) = &processor {
             processor.process_capture(&mut frame);
@@ -631,6 +656,9 @@ fn send_loop(
         if !sending {
             if was_sending {
                 // 说完了。补一个 terminator，对面立刻收尾而不是等欠载。
+                let Some(seq) = sequences.next(false) else {
+                    return;
+                };
                 let header = VoiceHeader {
                     session: session_id,
                     seq,
@@ -640,7 +668,6 @@ fn send_loop(
                 if cipher.seal(header, &[], &mut wire).is_ok() {
                     let _ = socket.send_to(&wire, server);
                 }
-                seq = seq.wrapping_add(1);
                 was_sending = false;
             }
             continue;
@@ -648,6 +675,9 @@ fn send_loop(
 
         let Ok(packet) = encoder.encode(&frame) else {
             continue;
+        };
+        let Some(seq) = sequences.next(false) else {
+            return;
         };
         let header = VoiceHeader {
             session: session_id,
@@ -658,7 +688,6 @@ fn send_loop(
         if cipher.seal(header, packet, &mut wire).is_ok() && socket.send_to(&wire, server).is_ok() {
             shared.packets_sent.fetch_add(1, Ordering::Relaxed);
         }
-        seq = seq.wrapping_add(1);
         was_sending = true;
     }
 }
@@ -827,7 +856,8 @@ fn play_loop(
         if let Some(processor) = &processor {
             processor.analyze_render(&mut mix);
         }
-        if render.write(&mix).is_err() {
+        if let Err(error) = render.write(&mix) {
+            *shared.error.lock().expect("voice error poisoned") = Some(format!("耳机或扬声器无法继续播放：{error}。请检查设备后点重试语音，或在设置里换一个输出设备。"));
             return;
         }
     }
@@ -840,19 +870,22 @@ fn keepalive_loop(
     session_id: u32,
     key: [u8; 32],
     server: SocketAddr,
+    sequences: Arc<protocol::VoiceSequences>,
 ) {
     let cipher = VoiceCipher::new(&key);
     let mut wire = Vec::with_capacity(VOICE_HEADER_LEN + 32);
-    // 保活自己的序号，从 0 开始正着走。服务端给保活留了**单独的防重放窗口**，
+    // 保活序号从连接的共享计数器取，只有换密钥才从 0 开始。服务端留了单独防重放窗口，
     // 所以它跟语音的序号互不干扰 —— 两边都得这么认。
     //
     // 第一版让它从 u32::MAX 倒着走，结果是：语音每秒把窗口推进 100，
     // 两秒后倒着走的保活序号已经落在窗口外，被当成重放丢掉。
     // 表现是「UDP 时通时不通」，而语音本身看着一切正常。
-    let mut seq: u32 = 0;
     // 一上来立刻发一个：服务端要靠它学到我们的地址，不然只听不说的人
     // 会完全听不见声音。
     loop {
+        let Some(seq) = sequences.next(true) else {
+            return;
+        };
         let header = VoiceHeader {
             session: session_id,
             seq,
@@ -863,7 +896,6 @@ fn keepalive_loop(
         if cipher.seal(header, &[], &mut wire).is_ok() {
             let _ = socket.send_to(&wire, server);
         }
-        seq = seq.wrapping_add(1);
 
         // 分成小段睡，这样停的时候不用等满一个周期
         let deadline = Instant::now() + KEEPALIVE_INTERVAL;

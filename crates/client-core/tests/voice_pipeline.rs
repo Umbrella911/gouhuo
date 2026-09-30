@@ -91,14 +91,16 @@ fn join(server: &TestServer, name: &str) -> Client {
 }
 
 fn voice_config(client: &Client, server: &TestServer, mode: TransmitMode) -> PipelineConfig {
-    let addr = format!("{}:{}", server.invite.host, client.udp_port())
+    let (session_id, udp_port, keys) = client.voice_session();
+    let addr = format!("{}:{}", server.invite.host, udp_port)
         .parse()
         .expect("服务端给的语音地址解析不了");
     PipelineConfig {
-        session_id: client.session_id(),
+        session_id,
         server: addr,
-        upstream_key: *client.voice_keys().upstream.as_bytes(),
-        downstream_key: *client.voice_keys().downstream.as_bytes(),
+        sequences: Arc::clone(&keys.sequences),
+        upstream_key: *keys.upstream.as_bytes(),
+        downstream_key: *keys.downstream.as_bytes(),
         jitter: default_jitter(),
         mode,
     }
@@ -652,4 +654,186 @@ fn the_input_level_follows_the_microphone() {
         speaking > -45.0,
         "这个信号连默认阈值都过不去，电平算错了：{speaking:.1} dB"
     );
+}
+
+/// 换设备重建两端 Pipeline，沿用 TLS 会话；新语音和保活必须立即通过旧防重放窗口。
+#[test]
+fn rebuilding_devices_preserves_sequences_and_bidirectional_voice() {
+    let server = start_server();
+    let alice = join(&server, "alice");
+    let bob = join(&server, "bob");
+    let make_voice = |client: &Client| {
+        let source = chirp_f32(FRAME_SAMPLES * 200);
+        let (render, played) = CollectingRender::new();
+        let voice = Pipeline::start(
+            voice_config(client, &server, TransmitMode::PushToTalk),
+            Box::new(SyntheticCapture::new(source).then_silence()),
+            Box::new(render),
+            None,
+        )
+        .unwrap();
+        (voice, played)
+    };
+    let (a, _) = make_voice(&alice);
+    let (b, _) = make_voice(&bob);
+    a.set_transmitting(true);
+    b.set_transmitting(true);
+    let wait_for = |condition: &dyn Fn() -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !condition() {
+            assert!(Instant::now() < deadline, "重建后的链路没恢复");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    wait_for(&|| {
+        a.stats().packets_sent > 40
+            && b.stats().packets_sent > 40
+            && a.stats().udp_ok
+            && b.stats().udp_ok
+    });
+    drop(a);
+    drop(b);
+    let a_received = server.hub.voice.packets_received(alice.session_id());
+    let b_received = server.hub.voice.packets_received(bob.session_id());
+    let (a, a_played) = make_voice(&alice);
+    let (b, b_played) = make_voice(&bob);
+    assert!(Arc::ptr_eq(
+        &alice.voice_keys().sequences,
+        &voice_config(&alice, &server, TransmitMode::Always).sequences
+    ));
+    // 重建默认 PTT，闭麦仍然优先；保活必须已经恢复。
+    a.set_muted(true);
+    a.set_transmitting(true);
+    wait_for(&|| a.stats().udp_ok && b.stats().udp_ok);
+    assert_eq!(a.stats().packets_sent, 0);
+    a.set_muted(false);
+    b.set_transmitting(true);
+    wait_for(&|| {
+        server.hub.voice.packets_received(alice.session_id()) > a_received + 20
+            && server.hub.voice.packets_received(bob.session_id()) > b_received + 20
+    });
+    wait_for(&|| {
+        a_played.lock().unwrap().iter().any(|v| v.abs() > 0.05)
+            && b_played.lock().unwrap().iter().any(|v| v.abs() > 0.05)
+    });
+    a.set_transmitting(false);
+    b.set_transmitting(false);
+}
+
+#[test]
+fn a_capture_failure_is_reported_while_receive_remains_available() {
+    struct FailedCapture;
+    impl Capture for FailedCapture {
+        fn read(&mut self, _: &mut [f32]) -> std::io::Result<bool> {
+            Err(std::io::Error::other("设备已拔出"))
+        }
+    }
+    let server = start_server();
+    let alice = join(&server, "alice");
+    let voice = Pipeline::start(
+        voice_config(&alice, &server, TransmitMode::Always),
+        Box::new(FailedCapture),
+        Box::new(NullRender::default()),
+        None,
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let stats = voice.stats();
+        if let Some(error) = stats.error {
+            assert!(error.contains("麦克风"));
+            assert!(error.contains("重试语音"));
+            if stats.udp_ok {
+                break;
+            }
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn a_playback_failure_does_not_stop_sending_voice() {
+    struct FailedRender;
+    impl Render for FailedRender {
+        fn write(&mut self, _: &[f32]) -> std::io::Result<()> {
+            Err(std::io::Error::other("设备已拔出"))
+        }
+    }
+    let server = start_server();
+    let alice = join(&server, "alice");
+    let voice = Pipeline::start(
+        voice_config(&alice, &server, TransmitMode::Always),
+        Box::new(SyntheticCapture::new(vec![0.; FRAME_SAMPLES]).then_silence()),
+        Box::new(FailedRender),
+        None,
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let stats = voice.stats();
+        if let Some(error) = stats.error {
+            assert!(error.contains("播放"));
+            assert!(error.contains("重试语音"));
+            if stats.packets_sent > 10 {
+                break;
+            }
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// UDP 受阻时区分探测中和已超时，网络恢复后提示自动清除。
+#[test]
+fn udp_failure_is_visible_and_clears_after_probes_return() {
+    use protocol::{VoiceCipher, VoiceHeader};
+    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(4)))
+        .unwrap();
+    let voice = Pipeline::start(
+        PipelineConfig {
+            session_id: 1,
+            server: socket.local_addr().unwrap(),
+            sequences: Arc::new(protocol::VoiceSequences::default()),
+            upstream_key: [1; 32],
+            downstream_key: [2; 32],
+            jitter: default_jitter(),
+            mode: TransmitMode::PushToTalk,
+        },
+        Box::new(SyntheticCapture::new(Vec::new()).then_silence()),
+        Box::new(NullRender::default()),
+        None,
+    )
+    .unwrap();
+    assert!(!voice.stats().udp_failed);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !voice.stats().udp_failed {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!voice.stats().udp_ok);
+    // 先丢掉阻塞期间旧探测；用刚发出的探测验证恢复，避免复用旧时间戳。
+    socket.set_nonblocking(true).unwrap();
+    let mut received = [0; 2048];
+    while socket.recv_from(&mut received).is_ok() {}
+    socket.set_nonblocking(false).unwrap();
+    let (n, from) = socket.recv_from(&mut received).unwrap();
+    let mut payload = Vec::new();
+    let header: VoiceHeader = VoiceCipher::new(&[1; 32])
+        .open(&received[..n], &mut payload)
+        .unwrap();
+    assert!(header.is_keepalive());
+    let mut reply = Vec::new();
+    VoiceCipher::new(&[2; 32])
+        .seal(header, &[], &mut reply)
+        .unwrap();
+    socket.send_to(&reply, from).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !voice.stats().udp_ok {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!voice.stats().udp_failed);
 }

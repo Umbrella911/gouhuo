@@ -18,6 +18,7 @@
 //! 而不是散在一个 tokio 任务的七个 await 点之间。
 
 pub mod conn;
+mod control_io;
 pub mod state;
 pub mod store;
 pub mod voice;
@@ -42,13 +43,16 @@ pub fn accept_loop(
                 continue;
             }
         };
+        let Some(admission) = hub.reserve_connection() else {
+            continue;
+        };
         let peer_addr = sock.peer_addr().ok();
         let tls_config = Arc::clone(&tls_config);
         let hub = Arc::clone(&hub);
         let spawned = std::thread::Builder::new()
             .name("gouhuo-conn".into())
             .spawn(move || {
-                if let Err(e) = conn::serve_connection(sock, tls_config, hub) {
+                if let Err(e) = conn::serve_admitted(sock, tls_config, hub, admission) {
                     // 连接出错是日常（网线拔了、客户端崩了），记一行就行。
                     if let Some(addr) = peer_addr {
                         eprintln!("[{addr}] 连接结束：{e}");

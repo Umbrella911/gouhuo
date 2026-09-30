@@ -26,13 +26,16 @@
 //! M1 在 UDP 上已经被这个坑过一次（见 `voice_core::net`），TCP 上同样成立，
 //! 只是表现为流错位而不是丢包，更难查。
 //!
-//! 所以读永远是阻塞的、没有超时；另起一个看门狗线程看「谁多久没动静了」，
-//! 该踢的直接 `shutdown` 那条 socket —— 阻塞的读会立刻返回 0。
+//! 控制面用非阻塞 socket 等待系统可读/可写事件，不使用 SO_RCVTIMEO。
+//! 总认证截止时间覆盖 TLS 和应用握手；已登录连接由看门狗置关闭标志。
+//! 克隆的 Winsock 句柄 shutdown 不一定唤醒已挂起的读，因此每次等待至多 100 ms。
+//! 见 control_io；语音 UDP 的收包节奏没有改变。
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::net::{Shutdown, TcpStream, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::net::{TcpStream, UdpSocket};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -43,6 +46,7 @@ use protocol::control::{
 use protocol::PublicKey;
 use voice_core::identity::Identity;
 
+use crate::control_io::{IoControl, SocketIo};
 use crate::state::{Broadcast, Server, SessionId};
 use crate::store::Store;
 use crate::voice::{Incoming, VoiceRouter};
@@ -56,18 +60,64 @@ pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// 开一千条就能把服务端拖垮，而且不需要任何凭证。
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// 未认证连接的上限，在 accept 启动线程之前占位。
+pub const MAX_PENDING_CONNECTIONS: usize = 32;
+const OUTBOUND_CAPACITY: usize = 64;
+
+/// 从 TCP accept 到认证完成的总截止时间；shutdown 不需要 TLS 锁。
+pub struct Admission {
+    hub: Arc<Hub>,
+    deadline: Instant,
+}
+
+impl Drop for Admission {
+    fn drop(&mut self) {
+        self.hub.pending.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+enum Outbound {
+    Message(ServerMessage),
+    Goodbye(ServerMessage),
+}
+
+/// 每连接一个有界队列，网络写入只在该连接的 writer 上发生。
+fn spawn_writer(
+    wire: Arc<Mutex<Wire>>,
+    control: Arc<IoControl>,
+) -> io::Result<SyncSender<Outbound>> {
+    let (tx, rx) = sync_channel(OUTBOUND_CAPACITY);
+    std::thread::Builder::new()
+        .name("gouhuo-control-write".into())
+        .spawn(move || {
+            while let Ok(item) = rx.recv() {
+                let (message, close) = match item {
+                    Outbound::Message(message) => (message, false),
+                    Outbound::Goodbye(message) => (message, true),
+                };
+                let sent = wire.lock().expect("wire poisoned").send(&message);
+                if sent.is_err() || close {
+                    break;
+                }
+            }
+            control.close();
+        })?;
+    Ok(tx)
+}
+
 /// 挑战随机数的长度。
 const CHALLENGE_LEN: usize = 32;
 
 /// 一条连接的 TLS 状态和写用的 socket。
 struct Wire {
     conn: rustls::ServerConnection,
-    sock: TcpStream,
+    sock: SocketIo,
 }
 
 impl Wire {
     /// 把 rustls 攒着的字节真正写出去。
     fn flush_tls(&mut self) -> io::Result<()> {
+        self.sock.begin_write();
         while self.conn.wants_write() {
             self.conn.write_tls(&mut self.sock)?;
         }
@@ -85,7 +135,8 @@ impl Wire {
 /// 一个已登录的人。广播时通过它把消息推出去。
 pub struct Peer {
     pub session: SessionId,
-    wire: Arc<Mutex<Wire>>,
+    outbound: SyncSender<Outbound>,
+    shutdown: Arc<IoControl>,
     /// 最后一次收到东西的时刻，看门狗要用。存成 Unix 毫秒的原子值，
     /// 免得为了读一个时间戳还要上锁。
     last_seen_ms: AtomicU64,
@@ -98,10 +149,13 @@ pub struct Peer {
 
 impl Peer {
     pub fn send(&self, message: &ServerMessage) {
-        // 发不出去不是这里该处理的：读线程会在下一次 read 返回 0 时清理。
-        // 在广播路径上做清理会让锁的顺序变复杂，而复杂的锁顺序就是死锁。
-        if let Ok(mut wire) = self.wire.lock() {
-            let _ = wire.send(message);
+        self.enqueue(Outbound::Message(message.clone()));
+    }
+
+    fn enqueue(&self, item: Outbound) {
+        // 满了就断开；不等待慢客户端，不增加无界积压。
+        if self.outbound.try_send(item).is_err() {
+            self.close();
         }
     }
 
@@ -121,14 +175,13 @@ impl Peer {
     /// 「连接被拿走了」（不该重连）—— 什么都不说就断，客户端只能当成网络问题
     /// 去重连，顶号的两端就会互相踢个没完。
     fn kick(&self, reason: goodbye::Reason, detail: &str) {
-        self.send(
-            &Goodbye {
+        self.enqueue(Outbound::Goodbye(
+            Goodbye {
                 reason: reason as i32,
                 detail: detail.to_string(),
             }
             .into(),
-        );
-        self.close();
+        ));
     }
 
     /// 同上，但标记成「超时」而不是「自己走的」。
@@ -138,14 +191,15 @@ impl Peer {
     }
 
     fn close(&self) {
-        if let Ok(wire) = self.wire.lock() {
-            let _ = wire.sock.shutdown(Shutdown::Both);
-        }
+        self.shutdown.close();
     }
 }
 
 /// 所有连接和状态的汇合点。
 pub struct Hub {
+    /// 只串行化状态提交、快照注册和非阻塞入队，不执行 socket 写入。
+    commits: Mutex<()>,
+    pending: AtomicUsize,
     state: Mutex<Server>,
     peers: Mutex<HashMap<SessionId, Arc<Peer>>>,
     /// 存档。`None` = 不落盘（测试、或者存档打不开时只在内存里跑）。
@@ -159,11 +213,25 @@ pub struct Hub {
 impl Hub {
     pub fn new(server: Server, voice_socket: UdpSocket) -> Self {
         Self {
+            commits: Mutex::new(()),
+            pending: AtomicUsize::new(0),
             state: Mutex::new(server),
             peers: Mutex::new(HashMap::new()),
             store: None,
             voice: VoiceRouter::new(voice_socket),
         }
+    }
+
+    pub fn reserve_connection(self: &Arc<Self>) -> Option<Admission> {
+        self.pending
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                (n < MAX_PENDING_CONNECTIONS).then_some(n + 1)
+            })
+            .ok()?;
+        Some(Admission {
+            hub: Arc::clone(self),
+            deadline: Instant::now() + HANDSHAKE_TIMEOUT,
+        })
     }
 
     /// 带存档。`server` 应该是用同一份存档 `Server::restore` 出来的。
@@ -174,17 +242,73 @@ impl Hub {
         }
     }
 
+    /// 提交入场、给旧成员广播、注册新订阅者是同一次提交。
+    fn admit_peer(
+        &self,
+        public_key: PublicKey,
+        invite_code: &str,
+        desired_name: &str,
+        keys: (&[u8; 32], &[u8; 32]),
+        outbound: SyncSender<Outbound>,
+        shutdown: Arc<IoControl>,
+    ) -> Result<Arc<Peer>, crate::state::Denied> {
+        let _commit = self.commits.lock().expect("commits poisoned");
+        let admitted = {
+            let mut state = self.state.lock().expect("state poisoned");
+            let admitted = state.admit(public_key, invite_code, desired_name);
+            self.persist(&mut state);
+            admitted
+        };
+        let admitted = admitted?;
+        let peer = Arc::new(Peer {
+            session: admitted.session_id,
+            outbound,
+            shutdown,
+            last_seen_ms: AtomicU64::new(now_ms() as u64),
+            timed_out: AtomicBool::new(false),
+        });
+
+        // 顶号：把旧连接踢掉。状态里已经摘干净了，这里只管关 socket。
+        if let Some(old) = admitted.displaced {
+            let old_peer = self.peers.lock().expect("peers poisoned").remove(&old);
+            if let Some(old_peer) = old_peer {
+                old_peer.kick(
+                    goodbye::Reason::Displaced,
+                    "同一个身份从别处连进了这个服务器，这边被顶下去了",
+                );
+            }
+        }
+
+        // **在 Welcome 发出去之前挂上密钥**：客户端一收到 Welcome 就会开始发语音，
+        // 晚一步注册，开头那几个包就全被当成「不认识的会话」丢了。
+        self.voice.register(admitted.session_id, keys.0, keys.1);
+
+        let mut welcome = admitted.welcome;
+        welcome.udp_port = self.voice.local_port() as u32;
+        // 快照先入队，再注册订阅；提交锁内不允许其他变更插入这两步之间。
+        peer.send(&welcome.into());
+        // 入场事件只通知现有订阅者；新人的 Welcome 已包含这批变化。
+        self.dispatch(admitted.broadcasts);
+        self.peers
+            .lock()
+            .expect("peers poisoned")
+            .insert(peer.session, Arc::clone(&peer));
+        Ok(peer)
+    }
+
     /// 改状态，并在**同一把锁里**把要落盘的部分写进存档。
     ///
     /// 写库不能挪到 [`Hub::dispatch`] 里做：那是在锁外面跑的，两个线程的
     /// 广播可能乱序。A 删了频道 X（子频道 Y 挪到根上），紧接着 C 删了 Y ——
     /// 要是 C 的那批先落盘，库里就是先删 Y、再被 A 那批「Y 挪到根上」写回来，
     /// 一个删掉的频道重启之后又冒出来。在锁里写，落盘顺序就是改状态的顺序。
-    fn mutate(&self, f: impl FnOnce(&mut Server) -> Vec<Broadcast>) -> Vec<Broadcast> {
+    fn mutate(&self, f: impl FnOnce(&mut Server) -> Vec<Broadcast>) {
+        let _commit = self.commits.lock().expect("commits poisoned");
         let mut state = self.state.lock().expect("state poisoned");
         let events = f(&mut state);
         self.persist(&mut state);
-        events
+        drop(state);
+        self.dispatch(events);
     }
 
     /// 把状态机记下的变化写进存档。调用方持着 `state` 锁（就是传进来的这个）。
@@ -328,13 +452,29 @@ pub fn serve_connection(
     tls_config: Arc<rustls::ServerConfig>,
     hub: Arc<Hub>,
 ) -> io::Result<()> {
+    let admission = hub
+        .reserve_connection()
+        .ok_or_else(|| io::Error::other("未认证连接已满"))?;
+    serve_admitted(sock, tls_config, hub, admission)
+}
+
+pub fn serve_admitted(
+    sock: TcpStream,
+    tls_config: Arc<rustls::ServerConfig>,
+    hub: Arc<Hub>,
+    admission: Admission,
+) -> io::Result<()> {
+    let deadline = admission.deadline;
     sock.set_nodelay(true)?;
+    let control = Arc::new(IoControl::new(sock.try_clone()?, Some(deadline)));
+    let sock = SocketIo::new(sock, Arc::clone(&control))?;
     let read_sock = sock.try_clone()?;
 
     let mut conn = rustls::ServerConnection::new(tls_config).map_err(io::Error::other)?;
     // 握手在这里一次做完，之后才拆成读写两半。
     let mut handshake_sock = sock.try_clone()?;
     conn.complete_io(&mut handshake_sock)?;
+    drop(handshake_sock);
 
     // 语音密钥在这里就派生好。不另起一次握手 —— 这条 TLS 连接已经认证过了，
     // RFC 5705 的 exporter 保证两端算出来一模一样。上下行分开，见
@@ -348,44 +488,35 @@ pub fn serve_connection(
     let mut reader = Reader::new(read_sock, Arc::clone(&wire));
 
     // ---- 认证 ----
-    let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
     let keys = VoiceKeys {
         upstream,
         downstream,
     };
-    let session = match authenticate(&mut reader, &wire, &hub, &keys, deadline) {
-        Ok(Some(session)) => session,
+    let peer = match authenticate(&mut reader, &wire, &hub, &keys, deadline) {
+        Ok(Some(peer)) => peer,
         // 被拒或者对面走了：Rejected 已经发过了，这里干净收场。
         Ok(None) => return Ok(()),
         Err(e) => return Err(e),
     };
 
-    let peer = Arc::new(Peer {
-        session,
-        wire: Arc::clone(&wire),
-        last_seen_ms: AtomicU64::new(now_ms() as u64),
-        timed_out: AtomicBool::new(false),
-    });
-    hub.peers
-        .lock()
-        .expect("peers poisoned")
-        .insert(session, Arc::clone(&peer));
+    control.authenticated();
+    drop(admission);
+    let session = peer.session;
 
     // ---- 消息循环 ----
-    let result = message_loop(&mut reader, &wire, &hub, &peer);
+    let result = message_loop(&mut reader, &hub, &peer);
 
     // ---- 收尾。不管怎么出来的，都要把人从状态里摘掉并广播 ----
     hub.peers.lock().expect("peers poisoned").remove(&session);
     // **先摘语音再改状态**：留着的话，一个刚被踢掉的人还能继续往频道里灌声音。
     hub.voice.unregister(session);
-    let events = hub.mutate(|state| {
+    hub.mutate(|state| {
         if peer.timed_out.load(Ordering::Relaxed) {
             state.timeout(session)
         } else {
             state.disconnect(session)
         }
     });
-    hub.dispatch(events);
     result
 }
 
@@ -405,7 +536,7 @@ fn authenticate(
     hub: &Arc<Hub>,
     keys: &VoiceKeys,
     deadline: Instant,
-) -> io::Result<Option<SessionId>> {
+) -> io::Result<Option<Arc<Peer>>> {
     use protocol::control::rejected::Reason;
 
     let Some(hello) = reader.next_message(deadline)? else {
@@ -468,50 +599,25 @@ fn authenticate(
         return Ok(None);
     }
 
-    // 到这里才轮到策略。密码学归密码学，策略归 state。
-    let admitted = {
-        let mut state = hub.state.lock().expect("state poisoned");
-        let admitted = state.admit(public_key, &auth.invite_code, &auth.desired_name);
-        // 用管理员链接进来的，「他是管理员」和「链接作废」都要落盘。
-        hub.persist(&mut state);
-        admitted
-    };
-    let admitted = match admitted {
-        Ok(a) => a,
+    // Writer 在状态提交前启动，线程创建失败不会留下已登录的幽灵成员。
+    let shutdown = Arc::clone(&wire.lock().expect("wire poisoned").sock.control);
+    let outbound = spawn_writer(Arc::clone(wire), Arc::clone(&shutdown))?;
+    match hub.admit_peer(
+        public_key,
+        &auth.invite_code,
+        &auth.desired_name,
+        (keys.upstream.as_bytes(), keys.downstream.as_bytes()),
+        outbound,
+        shutdown,
+    ) {
+        Ok(peer) => Ok(Some(peer)),
         Err(denied) => {
-            let mut w = wire.lock().expect("wire poisoned");
-            let _ = w.send(&denied.to_wire().into());
-            return Ok(None);
-        }
-    };
-
-    // 顶号：把旧连接踢掉。状态里已经摘干净了，这里只管关 socket。
-    if let Some(old) = admitted.displaced {
-        let old_peer = hub.peers.lock().expect("peers poisoned").remove(&old);
-        if let Some(old_peer) = old_peer {
-            old_peer.kick(
-                goodbye::Reason::Displaced,
-                "同一个身份从别处连进了这个服务器，这边被顶下去了",
-            );
+            wire.lock()
+                .expect("wire poisoned")
+                .send(&denied.to_wire().into())?;
+            Ok(None)
         }
     }
-
-    // **在 Welcome 发出去之前挂上密钥**：客户端一收到 Welcome 就会开始发语音，
-    // 晚一步注册，开头那几个包就全被当成「不认识的会话」丢了。
-    hub.voice.register(
-        admitted.session_id,
-        keys.upstream.as_bytes(),
-        keys.downstream.as_bytes(),
-    );
-
-    let mut welcome = admitted.welcome;
-    welcome.udp_port = hub.voice.local_port() as u32;
-    {
-        let mut w = wire.lock().expect("wire poisoned");
-        w.send(&welcome.into())?;
-    }
-    hub.dispatch(admitted.broadcasts);
-    Ok(Some(admitted.session_id))
 }
 
 fn reject(wire: &Arc<Mutex<Wire>>, reason: protocol::control::rejected::Reason, detail: String) {
@@ -526,12 +632,7 @@ fn reject(wire: &Arc<Mutex<Wire>>, reason: protocol::control::rejected::Reason, 
     }
 }
 
-fn message_loop(
-    reader: &mut Reader,
-    wire: &Arc<Mutex<Wire>>,
-    hub: &Arc<Hub>,
-    peer: &Arc<Peer>,
-) -> io::Result<()> {
+fn message_loop(reader: &mut Reader, hub: &Arc<Hub>, peer: &Arc<Peer>) -> io::Result<()> {
     use protocol::control::Pong;
 
     loop {
@@ -542,10 +643,9 @@ fn message_loop(
         };
         peer.touch();
 
-        let events = match message.payload {
+        match message.payload {
             Some(client_message::Payload::Ping(ping)) => {
-                let mut w = wire.lock().expect("wire poisoned");
-                w.send(
+                peer.send(
                     &Pong {
                         timestamp: ping.timestamp,
                         // 客户端靠这个判断 UDP 到底通没通 —— 一直是 0
@@ -553,8 +653,7 @@ fn message_loop(
                         udp_packets_received: hub.voice.packets_received(peer.session),
                     }
                     .into(),
-                )?;
-                Vec::new()
+                );
             }
             Some(client_message::Payload::JoinChannel(join)) => {
                 hub.mutate(|state| state.join_channel(peer.session, join.channel_id))
@@ -587,12 +686,11 @@ fn message_loop(
                 hub.mutate(|state| state.set_role(peer.session, req.session_id, role))
             }
             // 登录之后再发 Hello / Authenticate 是协议错误，忽略。
-            Some(_) => Vec::new(),
+            Some(_) => (),
             // 认不出来的分支：新客户端发了我们不懂的东西。**忽略，不要断开** ——
             // 这正是 protobuf 演进语义要的行为。
-            None => Vec::new(),
+            None => (),
         };
-        hub.dispatch(events);
     }
 }
 
@@ -602,7 +700,7 @@ fn message_loop(
 struct Reader {
     /// 只用来读的 socket 句柄。阻塞读的时候**不持锁** ——
     /// 否则一条安静的连接会把广播路径堵死。
-    sock: TcpStream,
+    sock: SocketIo,
     /// TLS 状态。读到密文之后才短暂上锁，解出明文就放开。
     wire: Arc<Mutex<Wire>>,
     /// 已经解密但还没解析成消息的明文。
@@ -610,7 +708,7 @@ struct Reader {
 }
 
 impl Reader {
-    fn new(sock: TcpStream, wire: Arc<Mutex<Wire>>) -> Self {
+    fn new(sock: SocketIo, wire: Arc<Mutex<Wire>>) -> Self {
         Self {
             sock,
             wire,
@@ -740,5 +838,339 @@ mod tests {
         // 2020-01-01 之后、2100 之前
         assert!(now > 1_577_836_800_000);
         assert!(now < 4_102_444_800_000);
+    }
+}
+
+#[cfg(test)]
+mod regressions {
+    use super::*;
+    use crate::state::Config;
+    use protocol::control::{server_message, CreateChannel, EditChannel, Hello, Pong};
+    use std::net::TcpListener;
+    use std::sync::mpsc::{channel, Receiver};
+
+    fn sockets() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        (server, client)
+    }
+
+    fn hub() -> Arc<Hub> {
+        Arc::new(Hub::new(
+            Server::new(Config::default()),
+            UdpSocket::bind("127.0.0.1:0").unwrap(),
+        ))
+    }
+
+    fn queued_peer(session: u32) -> (Arc<Peer>, Receiver<Outbound>, TcpStream) {
+        let (shutdown, client) = sockets();
+        let (outbound, rx) = sync_channel(OUTBOUND_CAPACITY);
+        (
+            Arc::new(Peer {
+                session,
+                outbound,
+                shutdown: Arc::new(IoControl::new(shutdown, None)),
+                last_seen_ms: AtomicU64::new(now_ms() as u64),
+                timed_out: AtomicBool::new(false),
+            }),
+            rx,
+            client,
+        )
+    }
+
+    #[test]
+    fn pending_admission_is_bounded_and_released() {
+        let hub = hub();
+        let permits: Vec<_> = (0..MAX_PENDING_CONNECTIONS)
+            .map(|_| hub.reserve_connection().unwrap())
+            .collect();
+        assert!(hub.reserve_connection().is_none());
+        drop(permits);
+        assert_eq!(hub.pending.load(Ordering::Relaxed), 0);
+        assert!(hub.reserve_connection().is_some());
+    }
+
+    // 四个静默位置都实际阻塞服务端 IO，deadline 通过 shutdown 唤醒。
+    fn stalled_auth(stage: u8) {
+        let hub = hub();
+        let cert = transport::ServerCert::generate().unwrap();
+        let tls = Arc::new(transport::server_config(&cert).unwrap());
+        let (sock, mut client_sock) = sockets();
+        client_sock
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut admission = hub.reserve_connection().unwrap();
+        admission.deadline = Instant::now() + Duration::from_millis(600);
+        let server_hub = Arc::clone(&hub);
+        let (done, finished) = channel();
+        let thread = std::thread::spawn(move || {
+            let result = serve_admitted(sock, tls, server_hub, admission);
+            done.send(result.is_ok()).unwrap();
+        });
+        let config = Arc::new(transport::client_config(cert.fingerprint()).unwrap());
+        let mut conn = rustls::ClientConnection::new(
+            config,
+            rustls::pki_types::ServerName::try_from("gouhuo").unwrap(),
+        )
+        .unwrap();
+        if stage == 1 {
+            let mut hello = Vec::new();
+            conn.write_tls(&mut hello).unwrap();
+            client_sock.write_all(&hello[..5]).unwrap();
+        }
+        if stage >= 2 {
+            conn.complete_io(&mut client_sock).unwrap();
+            if stage == 3 {
+                let identity = Identity::generate().unwrap();
+                let mut frame = Vec::new();
+                encode_frame(
+                    &ClientMessage::from(Hello {
+                        protocol_version: PROTOCOL_VERSION,
+                        client_version: "test".into(),
+                        public_key: identity.public_key().0.to_vec(),
+                    }),
+                    &mut frame,
+                )
+                .unwrap();
+                conn.writer().write_all(&frame).unwrap();
+                conn.complete_io(&mut client_sock).unwrap();
+                let mut stream = rustls::StreamOwned::new(conn, client_sock.try_clone().unwrap());
+                let mut received = Vec::new();
+                let mut buf = [0; 4096];
+                loop {
+                    let n = stream.read(&mut buf).unwrap();
+                    assert_ne!(n, 0);
+                    received.extend_from_slice(&buf[..n]);
+                    if let Some((message, _)) = decode_frame::<ServerMessage>(&received).unwrap() {
+                        assert!(matches!(
+                            message.payload,
+                            Some(server_message::Payload::Challenge(_))
+                        ));
+                        break;
+                    }
+                }
+                // 保持 stream 活着，不能靠客户端 Drop 冒充服务端超时。
+                assert!(finished.recv_timeout(Duration::from_secs(3)).is_ok());
+                thread.join().unwrap();
+                assert_eq!(hub.pending.load(Ordering::Relaxed), 0);
+                assert_eq!(hub.user_count(), 0);
+                return;
+            }
+        }
+        assert!(finished.recv_timeout(Duration::from_secs(3)).is_ok());
+        thread.join().unwrap();
+        assert_eq!(hub.pending.load(Ordering::Relaxed), 0);
+        assert_eq!(hub.user_count(), 0);
+    }
+
+    #[test]
+    fn silent_tcp_expires() {
+        stalled_auth(0);
+    }
+    #[test]
+    fn partial_tls_expires() {
+        stalled_auth(1);
+    }
+    #[test]
+    fn silent_after_tls_expires() {
+        stalled_auth(2);
+    }
+    #[test]
+    fn silent_after_challenge_expires() {
+        stalled_auth(3);
+    }
+
+    #[test]
+    fn stalled_writer_does_not_block_other_peers_or_close() {
+        let hub = hub();
+        let (slow, _stalled_writer, mut client) = queued_peer(1);
+        let (fast, fast_rx, _fast_client) = queued_peer(2);
+        hub.peers.lock().unwrap().insert(1, Arc::clone(&slow));
+        hub.peers.lock().unwrap().insert(2, fast);
+        let message: ServerMessage = Pong::default().into();
+        for _ in 0..OUTBOUND_CAPACITY {
+            slow.send(&message);
+        }
+        let (done, finished) = channel();
+        let thread = std::thread::spawn(move || {
+            hub.mutate(|_| vec![Broadcast::Everyone(message)]);
+            slow.close();
+            done.send(()).unwrap();
+        });
+        finished
+            .recv_timeout(Duration::from_secs(1))
+            .expect("广播或关闭被慢连接拖住");
+        assert!(fast_rx.recv_timeout(Duration::from_secs(1)).is_ok());
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        assert!(matches!(client.read(&mut [0; 1]), Ok(0) | Err(_)));
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn concurrent_update_then_delete_is_queued_in_commit_order() {
+        let hub = hub();
+        let (session, channel_id) = {
+            let mut state = hub.state.lock().unwrap();
+            let admitted = state.admit(PublicKey([1; 32]), "", "owner").unwrap();
+            let events = state.create_channel(
+                admitted.session_id,
+                CreateChannel {
+                    name: "old".into(),
+                    ..Default::default()
+                },
+            );
+            let Broadcast::Everyone(message) = &events[0] else {
+                panic!()
+            };
+            let Some(server_message::Payload::ChannelState(created)) = &message.payload else {
+                panic!()
+            };
+            (admitted.session_id, created.channel.as_ref().unwrap().id)
+        };
+        let (peer, rx, _client) = queued_peer(session);
+        hub.peers.lock().unwrap().insert(session, peer);
+        let (entered, ready) = channel();
+        let (release, wait) = channel();
+        let first_hub = Arc::clone(&hub);
+        let first = std::thread::spawn(move || {
+            first_hub.mutate(|state| {
+                let events = state.edit_channel(
+                    session,
+                    EditChannel {
+                        channel_id,
+                        name: "new".into(),
+                        ..Default::default()
+                    },
+                );
+                entered.send(()).unwrap();
+                wait.recv().unwrap();
+                events
+            })
+        });
+        ready.recv_timeout(Duration::from_secs(1)).unwrap();
+        let (attempted, attempting) = channel();
+        let second_hub = Arc::clone(&hub);
+        let second = std::thread::spawn(move || {
+            attempted.send(()).unwrap();
+            second_hub.mutate(|state| state.delete_channel(session, channel_id));
+        });
+        attempting.recv_timeout(Duration::from_secs(1)).unwrap();
+        release.send(()).unwrap();
+        first.join().unwrap();
+        second.join().unwrap();
+        let Outbound::Message(update) = rx.recv().unwrap() else {
+            panic!()
+        };
+        let Outbound::Message(delete) = rx.recv().unwrap() else {
+            panic!()
+        };
+        assert!(matches!(
+            update.payload,
+            Some(server_message::Payload::ChannelState(ref state)) if !state.removed
+        ));
+        assert!(matches!(
+            delete.payload,
+            Some(server_message::Payload::ChannelState(ref state)) if state.removed
+        ));
+        assert!(!hub
+            .state
+            .lock()
+            .unwrap()
+            .welcome_for(session)
+            .channels
+            .iter()
+            .any(|c| c.id == channel_id));
+    }
+    #[test]
+    fn welcome_and_subscription_cover_concurrent_commits_without_duplicates() {
+        let hub = hub();
+        let (old, old_rx, _client) = queued_peer(1);
+        let old = hub
+            .admit_peer(
+                PublicKey([1; 32]),
+                "",
+                "old",
+                (&[1; 32], &[2; 32]),
+                old.outbound.clone(),
+                Arc::clone(&old.shutdown),
+            )
+            .unwrap();
+        assert!(matches!(
+            old_rx.recv().unwrap(),
+            Outbound::Message(ServerMessage {
+                payload: Some(server_message::Payload::Welcome(_))
+            })
+        ));
+        let (new, new_rx, _new_client) = queued_peer(2);
+        // 保持一项真实状态提交暂停；新连接必须等它连广播一起提交。
+        let (entered, ready) = channel();
+        let (release, wait) = channel();
+        let commit_hub = Arc::clone(&hub);
+        let session = old.session;
+        let change = std::thread::spawn(move || {
+            commit_hub.mutate(|state| {
+                let events = state.create_channel(
+                    session,
+                    CreateChannel {
+                        name: "before".into(),
+                        ..Default::default()
+                    },
+                );
+                entered.send(()).unwrap();
+                wait.recv().unwrap();
+                events
+            })
+        });
+        ready.recv().unwrap();
+        let join_hub = Arc::clone(&hub);
+        let (attempt, attempted) = channel();
+        let join = std::thread::spawn(move || {
+            attempt.send(()).unwrap();
+            join_hub
+                .admit_peer(
+                    PublicKey([2; 32]),
+                    "",
+                    "new",
+                    (&[3; 32], &[4; 32]),
+                    new.outbound.clone(),
+                    Arc::clone(&new.shutdown),
+                )
+                .unwrap()
+        });
+        attempted.recv().unwrap();
+        release.send(()).unwrap();
+        change.join().unwrap();
+        let newcomer = join.join().unwrap();
+        let Outbound::Message(ServerMessage {
+            payload: Some(server_message::Payload::Welcome(welcome)),
+        }) = new_rx.recv().unwrap()
+        else {
+            panic!()
+        };
+        assert!(welcome.channels.iter().any(|c| c.name == "before"));
+        assert!(
+            new_rx.try_recv().is_err(),
+            "Welcome 中已有的入场不应再广播给新人"
+        );
+        hub.mutate(|state| {
+            state.create_channel(
+                session,
+                CreateChannel {
+                    name: "after".into(),
+                    ..Default::default()
+                },
+            )
+        });
+        let Outbound::Message(ServerMessage {
+            payload: Some(server_message::Payload::ChannelState(event)),
+        }) = new_rx.recv().unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(event.channel.unwrap().name, "after");
+        assert!(hub.peers.lock().unwrap().contains_key(&newcomer.session));
     }
 }

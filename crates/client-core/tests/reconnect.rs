@@ -234,6 +234,8 @@ fn comes_back_to_the_same_channel_after_the_network_drops() {
             .any(|u| u.name == "阿狸" && u.channel_id == room && u.self_muted)
     });
     let old_session = alice.session_id();
+    let old_sequences = Arc::clone(&alice.voice_keys().sequences);
+    assert_eq!(old_sequences.next(false), Some(0));
     let old_key = *alice.voice_keys().upstream.as_bytes();
 
     proxy.cut();
@@ -247,6 +249,8 @@ fn comes_back_to_the_same_channel_after_the_network_drops() {
         &old_key,
         "新连接必须换语音密钥，否则序号会撞上防重放窗口"
     );
+    assert!(!Arc::ptr_eq(&old_sequences, &alice.voice_keys().sequences));
+    assert_eq!(alice.voice_keys().sequences.next(false), Some(0));
     eventually(
         "波波那边看到阿狸回到开黑、还闭着麦",
         || {

@@ -559,6 +559,7 @@ fn on_connected(
     app.set_self_deafened(false);
     app.set_voice_error("".into());
     app.set_udp_ok(false);
+    app.set_udp_failed(false);
     refresh(app, state, &client);
 
     start_voice(app, state, &client);
@@ -573,17 +574,19 @@ fn start_voice(app: &App, state: &Arc<Mutex<State>>, client: &Client) {
     // 先把独立试麦停掉：两个都开的话麦克风会被采两遍。
     stop_mic_check(state);
 
-    let Some(addr) = resolve_voice_addr(client) else {
+    let (session_id, udp_port, keys) = client.voice_session();
+    let Some(addr) = resolve_voice_addr(client.server_host(), udp_port) else {
         app.set_voice_error("服务器没给出语音端口".into());
         return;
     };
 
     let mode = transmit_mode(&state.lock().expect("state poisoned").settings);
     let cfg = PipelineConfig {
-        session_id: client.session_id(),
+        session_id,
         server: addr,
-        upstream_key: *client.voice_keys().upstream.as_bytes(),
-        downstream_key: *client.voice_keys().downstream.as_bytes(),
+        sequences: Arc::clone(&keys.sequences),
+        upstream_key: *keys.upstream.as_bytes(),
+        downstream_key: *keys.downstream.as_bytes(),
         jitter: default_jitter(),
         mode,
     };
@@ -715,6 +718,7 @@ fn restart_voice(app: &App, state: &Arc<Mutex<State>>) {
     }
     app.set_voice_error("".into());
     app.set_udp_ok(false);
+    app.set_udp_failed(false);
     app.set_capture_in_use("".into());
     start_voice(app, state, &client);
     if was_monitoring {
@@ -781,8 +785,87 @@ fn wire_scan(app: &App, state: &Arc<Mutex<State>>) {
     });
 }
 
+/// 手动生成快照；不包含邀请凭据、身份密钥或聊天内容。
+fn diagnostics(app: &App, state: &Arc<Mutex<State>>) -> String {
+    let locked = state.lock().expect("state poisoned");
+    let output = app
+        .get_render_devices()
+        .row_data(app.get_render_index().max(0) as usize)
+        .unwrap_or_default();
+    let mut text = format!(
+        "篝火 {} / 协议 {} / {}
+连接：{}
+麦克风：{}
+输出选择：{}
+闭麦：{} / 关闭声音：{}
+",
+        env!("CARGO_PKG_VERSION"),
+        protocol::control::PROTOCOL_VERSION,
+        std::env::consts::OS,
+        if app.get_connected() {
+            "已连接"
+        } else {
+            "未连接"
+        },
+        app.get_capture_in_use(),
+        output,
+        app.get_self_muted(),
+        app.get_self_deafened()
+    );
+    if let Some(voice) = &locked.voice {
+        let stats = voice.stats();
+        text.push_str(&format!(
+            "UDP：{} / RTT：{:.1} ms
+发送包：{} / 收到包：{} / 播放等待：{}
+输入电平：{:.1} dB
+",
+            if stats.udp_ok {
+                "通"
+            } else if stats.udp_failed {
+                "超时未连通"
+            } else {
+                "探测中"
+            },
+            stats.rtt_ms,
+            stats.packets_sent,
+            stats.packets_received,
+            stats.underruns,
+            stats.input_db
+        ));
+    }
+    text.push_str(&format!(
+        "语音提示：{}
+连接提示：{} {}
+",
+        app.get_voice_error(),
+        app.get_error_headline(),
+        app.get_error_advice()
+    ));
+    text
+}
+
 /// 设置面板：切换说话方式、绑按住说话的键、试听麦克风、选设备。
 fn wire_settings(app: &App, state: &Arc<Mutex<State>>, hotkeys: Option<Rc<Hotkeys>>) {
+    {
+        let state = Arc::clone(state);
+        let weak = app.as_weak();
+        app.on_retry_voice(move || {
+            if let Some(app) = weak.upgrade() {
+                load_devices(&app, &state);
+                restart_voice(&app, &state);
+            }
+        });
+    }
+    {
+        let state = Arc::clone(state);
+        let weak = app.as_weak();
+        app.on_show_diagnostics(move || {
+            if let Some(app) = weak.upgrade() {
+                app.set_diagnostics(diagnostics(&app, &state).into());
+                app.set_diagnostics_open(true);
+            }
+        });
+    }
     {
         let state = Arc::clone(state);
         let weak = app.as_weak();
@@ -1056,15 +1139,12 @@ fn audio_processor() -> Option<Box<dyn voice_core::pipeline::AudioProcessor>> {
     }
 }
 
-fn resolve_voice_addr(client: &Client) -> Option<std::net::SocketAddr> {
+fn resolve_voice_addr(host: &str, udp_port: u16) -> Option<std::net::SocketAddr> {
     use std::net::ToSocketAddrs;
-    if client.udp_port() == 0 {
+    if udp_port == 0 {
         return None;
     }
-    (client.server_host(), client.udp_port())
-        .to_socket_addrs()
-        .ok()?
-        .next()
+    (host, udp_port).to_socket_addrs().ok()?.next()
 }
 
 /// 定时把音频状态搬到界面上。**整个程序只有一个**，连着和没连着都靠它。
@@ -1142,6 +1222,14 @@ fn spawn_status_poll(weak: slint::Weak<App>, state: Arc<Mutex<State>>) {
 
         if let Some(voice) = voice {
             let stats = voice.stats();
+            app.set_udp_failed(stats.udp_failed);
+            if stats.sequences_exhausted {
+                app.set_voice_error(
+                    "语音加密序号已用尽。请退出服务器后重新加入，以更换密钥。".into(),
+                );
+            } else if let Some(error) = &stats.error {
+                app.set_voice_error(error.clone().into());
+            }
             app.set_udp_ok(stats.udp_ok);
             app.set_input_level(db_to_level(stats.input_db));
             app.set_monitoring(voice.is_monitoring());
@@ -1281,6 +1369,7 @@ fn pump_events(
                     // 停掉它，别让用户以为自己还在被人听见 —— 麦克风指示灯也跟着灭。
                     state.lock().expect("state poisoned").voice = None;
                     app.set_udp_ok(false);
+                    app.set_udp_failed(false);
                     app.set_transmitting(false);
                     app.set_input_level(0.0);
                     app.set_reconnecting(

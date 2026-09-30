@@ -33,10 +33,10 @@ mod generated {
 
 pub use generated::*;
 
-/// 控制面协议版本。**只在消息格式变得不兼容时才动**，跟客户端版本号无关。
+/// 连接协议版本。**控制面或语音加密规则不兼容时才动**，跟客户端版本号无关。
 ///
 /// 加字段不算不兼容（protobuf 的旧端会忽略它），所以绝大多数改动都不该碰这个数。
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// 一条控制面消息的字节上限。
 ///
