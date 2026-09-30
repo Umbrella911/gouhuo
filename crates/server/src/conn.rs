@@ -347,6 +347,11 @@ impl Hub {
                         peer.send(&msg);
                     }
                 }
+                Broadcast::Others(except, msg) => {
+                    for peer in peers.iter().filter(|p| p.session != except) {
+                        peer.send(&msg);
+                    }
+                }
                 Broadcast::Channel(channel, msg) => {
                     let targets = {
                         let state = self.state.lock().expect("state poisoned");
@@ -520,16 +525,18 @@ pub fn serve_admitted(
     result
 }
 
-/// Hello -> Challenge -> Authenticate -> Welcome / Rejected。
-///
-/// 返回 `Ok(None)` 表示「正常地没让他进来」（版本不对、签名不对、策略不让）——
-/// 该发的 `Rejected` 已经发出去了，调用方安静收场就行。
 /// 这条连接派生出来的两把语音密钥。
 struct VoiceKeys {
     upstream: transport::VoiceKey,
     downstream: transport::VoiceKey,
 }
 
+/// Hello -> Challenge -> Authenticate -> Welcome / Rejected。
+///
+/// 返回 `Ok(None)` 表示「正常地没让他进来」（版本不对、签名不对、策略不让）——
+/// 该发的 `Rejected` 已经发出去了，调用方安静收场就行。
+///
+/// 返回 `Some` 时这个人已经登记进 `hub.peers`，调用方负责在断开时把他摘掉。
 fn authenticate(
     reader: &mut Reader,
     wire: &Arc<Mutex<Wire>>,
